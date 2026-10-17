@@ -1,0 +1,303 @@
+{
+  "note": "OmO providers and model ids are the union of category and agent fallback chains in packages/model-core. openswarm model ids are the OpenCode Go monthly-cap keys plus deepseek.tiers values in policy.json. Codex slugs are not listed in policy.json.",
+  "omo": {
+    "agent_names": [
+      "atlas",
+      "explore",
+      "hephaestus",
+      "librarian",
+      "metis",
+      "momus",
+      "multimodal-looker",
+      "oracle",
+      "prometheus",
+      "sisyphus",
+      "sisyphus-junior"
+    ],
+    "agents": 11,
+    "categories": 9,
+    "category_chains": {
+      "artistry": {
+        "models": [
+          "claude-fable-5-1",
+          "claude-opus-5-5",
+          "kimi-k3"
+        ],
+        "providers": [
+          "anthropic",
+          "anthropic-api",
+          "github-copilot",
+          "kimi-for-coding",
+          "moonshotai",
+          "opencode",
+          "opencode-go"
+        ]
+      },
+      "deep-high": {
+        "models": [
+          "gpt-6-astra"
+        ],
+        "providers": [
+          "chatgpt-subscription",
+          "github-copilot",
+          "openai",
+          "opencode"
+        ]
+      },
+      "deep-low": {
+        "models": [
+          "gpt-5.6-sol",
+          "gpt-5.6-sol-fast",
+          "gpt-6.1-sol",
+          "gpt-6.1-sol-fast"
+        ],
+        "providers": [
+          "chatgpt-subscription",
+          "github-copilot",
+          "openai",
+          "opencode"
+        ]
+      },
+      "quick": {
+        "models": [
+          "claude-haiku-5-5",
+          "deepseek-flash",
+          "glm-5.3-flash",
+          "gpt-6-luna-fast",
+          "grok-4.20-0309-non-reasoning",
+          "mimo-v2.6-flash",
+          "minimax-m2.7",
+          "minimax-m3",
+          "qwen3.6-flash"
+        ],
+        "providers": [
+          "alibaba-token-plan",
+          "anthropic",
+          "anthropic-api",
+          "bailian-coding-plan",
+          "chatgpt-subscription",
+          "deepseek",
+          "github-copilot",
+          "openai",
+          "opencode-go",
+          "qwen-token-plan",
+          "xai",
+          "xiaomi",
+          "zai-coding-plan"
+        ]
+      },
+      "ultrabrain": {
+        "models": [
+          "gpt-5.6-sol",
+          "gpt-6-astra"
+        ],
+        "providers": [
+          "chatgpt-subscription",
+          "github-copilot",
+          "openai",
+          "opencode"
+        ]
+      },
+      "unspecified-high": {
+        "models": [
+          "claude-opus-5-5",
+          "glm-5.3",
+          "kimi-k3"
+        ],
+        "providers": [
+          "anthropic",
+          "anthropic-api",
+          "github-copilot",
+          "kimi-for-coding",
+          "moonshotai",
+          "opencode",
+          "opencode-go",
+          "zai-coding-plan"
+        ]
+      },
+      "unspecified-low": {
+        "models": [
+          "claude-sonnet-5",
+          "claude-sonnet-5-5",
+          "deepseek-v4-pro",
+          "gpt-5.6-sol",
+          "gpt-6.1-sol",
+          "grok-4.7",
+          "mimo-v2.5-pro",
+          "mimo-v2.6-pro",
+          "qwen3.8-max-preview"
+        ],
+        "providers": [
+          "alibaba-token-plan",
+          "alibaba-token-plan-cn",
+          "anthropic",
+          "anthropic-api",
+          "chatgpt-subscription",
+          "deepseek",
+          "github-copilot",
+          "openai",
+          "opencode",
+          "opencode-go",
+          "qwen-token-plan",
+          "qwen-token-plan-cn",
+          "xai",
+          "xiaomi"
+        ]
+      },
+      "visual-engineering": {
+        "models": [
+          "claude-fable-5-1",
+          "claude-opus-5-5",
+          "gemini-4-argon",
+          "kimi-k3"
+        ],
+        "providers": [
+          "anthropic",
+          "anthropic-api",
+          "github-copilot",
+          "google",
+          "google-vertex",
+          "kimi-for-coding",
+          "moonshotai",
+          "opencode",
+          "opencode-go"
+        ]
+      },
+      "writing": {
+        "models": [
+          "claude-opus-4-6",
+          "claude-opus-5-5",
+          "gemini-4-argon"
+        ],
+        "providers": [
+          "anthropic",
+          "anthropic-api",
+          "github-copilot",
+          "google",
+          "google-vertex",
+          "opencode"
+        ]
+      }
+    },
+    "category_names": [
+      "artistry",
+      "deep-high",
+      "deep-low",
+      "quick",
+      "ultrabrain",
+      "unspecified-high",
+      "unspecified-low",
+      "visual-engineering",
+      "writing"
+    ],
+    "commit": "07776864a043acdda9f9976ac8f71659a25f1d86",
+    "distinct_model_ids": 36,
+    "distinct_providers": 26,
+    "model_ids": [
+      "MiniMax-M3",
+      "big-pickle",
+      "claude-fable-5-1",
+      "claude-haiku-5-5",
+      "claude-opus-4-6",
+      "claude-opus-5-5",
+      "claude-sonnet-5",
+      "claude-sonnet-5-5",
+      "deepseek-flash",
+      "deepseek-v4-pro",
+      "gemini-3.1-pro",
+      "gemini-4-argon",
+      "glm-4.6v",
+      "glm-5.2",
+      "glm-5.3",
+      "glm-5.3-flash",
+      "gpt-5-nano",
+      "gpt-5.6-sol",
+      "gpt-5.6-sol-fast",
+      "gpt-6-astra",
+      "gpt-6-luna-fast",
+      "gpt-6-sol",
+      "gpt-6.1-sol",
+      "gpt-6.1-sol-fast",
+      "grok-4.20-0309-non-reasoning",
+      "grok-4.7",
+      "kimi-for-coding-highspeed",
+      "kimi-k3",
+      "mimo-v2.5-pro",
+      "mimo-v2.6-flash",
+      "mimo-v2.6-pro",
+      "minimax-m2.7",
+      "minimax-m3",
+      "qwen3.6-flash",
+      "qwen3.7-plus",
+      "qwen3.8-max-preview"
+    ],
+    "providers": [
+      "aihubmix",
+      "alibaba-token-plan",
+      "alibaba-token-plan-cn",
+      "anthropic",
+      "anthropic-api",
+      "bailian-coding-plan",
+      "chatgpt-subscription",
+      "deepseek",
+      "firmware",
+      "github-copilot",
+      "google",
+      "google-vertex",
+      "kimi-for-coding",
+      "minimax-cn-coding-plan",
+      "minimax-coding-plan",
+      "moonshotai",
+      "moonshotai-cn",
+      "ollama-cloud",
+      "openai",
+      "opencode",
+      "opencode-go",
+      "qwen-token-plan",
+      "qwen-token-plan-cn",
+      "xai",
+      "xiaomi",
+      "zai-coding-plan"
+    ],
+    "source": "<omo-dir>/packages/model-core"
+  },
+  "omo_dir": "<omo-dir>",
+  "openswarm": {
+    "backend_names": [
+      "codex",
+      "ocgo",
+      "deepseek"
+    ],
+    "backends": 3,
+    "model_ids": [
+      "deepseek-flash",
+      "deepseek-v4-flash",
+      "deepseek-v4-pro",
+      "deepseek-v4.1-flash",
+      "glm-5.2",
+      "glm-5.3",
+      "glm-5.3-flash",
+      "gpt-5.6-luna",
+      "gpt-6-luna",
+      "grok-4.6",
+      "grok-4.7",
+      "hy3",
+      "hy4-preview",
+      "kimi-k2.6",
+      "kimi-k2.7-code",
+      "kimi-k3",
+      "longcat-2.0",
+      "mimo-v2.5",
+      "mimo-v2.5-pro",
+      "mimo-v2.6-flash",
+      "mimo-v2.6-pro",
+      "minimax-m2.7",
+      "minimax-m3",
+      "qwen3.7-plus",
+      "qwen3.8-flash",
+      "qwen3.8-max",
+      "space-bunny"
+    ],
+    "model_ids_in_policy": 27
+  }
+}

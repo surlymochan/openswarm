@@ -1,0 +1,22 @@
+{
+  "cli_cold_start": {
+    "command": "python3 bin/openswarm route --type impl --difficulty 3 --context-tokens 24000",
+    "kind": "cli_cold_start",
+    "max": 90.0215,
+    "median": 73.9972,
+    "min": 69.6864,
+    "n": 25,
+    "note": "Each sample is a new Python process. OPENSWARM_STATE_FILE points at a temporary copy of the fresh-quota state. This is the product route CLI.",
+    "p95": 86.8789,
+    "unit": "ms"
+  },
+  "in_process": {
+    "kind": "in_process",
+    "max": 2.1924,
+    "median": 0.0075,
+    "min": 0.004,
+    "n": 1120,
+    "p95": 0.0215,
+    "unit": "ms"
+  }
+}

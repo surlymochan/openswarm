@@ -1,0 +1,75 @@
+{
+  "thresholds_from_policy": {
+    "window_soft": 0.85,
+    "window_hard": 0.95,
+    "deepseek_min_balance_cny": 10,
+    "ocgo_usage_limit": 1.0
+  },
+  "exhaustion_rule": "openswarm applies window_soft and window_hard inside route() before any attempt. OmO's model-core does not read a quota window. A model is treated as exhausted for OmO only when a call would return an error its classifier accepts: Codex worst window >= window_hard, an OpenCode Go model whose max window usage >= 1.0 (the window budget is gone), or DeepSeek balance below the floor. Usage of 0.90 is 'hot' for openswarm (ocgo models are skipped at 0.85) and is not an OmO error. The simulated errors are exactly {message:'usage limit exceeded', statusCode:429} and, for DeepSeek, {message:'insufficient balance'}.",
+  "scenarios": [
+    {
+      "id": "fresh",
+      "summary": "Quotas recently reset. Codex 5h at 12% and 7d at 31%. Go models unused. DeepSeek balance 55 CNY.",
+      "codex": {"five_hour": 0.12, "seven_day": 0.31},
+      "ocgo_usage": {},
+      "deepseek_balance_cny": 55.0
+    },
+    {
+      "id": "codex_soft_90",
+      "summary": "Codex 5h window at 90% (soft). 7d at 40%. Go and DeepSeek fresh. openswarm spills difficulty <= 3 and keeps harder work at effort -1. OmO still selects Codex; 90% is not a usage-limit error.",
+      "codex": {"five_hour": 0.90, "seven_day": 0.40},
+      "ocgo_usage": {},
+      "deepseek_balance_cny": 55.0
+    },
+    {
+      "id": "codex_hard_97",
+      "summary": "Codex 5h at 97% (hard). openswarm skips Codex. OmO's first Codex pick is one failed attempt, then the next reachable fallback rung.",
+      "codex": {"five_hour": 0.97, "seven_day": 0.55},
+      "ocgo_usage": {},
+      "deepseek_balance_cny": 55.0
+    },
+    {
+      "id": "ocgo_hot",
+      "summary": "The Go models openswarm would pick first in each price tier sit at 90% of every window: glm-5.3-flash, grok-4.7, kimi-k3. That is above openswarm's 85% skip and below a usage-limit error, so OmO still accepts them.",
+      "codex": {"five_hour": 0.20, "seven_day": 0.30},
+      "ocgo_usage": {
+        "glm-5.3-flash": {"5h": 0.90, "7d": 0.90, "30d": 0.90},
+        "grok-4.7": {"5h": 0.90, "7d": 0.90, "30d": 0.90},
+        "kimi-k3": {"5h": 0.90, "7d": 0.90, "30d": 0.90}
+      },
+      "deepseek_balance_cny": 55.0
+    },
+    {
+      "id": "deepseek_floor",
+      "summary": "DeepSeek balance 3 CNY, under the 10 CNY floor. Codex and Go are fresh. openswarm will not select DeepSeek. OmO learns it only if a rung actually resolves to the deepseek provider.",
+      "codex": {"five_hour": 0.12, "seven_day": 0.31},
+      "ocgo_usage": {},
+      "deepseek_balance_cny": 3.0
+    },
+    {
+      "id": "mixed_late_week",
+      "summary": "Codex 5h at 92% and 7d at 88% (soft, not hard). Go's deep models are fully spent (usage 1.0: kimi-k3, glm-5.3). grok-4.7 is hot at 90%. DeepSeek balance 12 CNY, above the floor.",
+      "codex": {"five_hour": 0.92, "seven_day": 0.88},
+      "ocgo_usage": {
+        "kimi-k3": {"5h": 0.40, "7d": 0.70, "30d": 1.0},
+        "glm-5.3": {"5h": 0.20, "7d": 0.50, "30d": 1.0},
+        "grok-4.7": {"5h": 0.90, "7d": 0.60, "30d": 0.40}
+      },
+      "deepseek_balance_cny": 12.0
+    },
+    {
+      "id": "tight_friday",
+      "summary": "Codex 5h at 97% (hard). Every scarce Go model is at usage 1.0 (minimax-m3, minimax-m2.7, grok-4.7, mimo-v2.6-pro, glm-5.3, kimi-k3). The two cap-60 flash models are at 0. DeepSeek balance 40 CNY.",
+      "codex": {"five_hour": 0.97, "seven_day": 0.80},
+      "ocgo_usage": {
+        "minimax-m3": {"5h": 1.0, "7d": 1.0, "30d": 1.0},
+        "minimax-m2.7": {"5h": 1.0, "7d": 1.0, "30d": 1.0},
+        "grok-4.7": {"5h": 1.0, "7d": 1.0, "30d": 1.0},
+        "mimo-v2.6-pro": {"5h": 1.0, "7d": 1.0, "30d": 1.0},
+        "glm-5.3": {"5h": 1.0, "7d": 1.0, "30d": 1.0},
+        "kimi-k3": {"5h": 1.0, "7d": 1.0, "30d": 1.0}
+      },
+      "deepseek_balance_cny": 40.0
+    }
+  ]
+}

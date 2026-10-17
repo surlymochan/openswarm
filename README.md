@@ -30,6 +30,7 @@ openswarm splits the work:
   - [Codex CLI](https://github.com/openai/codex) is the main executor.
   - [OpenCode](https://opencode.ai) Go handles cheap or mechanical work, non-GPT second opinions, overflow, and 1M context.
   - DeepSeek is the metered last resort.
+  - Cursor CLI (`cursor-agent`) runs only when you pass `--backend cursor`, or when you add `cursor` to `routing.default_order`. It is not part of automatic routing.
 
 Routing decisions use live quota data, not guesses.
 
@@ -114,6 +115,7 @@ openswarm"*. The skill takes it from there.
 | Burn pace > 1.25× even | Effort −1 |
 | Resets within 24h with < 60% used | Effort +1, so quota isn't wasted |
 | DeepSeek balance below floor | Skips DeepSeek |
+| `--backend cursor` | Forces the Cursor CLI. Cursor is never chosen on its own unless `cursor` is listed in `routing.default_order` |
 
 The full rules are in [`SKILL.md`](SKILL.md#7-routing-rules-what-route-does). Every threshold is in
 [`policy.json`](policy.json).
@@ -134,6 +136,8 @@ The full rules are in [`SKILL.md`](SKILL.md#7-routing-rules-what-route-does). Ev
         └───────┬───────────────────┬───────────────────┬──────────┘
           codex exec          opencode run         opencode run
          (Codex plan)       (OpenCode Go plan)    (DeepSeek API)
+
+Cursor CLI is a fourth executor, opt-in only (`--backend cursor`).
 ```
 
 | Path | What |
@@ -166,6 +170,7 @@ Override any key in `$OPENSWARM_HOME/policy.local.json`. It is deep-merged over 
 | `OPENSWARM_CODEX_PLAN`, `OPENSWARM_CLAUDE_PLAN` | Declare your plans explicitly (recommended) |
 | `DEEPSEEK_API_KEY` | DeepSeek key, used only for the balance and model-list API |
 | `OPENSWARM_OPENCODE_BIN`, `OPENSWARM_OPENCODE_DB` | Non-standard OpenCode install locations |
+| `OPENSWARM_CURSOR_BIN` | Cursor CLI binary. Otherwise `cursor-agent` on `PATH`, then `~/.local/bin/cursor-agent` |
 | `OPENSWARM_STATE_FILE` | Offline mode: route against a saved or synthetic state; nothing is probed |
 | `XSWARM_*` | Legacy names from before the rename (formerly *xswarm*); still honoured, `OPENSWARM_*` wins |
 
