@@ -1,0 +1,18 @@
+{
+  "bun": "1.4.2",
+  "commands": [
+    "python3 bench/route_openswarm.py --out bench/results/openswarm.jsonl --latency-out bench/results/latency_openswarm.json --decisions 1000 --cli-runs 25",
+    "bun bench/route_omo.ts --omo-dir <omo-dir> --out bench/results/omo.jsonl --latency-out bench/results/latency_omo.json --decisions 1000",
+    "python3 bench/coverage.py --omo-dir <omo-dir> --out bench/results/coverage.json",
+    "python3 bench/score.py --openswarm bench/results/openswarm.jsonl --out-dir bench/results --env bench/results/environment.json --latency-openswarm bench/results/latency_openswarm.json --latency-omo bench/results/latency_omo.json --coverage bench/results/coverage.json --omo bench/results/omo.jsonl"
+  ],
+  "cores": 8,
+  "cpu": "Intel(R) Xeon(R) Processor",
+  "date": "2026-10-17T11:32:00Z",
+  "kernel": "6.12.94+",
+  "omo_commit": "07776864a043acdda9f9976ac8f71659a25f1d86",
+  "omo_dir": "<omo-dir>",
+  "openswarm_commit": "113d5514a0a78395699a39d597ab05bd7caf63c3",
+  "os": "Linux-6.12.94+-x86_64-with-glibc2.41",
+  "python": "3.13.5"
+}

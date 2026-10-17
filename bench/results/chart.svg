@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="760" viewBox="0 0 1100 760">
+<rect width="1100" height="760" fill="#ffffff"/>
+<text x="86.0" y="32.0" text-anchor="start" font-family="sans-serif" font-size="18" font-weight="600" fill="#1a1a1a">Routing benchmark</text>
+<text x="86.0" y="54.0" text-anchor="start" font-family="sans-serif" font-size="12" font-weight="normal" fill="#444">Wasted first attempts, unrouted decisions, and review independence. Percents of decisions.</text>
+<text x="86.0" y="72.0" text-anchor="start" font-family="sans-serif" font-size="12" font-weight="normal" fill="#444">Lower panel: share of the nominal Codex 5h budget used by one pass of the 80-task trace.</text>
+<line x1="86.0" y1="348.0" x2="1064.0" y2="348.0" stroke="#e6e6e6" />
+<text x="76.0" y="352.0" text-anchor="end" font-family="sans-serif" font-size="11" font-weight="normal" fill="#333">0%</text>
+<line x1="86.0" y1="288.0" x2="1064.0" y2="288.0" stroke="#e6e6e6" />
+<text x="76.0" y="292.0" text-anchor="end" font-family="sans-serif" font-size="11" font-weight="normal" fill="#333">25%</text>
+<line x1="86.0" y1="228.0" x2="1064.0" y2="228.0" stroke="#e6e6e6" />
+<text x="76.0" y="232.0" text-anchor="end" font-family="sans-serif" font-size="11" font-weight="normal" fill="#333">50%</text>
+<line x1="86.0" y1="168.0" x2="1064.0" y2="168.0" stroke="#e6e6e6" />
+<text x="76.0" y="172.0" text-anchor="end" font-family="sans-serif" font-size="11" font-weight="normal" fill="#333">75%</text>
+<line x1="86.0" y1="108.0" x2="1064.0" y2="108.0" stroke="#e6e6e6" />
+<text x="76.0" y="112.0" text-anchor="end" font-family="sans-serif" font-size="11" font-weight="normal" fill="#333">100%</text>
+<line x1="86.0" y1="348.0" x2="1064.0" y2="348.0" stroke="#222" />
+<rect x="102.0" y="348.0" width="52.8" height="0.0" fill="#1f4e79"/>
+<text x="128.4" y="340.0" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="normal" fill="#222">0.0</text>
+<rect x="160.8" y="291.9" width="52.8" height="56.1" fill="#c47b2b"/>
+<text x="187.2" y="283.9" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="normal" fill="#222">23.4</text>
+<rect x="219.6" y="279.4" width="52.8" height="68.6" fill="#3d6b58"/>
+<text x="246.0" y="271.4" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="normal" fill="#222">28.6</text>
+<rect x="278.4" y="279.4" width="52.8" height="68.6" fill="#6b4c7a"/>
+<text x="304.8" y="271.4" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="normal" fill="#222">28.6</text>
+<rect x="337.2" y="348.0" width="52.8" height="0.0" fill="#3f6f8f"/>
+<text x="363.6" y="340.0" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="normal" fill="#222">0.0</text>
+<text x="249.0" y="372.0" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="normal" fill="#222">Wasted first attempts</text>
+<rect x="428.0" y="348.0" width="52.8" height="0.0" fill="#1f4e79"/>
+<text x="454.4" y="340.0" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="normal" fill="#222">0.0</text>
+<rect x="486.8" y="300.4" width="52.8" height="47.6" fill="#c47b2b"/>
+<text x="513.2" y="292.4" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="normal" fill="#222">19.8</text>
+<rect x="545.6" y="279.4" width="52.8" height="68.6" fill="#3d6b58"/>
+<text x="572.0" y="271.4" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="normal" fill="#222">28.6</text>
+<rect x="604.4" y="279.4" width="52.8" height="68.6" fill="#6b4c7a"/>
+<text x="630.8" y="271.4" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="normal" fill="#222">28.6</text>
+<rect x="663.2" y="348.0" width="52.8" height="0.0" fill="#3f6f8f"/>
+<text x="689.6" y="340.0" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="normal" fill="#222">0.0</text>
+<text x="575.0" y="372.0" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="normal" fill="#222">Unrouted</text>
+<rect x="754.0" y="216.6" width="52.8" height="131.4" fill="#1f4e79"/>
+<text x="780.4" y="208.6" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="normal" fill="#222">54.8</text>
+<rect x="812.8" y="176.6" width="52.8" height="171.4" fill="#c47b2b"/>
+<text x="839.2" y="168.6" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="normal" fill="#222">71.4</text>
+<rect x="871.6" y="348.0" width="52.8" height="0.0" fill="#3d6b58"/>
+<text x="898.0" y="340.0" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="normal" fill="#222">0.0</text>
+<rect x="930.4" y="348.0" width="52.8" height="0.0" fill="#6b4c7a"/>
+<text x="956.8" y="340.0" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="normal" fill="#222">0.0</text>
+<rect x="989.2" y="348.0" width="52.8" height="0.0" fill="#3f6f8f"/>
+<text x="1015.6" y="340.0" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="normal" fill="#222">0.0</text>
+<text x="901.0" y="372.0" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="normal" fill="#222">Review independence</text>
+<rect x="86.0" y="396.0" width="14.0" height="14.0" fill="#1f4e79"/>
+<text x="106.0" y="408.0" text-anchor="start" font-family="sans-serif" font-size="13" font-weight="normal" fill="#222">openswarm</text>
+<rect x="282.0" y="396.0" width="14.0" height="14.0" fill="#c47b2b"/>
+<text x="302.0" y="408.0" text-anchor="start" font-family="sans-serif" font-size="13" font-weight="normal" fill="#222">OmO</text>
+<rect x="478.0" y="396.0" width="14.0" height="14.0" fill="#3d6b58"/>
+<text x="498.0" y="408.0" text-anchor="start" font-family="sans-serif" font-size="13" font-weight="normal" fill="#222">Codex default</text>
+<rect x="674.0" y="396.0" width="14.0" height="14.0" fill="#6b4c7a"/>
+<text x="694.0" y="408.0" text-anchor="start" font-family="sans-serif" font-size="13" font-weight="normal" fill="#222">strongest</text>
+<rect x="870.0" y="396.0" width="14.0" height="14.0" fill="#3f6f8f"/>
+<text x="890.0" y="408.0" text-anchor="start" font-family="sans-serif" font-size="13" font-weight="normal" fill="#222">cheapest</text>
+<text x="86.0" y="448.0" text-anchor="start" font-family="sans-serif" font-size="14" font-weight="600" fill="#222">Codex nominal 5h share per trace pass</text>
+<text x="86.0" y="468.0" text-anchor="start" font-family="sans-serif" font-size="12" font-weight="normal" fill="#444">1.0 is the whole nominal 5h window for one 80-task pass. Computed, not a quota.</text>
+<line x1="86.0" y1="680.0" x2="1064.0" y2="680.0" stroke="#e6e6e6" />
+<text x="76.0" y="684.0" text-anchor="end" font-family="sans-serif" font-size="11" font-weight="normal" fill="#333">0.0</text>
+<line x1="86.0" y1="644.0" x2="1064.0" y2="644.0" stroke="#e6e6e6" />
+<text x="76.0" y="648.0" text-anchor="end" font-family="sans-serif" font-size="11" font-weight="normal" fill="#333">0.5</text>
+<line x1="86.0" y1="608.0" x2="1064.0" y2="608.0" stroke="#e6e6e6" />
+<text x="76.0" y="612.0" text-anchor="end" font-family="sans-serif" font-size="11" font-weight="normal" fill="#333">1.0</text>
+<line x1="86.0" y1="572.0" x2="1064.0" y2="572.0" stroke="#e6e6e6" />
+<text x="76.0" y="576.0" text-anchor="end" font-family="sans-serif" font-size="11" font-weight="normal" fill="#333">1.5</text>
+<line x1="86.0" y1="536.0" x2="1064.0" y2="536.0" stroke="#e6e6e6" />
+<text x="76.0" y="540.0" text-anchor="end" font-family="sans-serif" font-size="11" font-weight="normal" fill="#333">2.0</text>
+<line x1="86.0" y1="500.0" x2="1064.0" y2="500.0" stroke="#e6e6e6" />
+<text x="76.0" y="504.0" text-anchor="end" font-family="sans-serif" font-size="11" font-weight="normal" fill="#333">2.5</text>
+<line x1="86.0" y1="680.0" x2="1064.0" y2="680.0" stroke="#222" />
+<rect x="151.8" y="645.7" width="64.0" height="34.3" fill="#1f4e79"/>
+<text x="183.8" y="637.7" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="normal" fill="#222">0.48</text>
+<text x="183.8" y="702.0" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="normal" fill="#222">openswarm</text>
+<rect x="347.4" y="618.8" width="64.0" height="61.2" fill="#c47b2b"/>
+<text x="379.4" y="610.8" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="normal" fill="#222">0.85</text>
+<text x="379.4" y="702.0" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="normal" fill="#222">OmO</text>
+<rect x="543.0" y="551.8" width="64.0" height="128.2" fill="#3d6b58"/>
+<text x="575.0" y="543.8" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="normal" fill="#222">1.78</text>
+<text x="575.0" y="702.0" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="normal" fill="#222">Codex default</text>
+<rect x="738.6" y="551.8" width="64.0" height="128.2" fill="#6b4c7a"/>
+<text x="770.6" y="543.8" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="normal" fill="#222">1.78</text>
+<text x="770.6" y="702.0" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="normal" fill="#222">strongest</text>
+<rect x="934.2" y="680.0" width="64.0" height="0.0" fill="#3f6f8f"/>
+<text x="966.2" y="672.0" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="normal" fill="#222">0.00</text>
+<text x="966.2" y="702.0" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="normal" fill="#222">cheapest</text>
+</svg>

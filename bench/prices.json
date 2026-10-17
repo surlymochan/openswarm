@@ -1,0 +1,31 @@
+{
+  "label": "Computed from this table times the trace's estimated tokens. Not a measured bill.",
+  "retrieved": "2026-10-17",
+  "deepseek": {
+    "source": "https://api-docs.deepseek.com/quick_start/pricing/",
+    "retrieved": "2026-10-17",
+    "unit": "USD per 1M tokens",
+    "basis": "Off-peak cache-miss list price. Official docs double every rate at peak (weekdays 01:00-04:00 and 06:00-10:00 UTC) and charge much less on a cache hit. The benchmark prices every estimated token at the off-peak cache-miss rate so the figure does not depend on a cache or a clock.",
+    "models": {
+      "deepseek-flash": {"cost_in": 0.15, "cost_out": 0.6},
+      "deepseek-v4-pro": {"cost_in": 0.66, "cost_out": 1.98}
+    }
+  },
+  "ocgo": {
+    "source": "examples/demo-state.json cost_in/cost_out bands, assigned by policy.json ocgo.monthly_limits.go",
+    "unit": "USD per 1M tokens, subscription accounting prices",
+    "basis": "OpenCode Go is a subscription. openswarm turns these per-token costs into a fraction of each model's monthly cap (policy.json ocgo.window_fractions: 5h=0.2, 7d=0.5, 30d=1.0). The only per-token costs shipped in-repo are the three demo-state models. Cap 60 uses cheap-flash (0.1/0.4), cap 30 would use mid-coder (0.5/2.0), cap 15 uses big-pro (1.5/6.0). No model in this catalogue has cap 30.",
+    "window_fractions": {"5h": 0.2, "7d": 0.5, "30d": 1.0},
+    "bands": {
+      "cheap-flash": {"cost_in": 0.1, "cost_out": 0.4},
+      "mid-coder": {"cost_in": 0.5, "cost_out": 2.0},
+      "big-pro": {"cost_in": 1.5, "cost_out": 6.0}
+    }
+  },
+  "codex": {
+    "source": "No per-token price is published for the ChatGPT/Codex window. openswarm reads used_percent from session rate_limits.",
+    "unit": "share of a nominal 5h token budget",
+    "five_hour_token_budget": 2000000,
+    "basis": "Share = (estimated input + output tokens routed to Codex) / 2000000. The budget is a benchmark convention so subscription use is a fraction instead of a raw token count. It is not an OpenAI quota. Compare tools on this same denominator only."
+  }
+}

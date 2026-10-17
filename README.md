@@ -7,6 +7,45 @@
 
 **Claude plans. Codex, OpenCode Go and DeepSeek write the code.**
 
+## Benchmarks: openswarm vs oh-my-openagent (2026-10-17)
+
+Compared with [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent) (OmO) v5.1.35 (`0777686`), whose
+`model-core` package resolves a delegated task to a model through per-category fallback chains. Scripts, raw results and
+methodology: [`bench/`](bench/README.md) and [`bench/e2e/`](bench/e2e/README.md). Where OmO comes out ahead, the table says so.
+
+**End-to-end tasks.** 8 small real tasks (4 JS, 4 Python), hidden acceptance tests applied only after the agent exits.
+Every arm runs `grok-4.7-high` through the local `cursor-agent` (openswarm uses its new `--backend cursor` executor).
+
+| Arm | Success (hidden tests) | Median wall time (IQR) | Median tokens: total / input+output | n |
+| --- | --- | --- | --- | --- |
+| Single agent (baseline) | 24/24 (100%) | 55 s (46–132) | 105k / 28k | 24 |
+| openswarm (planner + worktree executor + host verify) | 24/24 (100%) | 220 s (137–356) | 207k / 64k | 24 |
+| oh-my-openagent | not run ¹ | – | – | 0 |
+
+On tasks this small the single agent already succeeds every time. openswarm's planner call and isolated, verified run
+cost about 4× the time and 2× the tokens.
+¹ OmO runs inside OpenCode/senpi with its own provider logins. Cursor's subscription can't serve it, and paid APIs were out of scope for
+this benchmark. The estimated metered cost to run it on DeepSeek is about $1.3 ([details](bench/e2e/README.md#results-2026-10-17-first-round)).
+
+**Routing under quota pressure.** A synthetic 80-task trace × 7 quota scenarios (560 decisions per router), with the same
+providers for both routers (Codex subscription, OpenCode Go, DeepSeek). Costs are *computed* from the price tables in
+`bench/prices.json` × estimated tokens. They are not bills.
+
+| Metric | openswarm | OmO | Codex-only baseline |
+| --- | --- | --- | --- |
+| First attempt sent to an already-exhausted quota | **0.0%** | 23.4% (254 failed attempts) | 28.6% |
+| Decisions with no usable model (this provider set) | **0.0%** | 19.8% ² | 28.6% |
+| Review tasks sent to a different model family | 54.8% | **71.4%** | 0% |
+| Codex 5h window used per trace pass (computed) | **0.48** | 0.85 | 1.78 |
+| Metered spend, all scenarios (computed) | **$0.00** | $1.54 | $0.00 |
+| Routing decision latency, in-process median | **0.008 ms** | 0.026 ms | – |
+| Providers / model ids known to the router | 3 backends / 27 | **26 / 36** | – |
+
+openswarm reads quota windows before it routes, so it never spends an attempt on an exhausted plan. By design, OmO
+learns about an exhausted plan from the usage-limit error and then moves to the next rung. OmO keeps review work on a
+different model family more often, and it covers far more providers.
+² 49 of OmO's 111 unrouted decisions are `writing` tasks. In OmO that chain only names Google/Anthropic models, which this provider set does not connect.
+
 openswarm is a quota-aware dispatcher for coding agents. Your planner (Claude Code) breaks work into tasks and
 reviews the results. openswarm sends each task to the cheapest executor that can handle it, runs it in an
 isolated git worktree with a hard time budget, checks the result on the host, and reports back. Nothing
@@ -30,6 +69,7 @@ openswarm splits the work:
   - [Codex CLI](https://github.com/openai/codex) is the main executor.
   - [OpenCode](https://opencode.ai) Go handles cheap or mechanical work, non-GPT second opinions, overflow, and 1M context.
   - DeepSeek is the metered last resort.
+  - Cursor CLI (`cursor-agent`) runs only when you pass `--backend cursor`, or when you add `cursor` to `routing.default_order`. It is not part of automatic routing.
 
 Routing decisions use live quota data, not guesses.
 
@@ -114,6 +154,7 @@ openswarm"*. The skill takes it from there.
 | Burn pace > 1.25× even | Effort −1 |
 | Resets within 24h with < 60% used | Effort +1, so quota isn't wasted |
 | DeepSeek balance below floor | Skips DeepSeek |
+| `--backend cursor` | Forces the Cursor CLI. Cursor is never chosen on its own unless `cursor` is listed in `routing.default_order` |
 
 The full rules are in [`SKILL.md`](SKILL.md#7-routing-rules-what-route-does). Every threshold is in
 [`policy.json`](policy.json).
@@ -134,6 +175,8 @@ The full rules are in [`SKILL.md`](SKILL.md#7-routing-rules-what-route-does). Ev
         └───────┬───────────────────┬───────────────────┬──────────┘
           codex exec          opencode run         opencode run
          (Codex plan)       (OpenCode Go plan)    (DeepSeek API)
+
+Cursor CLI is a fourth executor, opt-in only (`--backend cursor`).
 ```
 
 | Path | What |
@@ -166,6 +209,7 @@ Override any key in `$OPENSWARM_HOME/policy.local.json`. It is deep-merged over 
 | `OPENSWARM_CODEX_PLAN`, `OPENSWARM_CLAUDE_PLAN` | Declare your plans explicitly (recommended) |
 | `DEEPSEEK_API_KEY` | DeepSeek key, used only for the balance and model-list API |
 | `OPENSWARM_OPENCODE_BIN`, `OPENSWARM_OPENCODE_DB` | Non-standard OpenCode install locations |
+| `OPENSWARM_CURSOR_BIN` | Cursor CLI binary. Otherwise `cursor-agent` on `PATH`, then `~/.local/bin/cursor-agent` |
 | `OPENSWARM_STATE_FILE` | Offline mode: route against a saved or synthetic state; nothing is probed |
 | `XSWARM_*` | Legacy names from before the rename (formerly *xswarm*); still honoured, `OPENSWARM_*` wins |
 

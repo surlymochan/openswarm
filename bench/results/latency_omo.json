@@ -1,0 +1,15 @@
+{
+  "in_process": {
+    "kind": "in_process",
+    "unit": "ms",
+    "n": 1120,
+    "median": 0.0292,
+    "p95": 0.1027,
+    "min": 0.0092,
+    "max": 1.5798
+  },
+  "cli_cold_start": null,
+  "note": "model-core has no standalone route CLI. The figure is in-process time around resolveModelPipeline plus the exhaustion walk, after bun has loaded the module. It is not comparable to openswarm's process cold start.",
+  "omo_commit": "07776864a043acdda9f9976ac8f71659a25f1d86",
+  "omo_dir": "<omo-dir>"
+}

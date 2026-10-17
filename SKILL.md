@@ -136,6 +136,7 @@ In a team, make teammates **thin openswarm dispatchers**: each teammate owns a s
 - Rate-limit errors open a 30-minute breaker for that model or limit and fall back to the next backend in the same worktree (reset first). Fallback is disabled when you force `--backend`.
 - OpenCode Go: plan auto-detected (Go unless spend proves Plus). Per-model caps come from the docs table in `policy.json` (5h = 20%, 7d = 50%, 30d = 100% of the monthly cap). It only sees `opencode run` spend, not OpenCode Go traffic that goes through other clients or proxies.
 - DeepSeek is used only when its balance is above the floor (¥10).
+- `cursor` is opt-in. Routing never selects it unless `routing.default_order` lists `cursor`, or the run passes `--backend cursor`. The model is `--model` or `cursor.default_model` (`grok-4.7-high`). The run's `result.json` and ledger entry record `usage` (`inputTokens`, `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`) and wall-clock `seconds`. Quota for Cursor is unknown, so it does not affect the other backends' windows.
 
 Override anything in `~/.claude/openswarm/policy.local.json`, deep-merged over `policy.json`: thresholds, the difficulty map, exclude patterns, plan, model caps.
 

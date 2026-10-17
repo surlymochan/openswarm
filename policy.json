@@ -193,6 +193,10 @@
       }
     }
   },
+  "cursor": {
+    "_doc": "Opt-in executor. Not in routing.default_order, so route never picks it unless you add \"cursor\" there or pass --backend cursor. Quota is unknown; the CLI reports token usage after the run.",
+    "default_model": "grok-4.7-high"
+  },
   "deepseek": {
     "_doc": "API key: DEEPSEEK_API_KEY env, or list macOS Keychain items you created for openswarm, e.g. [\"openswarm-deepseek-api-key\"].",
     "keychain_items": [],
