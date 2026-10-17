@@ -197,6 +197,11 @@
     "_doc": "Opt-in executor. Not in routing.default_order, so route never picks it unless you add \"cursor\" there or pass --backend cursor. Quota is unknown; the CLI reports token usage after the run.",
     "default_model": "grok-4.7-high"
   },
+  "pi": {
+    "_doc": "Opt-in executor: Pi coding agent (pi -p --mode json). Not in routing.default_order. provider/default_model null means Pi's own default. OPENSWARM_PI_BIN may point at a wrapper that takes the same flags. Quota is unknown; usage is summed from message_end events.",
+    "provider": null,
+    "default_model": null
+  },
   "deepseek": {
     "_doc": "API key: DEEPSEEK_API_KEY env, or list macOS Keychain items you created for openswarm, e.g. [\"openswarm-deepseek-api-key\"].",
     "keychain_items": [],

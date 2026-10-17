@@ -2,6 +2,7 @@
 """openswarm — Claude plans, Codex / OpenCode Go / DeepSeek execute.
 
 Cursor CLI is an opt-in executor (`--backend cursor`); it is not in the automatic routing order.
+Pi coding agent is an opt-in executor (`--backend pi`); it is not in the automatic routing order either.
 
 Subcommands:
   probe            discover models, plans, quotas -> $OPENSWARM_HOME/state.json (default ~/.claude/openswarm)
@@ -520,7 +521,7 @@ def probe(policy, quiet=False):
     state = {"generated_at": NOW(), "generated_at_local": iso(NOW()),
              "claude": probe_claude(policy), "codex": probe_codex(policy),
              "ocgo": probe_ocgo(policy), "deepseek": probe_deepseek(policy),
-             "cursor": probe_cursor(policy)}
+             "cursor": probe_cursor(policy), "pi": probe_pi(policy)}
     jsave(STATE, state)
     return state
 
@@ -736,7 +737,44 @@ def plan_cursor(prof, st, policy, forced, notes):
     return {"backend": "cursor", "model": model, "effort": None, "tier": tier}, None
 
 
-PLANNERS = {"codex": plan_codex, "ocgo": plan_ocgo, "deepseek": plan_deepseek, "cursor": plan_cursor}
+def pi_bin():
+    """OPENSWARM_PI_BIN, then `pi` on PATH, then ~/.local/bin/pi.
+
+    OPENSWARM_PI_BIN may be a wrapper that accepts the same flags and prints Pi's `--mode json` events.
+    A set OPENSWARM_PI_BIN that is missing or not executable is an error, not a cue to try the next place.
+    """
+    env_bin = envvar("PI_BIN")
+    if env_bin:
+        return env_bin if os.access(env_bin, os.X_OK) else None
+    found = shutil.which("pi")
+    if found and os.access(found, os.X_OK):
+        return found
+    home_bin = os.path.expanduser("~/.local/bin/pi")
+    if os.access(home_bin, os.X_OK):
+        return home_bin
+    return None
+
+
+def probe_pi(policy):
+    cfg = policy.get("pi") or {}
+    return {"binary": pi_bin(), "provider": cfg.get("provider"), "default_model": cfg.get("default_model"),
+            "quota": None}
+
+
+def plan_pi(prof, st, policy, forced, notes):
+    known = st.get("pi") if isinstance(st.get("pi"), dict) else None
+    binary = known.get("binary") if known is not None and "binary" in known else pi_bin()
+    if not binary:
+        return None, "no working pi binary"
+    model = prof.get("model") or (policy.get("pi") or {}).get("default_model")
+    if f"pi/{model or 'default'}" in breakers() or "pi/all" in breakers():
+        return None, "pi breaker open"
+    notes.append("pi quota unknown (opt-in backend; not metered by openswarm)")
+    tier = policy["difficulty_map"][str(prof["difficulty"])]["tier"]
+    return {"backend": "pi", "model": model, "effort": None, "tier": tier}, None
+
+
+PLANNERS = {"codex": plan_codex, "ocgo": plan_ocgo, "deepseek": plan_deepseek, "cursor": plan_cursor, "pi": plan_pi}
 
 
 def claude_mode(st, policy):
@@ -1054,7 +1092,76 @@ def exec_cursor(d, st, prompt, wd, rdir, timeout, evp):
     return rc, final, {"usage": usage}, err_text
 
 
-EXECUTORS = {"codex": exec_codex, "ocgo": exec_opencode, "deepseek": exec_opencode, "cursor": exec_cursor}
+PI_USAGE_KEYS = ("input", "output", "cacheRead", "cacheWrite")
+PI_TOOLS = "read,bash,edit,write,grep,find,ls"
+
+
+def pi_usage(events_path):
+    """Sum assistant `message_end` usage from a Pi `--mode json` stream. Returns (usage, final_text, errors)."""
+    usage = {k: 0 for k in PI_USAGE_KEYS}
+    final, errors = None, []
+    try:
+        fh = open(events_path, errors="ignore")
+    except OSError:
+        return usage, final, errors
+    with fh:
+        for line in fh:
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if ev.get("type") != "message_end":
+                continue
+            m = ev.get("message") or {}
+            if m.get("role") != "assistant":
+                continue
+            u = m.get("usage") or {}
+            for k in PI_USAGE_KEYS:
+                try:
+                    usage[k] += int(u.get(k) or 0)
+                except (TypeError, ValueError):
+                    pass
+            if m.get("stopReason") == "error" or m.get("errorMessage"):
+                errors.append(str(m.get("errorMessage") or "error")[:500])
+            text = "".join(b.get("text", "") for b in m.get("content") or [] if isinstance(b, dict) and b.get("type") == "text")
+            if text.strip():
+                final = text
+    return usage, final, errors
+
+
+def exec_pi(d, st, prompt, wd, rdir, timeout, evp):
+    """pi -p --mode json [--provider P] [--model M] --tools read,bash,edit,write,grep,find,ls <prompt>
+
+    stdin is /dev/null (run_proc) and cwd is the worktree. Quota is unknown; usage is summed from message_end events.
+    """
+    binary = pi_bin()
+    if not binary:
+        open(evp, "w").close()
+        with open(evp + ".err", "w") as f:
+            f.write("pi not found\n")
+        return 127, None, {"usage": {k: 0 for k in PI_USAGE_KEYS}}, "pi not found"
+    cfg = load_policy().get("pi") or {}
+    cmd = [binary, "-p", "--mode", "json"]
+    if cfg.get("provider"):
+        cmd += ["--provider", cfg["provider"]]
+    if d.get("model"):
+        cmd += ["--model", d["model"]]
+    cmd += ["--tools", PI_TOOLS, prompt]
+    rc = run_proc(cmd, wd, os.environ.copy(), timeout, evp)
+    usage, text, errors = pi_usage(evp)
+    final = extract_json(text) if isinstance(text, str) else None
+    try:
+        with open(evp + ".err", errors="ignore") as errf:
+            err_tail = errf.read()[-3000:]
+    except OSError:
+        err_tail = ""
+    if errors and rc == 0:
+        rc = 1
+    return rc, final, {"usage": usage}, "\n".join(errors) + err_tail
+
+
+EXECUTORS = {"codex": exec_codex, "ocgo": exec_opencode, "deepseek": exec_opencode, "cursor": exec_cursor,
+             "pi": exec_pi}
 
 
 def git(args, cwd, timeout=60):
@@ -1762,6 +1869,10 @@ def cmd_status(policy, refresh):
     print(f"Cursor   opt-in (--backend cursor) bin={cu.get('binary') or '-'} "
           f"model={cu.get('default_model') or (policy.get('cursor') or {}).get('default_model') or 'grok-4.7-high'} "
           f"quota=unknown")
+    pi = st.get("pi") or {}
+    print(f"Pi       opt-in (--backend pi) bin={pi.get('binary') or '-'} "
+          f"model={pi.get('default_model') or (policy.get('pi') or {}).get('default_model') or 'pi default'} "
+          f"quota=unknown")
     br = breakers()
     if br:
         print(f"Breakers {', '.join(f'{k} until {iso(v)}' for k, v in br.items())}")
@@ -1784,8 +1895,8 @@ def main():
                        help="impl|refactor|debug|test|docs|mechanical|review|research|migration|format|rename")
         p.add_argument("--difficulty", type=int, default=3, help="1 (trivial) .. 5 (hardest)")
         p.add_argument("--context-tokens", type=int, default=0, help="approx context the executor must read")
-        p.add_argument("--backend", choices=["codex", "ocgo", "deepseek", "cursor"],
-                       help="force a backend. cursor is opt-in and is not chosen unless named here or listed in routing")
+        p.add_argument("--backend", choices=["codex", "ocgo", "deepseek", "cursor", "pi"],
+                       help="force a backend. cursor and pi are opt-in and are not chosen unless named here or listed in routing")
         p.add_argument("--model")
         p.add_argument("--effort")
 

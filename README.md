@@ -13,8 +13,23 @@ Compared with [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent)
 `model-core` package resolves a delegated task to a model through per-category fallback chains. Scripts, raw results and
 methodology: [`bench/`](bench/README.md) and [`bench/e2e/`](bench/e2e/README.md). Where OmO comes out ahead, the table says so.
 
-**End-to-end tasks.** 8 small real tasks (4 JS, 4 Python), hidden acceptance tests applied only after the agent exits.
-Every arm runs `grok-4.7-high` through the local `cursor-agent` (openswarm uses its new `--backend cursor` executor).
+**Real GitHub issues (SWE-bench Verified), 2026-10-18.** Six hard instances from sympy, pytest and pylint; success
+means the official FAIL_TO_PASS and PASS_TO_PASS tests all pass. Every arm runs on the Pi coding agent with DeepSeek
+`deepseek-flash`, n=1 per cell, 20-minute cap; details and commands are in
+[`bench/swebench/`](bench/swebench/README.md).
+
+| Arm | Resolved (official tests) | Median wall-clock (IQR) | Median $ per task (DeepSeek list price) | Total $ (all runs) | n |
+| --- | --- | --- | --- | --- | --- |
+| Plain agent (baseline) | 1/6 (17%) | 124 s (110–175) | $0.0234 | $0.16 | 6 |
+| superpowers v7.0.0 | 0/6 (0%) | 154 s (136–340) | $0.0285 | $0.31 | 6 |
+| OpenFlow 0.2.1 | 2/6 (33%) | 230 s (200–266) | $0.0412 | $0.23 | 6 |
+| openswarm (planner + Pi executor) | 3/6 (50%) | 228 s (187–254) | $0.0377 | $0.21 | 6 |
+| oh-my-openagent v5.1.35 | not run ¹ | – | – | – | 0 |
+
+openswarm had no clean MiniMax run (usage cap), so only the DeepSeek comparison includes it.
+
+**Synthetic end-to-end tasks.** 8 small real tasks (4 JS, 4 Python), hidden acceptance tests applied only after the agent exits.
+For these synthetic tasks, every arm runs `grok-4.7-high` through the local `cursor-agent` (openswarm uses its new `--backend cursor` executor).
 
 | Arm | Success (hidden tests) | Median wall time (IQR) | Median tokens: total / input+output | n |
 | --- | --- | --- | --- | --- |

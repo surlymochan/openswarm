@@ -137,6 +137,7 @@ In a team, make teammates **thin openswarm dispatchers**: each teammate owns a s
 - OpenCode Go: plan auto-detected (Go unless spend proves Plus). Per-model caps come from the docs table in `policy.json` (5h = 20%, 7d = 50%, 30d = 100% of the monthly cap). It only sees `opencode run` spend, not OpenCode Go traffic that goes through other clients or proxies.
 - DeepSeek is used only when its balance is above the floor (¥10).
 - `cursor` is opt-in. Routing never selects it unless `routing.default_order` lists `cursor`, or the run passes `--backend cursor`. The model is `--model` or `cursor.default_model` (`grok-4.7-high`). The run's `result.json` and ledger entry record `usage` (`inputTokens`, `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`) and wall-clock `seconds`. Quota for Cursor is unknown, so it does not affect the other backends' windows.
+- `pi` is opt-in the same way (`--backend pi`, or list `pi` in `routing.default_order`). It runs `pi -p --mode json --tools read,bash,edit,write,grep,find,ls` in the worktree; `OPENSWARM_PI_BIN` may name a wrapper with the same flags. `--model` or `pi.default_model` picks the model, otherwise Pi's own default. `usage` (`input`, `output`, `cacheRead`, `cacheWrite`) is summed from Pi's `message_end` events. Quota is unknown.
 
 Override anything in `~/.claude/openswarm/policy.local.json`, deep-merged over `policy.json`: thresholds, the difficulty map, exclude patterns, plan, model caps.
 
