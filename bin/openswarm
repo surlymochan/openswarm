@@ -1,0 +1,1740 @@
+#!/usr/bin/env python3
+"""openswarm — Claude plans, Codex / OpenCode Go / DeepSeek execute.
+
+Subcommands:
+  probe            discover models, plans, quotas -> $OPENSWARM_HOME/state.json (default ~/.claude/openswarm)
+  status           human summary of state + recommended concurrency
+  route            pick backend/model/effort for a task profile (JSON out)
+  run              route + execute in an isolated git worktree, record ledger (JSON out)
+  watch            stream actionable events (progress, risk, stalls) for one or more runs
+  runs / report    snapshot of recent runs / compact scheduled check-in
+  stop             terminate a run (partial work is still committed to its branch)
+  ingest-claude    record Claude plan usage (from statusline JSON on stdin, or flags)
+  ledger           show recent runs
+
+Local data sources and credentials are documented in README.md ("What openswarm reads").
+Nothing that reads another tool's login/auth file is enabled by default.
+"""
+import argparse
+import base64
+import datetime as dt
+import glob
+import json
+import os
+import re
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.request
+import uuid
+
+HOME = os.path.expanduser("~")
+
+
+def envvar(name, default=None):
+    """OPENSWARM_<name>, falling back to the legacy XSWARM_<name> (pre-rename installs)."""
+    return os.environ.get(f"OPENSWARM_{name}") or os.environ.get(f"XSWARM_{name}") or default
+
+
+SKILL_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+DATA = envvar("HOME", f"{HOME}/.claude/openswarm")
+STATE = f"{DATA}/state.json"
+LEDGER = f"{DATA}/ledger.jsonl"
+CLAUDE_Q = f"{DATA}/quota-claude.json"
+BREAKERS = f"{DATA}/breakers.json"
+RUNS = f"{DATA}/runs"
+WORKTREES = f"{DATA}/worktrees"
+OPENCODE_DB = envvar("OPENCODE_DB", f"{HOME}/.local/share/opencode/opencode.db")
+
+NOW = time.time
+
+
+# ---------------------------------------------------------------- utils
+
+def jload(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def jsave(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def deep_merge(a, b):
+    out = dict(a)
+    for k, v in (b or {}).items():
+        out[k] = deep_merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
+def load_policy():
+    base = jload(f"{SKILL_DIR}/policy.json", {})
+    return deep_merge(base, jload(f"{DATA}/policy.local.json", {}))
+
+
+def source_enabled(policy, name):
+    """Opt-in switches for reading other tools' local files (policy.local_sources.<name>)."""
+    return bool((policy.get("local_sources") or {}).get(name, False))
+
+
+def sh(cmd, timeout=60, env=None, cwd=None):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env,
+                           cwd=cwd, stdin=subprocess.DEVNULL)
+        return p.returncode, p.stdout, p.stderr
+    except Exception as e:  # noqa: BLE001
+        return 127, "", str(e)
+
+
+def iso(ts):
+    if not ts:
+        return None
+    return dt.datetime.fromtimestamp(ts).astimezone().isoformat(timespec="minutes")
+
+
+def to_epoch(v):
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return v / 1000 if v > 1e12 else v
+    try:
+        return dt.datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def ver_key(s):
+    return [int(x) for x in re.findall(r"\d+", s or "")]
+
+
+def window_stats(used_pct, window_minutes, resets_at):
+    """Normalize a rate-limit window: used fraction, pace (>1 = burning faster than even), hours to reset."""
+    if used_pct is None:
+        return None
+    used = float(used_pct) / 100.0
+    if resets_at and resets_at < NOW():  # window rolled over since we observed it
+        used = 0.0
+    out = {"used": round(used, 4), "window_minutes": window_minutes, "resets_at": resets_at,
+           "resets_at_local": iso(resets_at), "hours_to_reset": None, "pace": None}
+    if resets_at and window_minutes:
+        left = max(0.0, resets_at - NOW())
+        out["hours_to_reset"] = round(left / 3600, 2)
+        elapsed = 1 - left / (window_minutes * 60)
+        if elapsed > 0.05:
+            out["pace"] = round(used / elapsed, 2)
+    return out
+
+
+# ---------------------------------------------------------------- claude
+
+def probe_claude(policy):
+    # Plan resolution, most explicit first: OPENSWARM_CLAUDE_PLAN env -> policy claude.plan ->
+    # (opt-in) the plan tier fields of ~/.claude.json. No tokens are read from that file.
+    explicit = envvar("CLAUDE_PLAN") or (policy.get("claude") or {}).get("plan")
+    oa = {}
+    if not explicit and source_enabled(policy, "claude_account_plan"):
+        oa = (jload(f"{HOME}/.claude.json", {}) or {}).get("oauthAccount") or {}
+    org_type = oa.get("organizationType") or ""
+    tier = oa.get("organizationRateLimitTier") or oa.get("userRateLimitTier") or ""
+    plan = explicit or "unknown"
+    if explicit:
+        pass
+    elif "max" in org_type or "max" in tier:
+        plan = "max-20x" if "20x" in tier else ("max-5x" if "5x" in tier else "max")
+    elif "pro" in org_type:
+        plan = "pro"
+    elif org_type:
+        plan = org_type
+    provider = os.environ.get("CLAUDE_PROVIDER") or ""
+    if not provider:
+        cd = os.environ.get("CLAUDE_CONFIG_DIR", "")
+        provider = next((p for p in ("ocgo", "deepseek", "minimax") if cd.endswith(p)), "official")
+    q = jload(CLAUDE_Q, {}) or {}
+    age_min = round((NOW() - q["ts"]) / 60, 1) if q.get("ts") else None
+    stale = age_min is None or age_min > policy["thresholds"]["claude_stale_minutes"]
+    rl = q.get("rate_limits") or {}
+
+    def win(key, minutes):
+        w = rl.get(key) or {}
+        pct = w.get("used_percentage", w.get("utilization"))
+        return window_stats(pct, minutes, to_epoch(w.get("resets_at"))) if pct is not None else None
+
+    return {
+        "plan": plan, "org_type": org_type, "rate_limit_tier": tier,
+        "provider": provider, "metered_by_anthropic": provider == "official",
+        "five_hour": win("five_hour", 300), "seven_day": win("seven_day", 10080),
+        "source": q.get("source"), "age_minutes": age_min, "stale": stale,
+    }
+
+
+def ingest_claude(args):
+    if args.five_hour is not None or args.seven_day is not None:
+        rl = {}
+        if args.five_hour is not None:
+            rl["five_hour"] = {"used_percentage": args.five_hour, "resets_at": to_epoch(args.five_hour_resets)}
+        if args.seven_day is not None:
+            rl["seven_day"] = {"used_percentage": args.seven_day, "resets_at": to_epoch(args.seven_day_resets)}
+        src = "manual"
+    else:
+        payload = json.load(sys.stdin)
+        rl = payload.get("rate_limits") or payload.get("plan") or {}
+        src = "statusline" if "rate_limits" in payload else "get_usage"
+    if not rl:
+        return
+    jsave(CLAUDE_Q, {"ts": NOW(), "source": src, "rate_limits": rl})
+    print(json.dumps({"ok": True, "source": src}))
+
+
+# ---------------------------------------------------------------- codex
+
+def codex_candidates(policy):
+    seen, out = set(), []
+    for c in policy["codex"]["binary_candidates"]:
+        if c.startswith("$PATH:"):
+            paths = [shutil.which(c[6:])]
+        else:
+            paths = glob.glob(os.path.expanduser(c))
+        for p in paths:
+            if p and os.path.isfile(p) and os.access(p, os.X_OK):
+                rp = os.path.realpath(p)
+                if rp not in seen:
+                    seen.add(rp)
+                    out.append(p)
+    return out
+
+
+def find_codex(policy):
+    """Newest codex binary that can actually load the user's config.toml."""
+    good = []
+    for b in codex_candidates(policy):
+        rc, out, _ = sh([b, "--version"], timeout=15)
+        if rc != 0:
+            continue
+        version = out.strip().split()[-1] if out.strip() else "0"
+        rc, _, _ = sh([b, "features", "list"], timeout=20, cwd="/tmp")
+        if rc == 0:
+            good.append((ver_key(version), version, b))
+    if not good:
+        return None, None
+    good.sort(reverse=True)
+    return good[0][2], good[0][1]
+
+
+def codex_plan(policy):
+    """ChatGPT plan behind Codex. Explicit OPENSWARM_CODEX_PLAN / policy codex.plan wins. Decoding the plan claim
+    from ~/.codex/auth.json is opt-in (local_sources.codex_auth_plan): only the id_token's
+    chatgpt_plan_type claim is decoded locally; the token is never sent anywhere or stored."""
+    explicit = envvar("CODEX_PLAN") or (policy.get("codex") or {}).get("plan")
+    if explicit:
+        return explicit
+    if not source_enabled(policy, "codex_auth_plan"):
+        return "unknown"
+    a = jload(f"{HOME}/.codex/auth.json", {}) or {}
+    tok = (a.get("tokens") or {}).get("id_token")
+    if not tok:
+        return a.get("auth_mode") or "unknown"
+    try:
+        p = tok.split(".")[1]
+        p += "=" * (-len(p) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(p))
+        return claims.get("https://api.openai.com/auth", {}).get("chatgpt_plan_type") or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def classify_codex(desc, policy):
+    d = (desc or "").lower()
+    kw = policy["codex"]["tier_keywords"]
+    for tier in ("deep", "fast", "balanced"):
+        if any(k in d for k in kw[tier]):
+            return tier
+    return "balanced"
+
+
+def codex_models(binary, policy):
+    data = None
+    if binary:
+        rc, out, _ = sh([binary, "debug", "models"], timeout=30, cwd="/tmp")
+        if rc == 0:
+            try:
+                data = json.loads(out)
+            except Exception:
+                data = None
+    source = "codex debug models"
+    if not data:
+        data = jload(f"{HOME}/.codex/models_cache.json", {}) or {}
+        source = "models_cache.json"
+    models = []
+    legacy_kw = policy["codex"]["legacy_keywords"]
+    for m in data.get("models", []):
+        if m.get("visibility") != "list":
+            continue
+        desc = m.get("description") or ""
+        efforts = [x["effort"] for x in m.get("supported_reasoning_levels", [])
+                   if x["effort"] not in policy["never_efforts"]]
+        models.append({
+            "id": m["slug"], "description": desc, "priority": m.get("priority", 99),
+            "tier": classify_codex(desc, policy),
+            "legacy": any(k in desc.lower() for k in legacy_kw) or bool(m.get("upgrade")),
+            "efforts": efforts, "default_effort": m.get("default_reasoning_level"),
+            "context_window": m.get("context_window"),
+            "limit_id": policy["codex"]["limit_id_by_model"].get(m["slug"], policy["codex"]["default_limit_id"]),
+        })
+    models.sort(key=lambda x: x["priority"])
+    return models, source
+
+
+def codex_limits(policy):
+    """Latest rate_limits per limit_id from recent rollouts (newest first). Only lines containing a
+    "rate_limits" payload are parsed; conversation content is ignored. Disable with local_sources.codex_sessions."""
+    if not source_enabled(policy, "codex_sessions"):
+        return {}
+    files = glob.glob(f"{HOME}/.codex/sessions/*/*/*/rollout-*.jsonl")
+    files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
+    found, newest_ts = {}, None
+    for f in files[:40]:
+        try:
+            size = os.path.getsize(f)
+            with open(f, "rb") as fh:
+                fh.seek(max(0, size - 400_000))
+                lines = fh.read().decode("utf-8", "ignore").splitlines()
+        except Exception:
+            continue
+        for line in reversed(lines):
+            if '"rate_limits"' not in line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            rl = (ev.get("payload") or {}).get("rate_limits")
+            if not rl:
+                continue
+            lid = rl.get("limit_id") or "codex"
+            if lid in found:
+                continue
+            ts = to_epoch(ev.get("timestamp"))
+            newest_ts = max(newest_ts or 0, ts or 0)
+            wins = {}
+            for k in ("primary", "secondary"):
+                w = rl.get(k)
+                if w:
+                    name = "five_hour" if w.get("window_minutes") == 300 else (
+                        "seven_day" if w.get("window_minutes") == 10080 else f"w{w.get('window_minutes')}")
+                    wins[name] = window_stats(w.get("used_percent"), w.get("window_minutes"), w.get("resets_at"))
+            found[lid] = {"name": rl.get("limit_name"), "windows": wins, "observed_at": iso(ts),
+                          "age_minutes": round((NOW() - ts) / 60, 1) if ts else None,
+                          "credits": rl.get("credits"), "reached": rl.get("rate_limit_reached_type")}
+        if "codex" in found and len(found) >= 2:
+            break
+    return found
+
+
+def probe_codex(policy):
+    binary, version = find_codex(policy)
+    models, source = codex_models(binary, policy)
+    return {"binary": binary, "version": version, "plan": codex_plan(policy), "models": models,
+            "models_source": source, "limits": codex_limits(policy), "config_model": codex_config_model()}
+
+
+def codex_config_model():
+    """Top-level default `model` in ~/.codex/config.toml (used by bare `codex exec`)."""
+    try:
+        for line in open(f"{HOME}/.codex/config.toml"):
+            if line.lstrip().startswith("["):
+                break
+            m = re.match(r'\s*model\s*=\s*"([^"]+)"', line)
+            if m:
+                return m.group(1)
+    except OSError:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------- opencode (ocgo + deepseek)
+
+def opencode_bin():
+    # Prefer the real binary over shell wrappers; OPENSWARM_OPENCODE_BIN overrides.
+    env_bin = envvar("OPENCODE_BIN")
+    if env_bin and os.access(env_bin, os.X_OK):
+        return env_bin
+    for p in ("/opt/homebrew/bin/opencode", "/usr/local/bin/opencode"):
+        if os.access(p, os.X_OK):
+            return p
+    w = shutil.which("opencode")
+    return w
+
+
+def opencode_env():
+    env = dict(os.environ)
+    env["OPENCODE_SKIP_STARTUP"] = "1"
+    env["OPENCODE_CONFIG_DIR"] = f"{HOME}/.config/opencode"
+    return env
+
+
+def opencode_models(provider):
+    ob = opencode_bin()
+    if not ob:
+        return []
+    rc, out, _ = sh([ob, "models", provider, "--verbose", "--pure"], timeout=60, env=opencode_env())
+    if rc != 0:
+        return []
+    models, buf, cur = [], [], None
+
+    def flush():
+        if cur and buf:
+            try:
+                models.append(json.loads("\n".join(buf)))
+            except Exception:
+                pass
+
+    for line in out.splitlines():
+        if re.match(rf"^{re.escape(provider)}/\S+$", line.strip()):
+            flush()
+            cur, buf = line.strip(), []
+        elif cur is not None:
+            buf.append(line)
+    flush()
+    return models
+
+
+def ocgo_spend(policy):
+    """Per-model opencode-go spend over rolling 5h / 7d / 30d windows from opencode's local DB (read-only;
+    only model id, role and cost columns). Disable with local_sources.opencode_db."""
+    out = {}
+    if not source_enabled(policy, "opencode_db") or not os.path.exists(OPENCODE_DB):
+        return out
+    try:
+        con = sqlite3.connect(f"file:{OPENCODE_DB}?mode=ro", uri=True, timeout=5)
+        now_ms = int(NOW() * 1000)
+        for key, secs in (("5h", 5 * 3600), ("7d", 7 * 86400), ("30d", 30 * 86400)):
+            rows = con.execute(
+                "select json_extract(data,'$.modelID'), sum(json_extract(data,'$.cost')) from message "
+                "where json_extract(data,'$.providerID')='opencode-go' and json_extract(data,'$.role')='assistant' "
+                "and time_created > ? group by 1", (now_ms - secs * 1000,)).fetchall()
+            for mid, cost in rows:
+                out.setdefault(mid, {"5h": 0.0, "7d": 0.0, "30d": 0.0})[key] = round(cost or 0.0, 4)
+        con.close()
+    except Exception as e:  # noqa: BLE001
+        out["_error"] = str(e)
+    return out
+
+
+def probe_ocgo(policy):
+    cfg = policy["ocgo"]
+    raw = opencode_models("opencode-go")
+    spend = ocgo_spend(policy)
+    limits_tbl = cfg["monthly_limits"]
+    plan = cfg["plan"]
+    if plan == "auto":
+        plan = "go"
+        for mid, s in spend.items():
+            if mid.startswith("_"):
+                continue
+            if s["30d"] > limits_tbl["go"].get(mid, limits_tbl["go"]["_default"]) * 1.02:
+                plan = "plus"  # spent more than Go allows without being cut off
+        for e in recent_ledger(500):
+            if e.get("backend") == "ocgo" and e.get("error_class") == "rate_limit" and plan == "go":
+                pass  # consistent with Go; keep
+    limits = limits_tbl[plan]
+    excl = cfg["exclude_patterns"]
+    models = []
+    for m in raw:
+        mid = m.get("id", "")
+        caps = m.get("capabilities") or {}
+        excluded = any(p in mid for p in excl) or not caps.get("toolcall") or m.get("status") not in (None, "active")
+        cost = m.get("cost") or {}
+        monthly = limits.get(mid, limits["_default"])
+        s = spend.get(mid, {"5h": 0.0, "7d": 0.0, "30d": 0.0})
+        wf = cfg["window_fractions"]
+        usage = {w: round(s[w] / (monthly * wf[w]), 4) if monthly else 0 for w in ("5h", "7d", "30d")}
+        models.append({
+            "id": mid, "name": m.get("name"), "family": m.get("family"), "release_date": m.get("release_date"),
+            "cost_in": cost.get("input"), "cost_out": cost.get("output"),
+            "context": (m.get("limit") or {}).get("context"),
+            "variants": list((m.get("variants") or {}).keys()), "reasoning": caps.get("reasoning"),
+            "monthly_limit_usd": monthly, "spend_usd": s, "usage": usage,
+            "excluded": excluded,
+        })
+    # Tier by output price among usable models (price is the best available proxy for capability).
+    usable = sorted([m for m in models if not m["excluded"] and m["cost_out"] is not None], key=lambda m: m["cost_out"])
+    n = len(usable)
+    for i, m in enumerate(usable):
+        m["tier"] = "fast" if i < n / 3 else ("balanced" if i < 2 * n / 3 else "deep")
+    for m in models:
+        m.setdefault("tier", None)
+    return {"binary": opencode_bin(), "plan": plan, "plan_inferred": cfg["plan"] == "auto",
+            "limits_source": cfg["monthly_limits_source"], "models": models,
+            "spend_note": "only opencode-run usage is visible locally; traffic outside `opencode run` is not counted"}
+
+
+def keychain(item):
+    """macOS Keychain lookup for an item YOU created for openswarm (see README). No-op elsewhere."""
+    if sys.platform != "darwin" or not shutil.which("security"):
+        return None
+    for flag in ("-s", "-a"):
+        rc, out, _ = sh(["security", "find-generic-password", flag, item, "-w"], timeout=10)
+        if rc == 0 and out.strip():
+            return out.strip()
+    return None
+
+
+def probe_deepseek(policy):
+    # DEEPSEEK_API_KEY env wins; otherwise only the Keychain items you list in deepseek.keychain_items (default none).
+    key = os.environ.get("DEEPSEEK_API_KEY") or next(
+        (k for k in (keychain(i) for i in policy["deepseek"].get("keychain_items") or []) if k), None)
+    res = {"plan": "pay-as-you-go", "balance": None, "currency": None, "available": None, "api_models": [],
+           "opencode_models": [m.get("id") for m in opencode_models("deepseek")]}
+    if not key:
+        res["error"] = "no api key"
+        return res
+    hdr = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
+    try:
+        req = urllib.request.Request("https://api.deepseek.com/user/balance", headers=hdr)
+        d = json.load(urllib.request.urlopen(req, timeout=15))
+        res["available"] = d.get("is_available")
+        bi = (d.get("balance_infos") or [{}])[0]
+        res["balance"], res["currency"] = float(bi.get("total_balance", 0)), bi.get("currency")
+        req = urllib.request.Request("https://api.deepseek.com/models", headers=hdr)
+        res["api_models"] = [m["id"] for m in json.load(urllib.request.urlopen(req, timeout=15)).get("data", [])]
+    except Exception as e:  # noqa: BLE001
+        res["error"] = str(e)[:200]
+    return res
+
+
+# ---------------------------------------------------------------- state
+
+def probe(policy, quiet=False):
+    state = {"generated_at": NOW(), "generated_at_local": iso(NOW()),
+             "claude": probe_claude(policy), "codex": probe_codex(policy),
+             "ocgo": probe_ocgo(policy), "deepseek": probe_deepseek(policy)}
+    jsave(STATE, state)
+    return state
+
+
+def get_state(policy, refresh=False):
+    fixed = envvar("STATE_FILE")
+    if fixed:  # offline mode: route/status against a saved or synthetic state (demos, tests, CI)
+        st = jload(fixed)
+        if not st:
+            sys.exit(f"openswarm: cannot read OPENSWARM_STATE_FILE={fixed}")
+        return st
+    st = jload(STATE)
+    ttl = policy["thresholds"]["state_ttl_minutes"] * 60
+    if refresh or not st or NOW() - st.get("generated_at", 0) > ttl:
+        st = probe(policy)
+    return st
+
+
+def breakers():
+    b = jload(BREAKERS, {}) or {}
+    return {k: v for k, v in b.items() if v > NOW()}
+
+
+def trip_breaker(key, policy, reason):
+    b = breakers()
+    b[key] = NOW() + policy["thresholds"]["breaker_minutes"] * 60
+    jsave(BREAKERS, b)
+
+
+def recent_ledger(n=50):
+    try:
+        with open(LEDGER) as f:
+            lines = f.readlines()[-n:]
+        return [json.loads(x) for x in lines if x.strip()]
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------- routing
+
+def shift_effort(effort, delta, policy):
+    order = policy["efforts"]
+    i = order.index(effort) if effort in order else 2
+    return order[max(0, min(len(order) - 1, i + delta))]
+
+
+def clamp_effort(effort, supported, policy):
+    """Nearest supported effort, preferring the closest lower one."""
+    if not supported:
+        return None
+    if effort in supported:
+        return effort
+    order = policy["efforts"]
+    want = order.index(effort) if effort in order else 2
+    ranked = sorted(supported, key=lambda e: (abs((order.index(e) if e in order else 2) - want),
+                                              (order.index(e) if e in order else 2) > want))
+    return ranked[0]
+
+
+TIER_FALLBACK = {"deep": ["deep", "balanced", "fast"], "balanced": ["balanced", "deep", "fast"],
+                 "fast": ["fast", "balanced", "deep"]}
+
+
+def worst_window(windows):
+    ws = [w for w in (windows or {}).values() if w]
+    return max(ws, key=lambda w: w["used"]) if ws else None
+
+
+def resets_left(policy):
+    """Codex manual quota resets the user still holds (policy.local.json; never consumed automatically)."""
+    return int((policy.get("codex") or {}).get("manual_resets_remaining") or 0)
+
+
+def plan_codex(prof, st, policy, forced, notes):
+    cx = st["codex"]
+    th = policy["thresholds"]
+    if not cx.get("binary"):
+        return None, "no working codex binary"
+    want = policy["difficulty_map"][str(prof["difficulty"])]
+    tier, effort = want["tier"], want["effort"]
+    br = breakers()
+    for t in TIER_FALLBACK[tier]:
+        cands = [m for m in cx["models"] if m["tier"] == t and f"codex/{m['id']}" not in br
+                 and f"codex/limit/{m['limit_id']}" not in br]
+        cands.sort(key=lambda m: (m["legacy"], m["priority"]))
+        if prof.get("context_tokens") and cands:
+            cands = [m for m in cands if (m.get("context_window") or 1e9) > prof["context_tokens"] * 1.15] or []
+        if not cands:
+            continue
+        m = cands[0]
+        lim = (cx["limits"].get(m["limit_id"]) or {})
+        w = worst_window(lim.get("windows"))
+        if w:
+            if w["used"] >= th["window_hard"]:
+                notes.append(f"codex limit {m['limit_id']} at {w['used']:.0%} >= hard {th['window_hard']:.0%}")
+                if resets_left(policy):
+                    notes.append(f"codex has {resets_left(policy)} manual reset(s) left: ask the user before falling back for long work")
+                continue
+            if w["used"] >= th["window_soft"] and not forced and prof["difficulty"] <= 3:
+                notes.append(f"codex {m['limit_id']} at {w['used']:.0%}: spill difficulty<=3 to other backends")
+                continue
+            if w["used"] >= th["window_soft"]:
+                effort = shift_effort(effort, -1, policy)
+                notes.append(f"codex near soft limit ({w['used']:.0%}): effort -1")
+            elif w.get("pace") and w["pace"] > th["pace_downgrade"]:
+                effort = shift_effort(effort, -1, policy)
+                notes.append(f"codex pace {w['pace']}x of even burn: effort -1")
+            elif (w.get("hours_to_reset") is not None and w["hours_to_reset"] <= th["upgrade_if_reset_within_hours"]
+                  and w["used"] < th["upgrade_if_used_below"]):
+                effort = shift_effort(effort, +1, policy)
+                notes.append(f"codex window resets in {w['hours_to_reset']}h with {w['used']:.0%} used: effort +1")
+        else:
+            notes.append("codex quota unknown (no recent rollout); using defaults")
+        if t != tier:
+            notes.append(f"codex tier {tier} unavailable, using {t}")
+        return {"backend": "codex", "model": m["id"], "effort": clamp_effort(effort, m["efforts"], policy),
+                "tier": t, "limit_id": m["limit_id"]}, None
+    return None, "codex unavailable (limits/breakers)"
+
+
+def ocgo_pick(prof, st, policy, tier, notes):
+    th = policy["thresholds"]
+    br = breakers()
+    if "ocgo/all" in br:  # plan-wide usage limit: no OpenCode Go model can run
+        return None, "ocgo plan usage limit (breaker open)"
+    hot = []
+    for t in TIER_FALLBACK[tier]:
+        cands = []
+        for m in st["ocgo"]["models"]:
+            if m["excluded"] or m["tier"] != t or f"ocgo/{m['id']}" in br:
+                continue
+            if prof.get("context_tokens") and (m.get("context") or 1e9) < prof["context_tokens"] * 1.15:
+                continue
+            u = max(m["usage"].values())
+            if u >= th["window_soft"]:
+                hot.append(m["id"])
+                continue
+            cands.append((u, m))
+        if cands:
+            # newest release first, then most headroom
+            cands.sort(key=lambda x: (-(int((x[1].get("release_date") or "0").replace("-", "") or 0)), x[0]))
+            if t != tier:
+                notes.append(f"ocgo tier {tier} unavailable, using {t}")
+            if hot:
+                notes.append(f"ocgo skipped {len(hot)} model(s) over {th['window_soft']:.0%} of window budget")
+            return cands[0][1], t
+    if hot:
+        notes.append(f"ocgo: all {len(hot)} candidate model(s) over {th['window_soft']:.0%} of window budget")
+    return None, None
+
+
+def plan_ocgo(prof, st, policy, forced, notes):
+    if not st["ocgo"].get("binary"):
+        return None, "opencode not installed"
+    want = policy["difficulty_map"][str(prof["difficulty"])]
+    m, t = ocgo_pick(prof, st, policy, want["tier"], notes)
+    if not m:
+        return None, "no ocgo model with headroom"
+    variant = clamp_effort(want["effort"], m["variants"], policy) if m["variants"] else None
+    return {"backend": "ocgo", "model": m["id"], "effort": variant, "tier": t,
+            "opencode_model": f"opencode-go/{m['id']}"}, None
+
+
+def plan_deepseek(prof, st, policy, forced, notes):
+    ds = st["deepseek"]
+    if ds.get("balance") is None:
+        return None, f"deepseek unavailable ({ds.get('error', 'no balance info')})"
+    if ds["balance"] < policy["thresholds"]["deepseek_min_balance_cny"]:
+        return None, f"deepseek balance {ds['balance']} below floor"
+    if f"deepseek/all" in breakers():
+        return None, "deepseek breaker open"
+    tier = policy["difficulty_map"][str(prof["difficulty"])]["tier"]
+    model = policy["deepseek"]["tiers"][tier]
+    avail = ds.get("opencode_models") or []
+    if avail and model not in avail:
+        model = avail[0]
+    return {"backend": "deepseek", "model": model, "effort": None, "tier": tier,
+            "opencode_model": f"deepseek/{model}"}, None
+
+
+PLANNERS = {"codex": plan_codex, "ocgo": plan_ocgo, "deepseek": plan_deepseek}
+
+
+def claude_mode(st, policy):
+    c = st["claude"]
+    if not c["metered_by_anthropic"]:
+        return "full", f"claude via {c['provider']} (not Anthropic-metered)"
+    w = worst_window({"5h": c["five_hour"], "7d": c["seven_day"]})
+    if c["stale"] or not w:
+        return "light", f"claude {c['plan']} quota unknown/stale; default to light review"
+    if w["used"] >= policy["thresholds"]["claude_tight"]:
+        return "delegate", f"claude {c['plan']} at {w['used']:.0%}: delegate review to executor, spot-check only"
+    return ("light" if c["plan"] == "pro" else "full"), f"claude {c['plan']} at {w['used']:.0%}"
+
+
+def concurrency(st, policy):
+    w = worst_window((st["codex"]["limits"].get("codex") or {}).get("windows"))
+    u = w["used"] if w else 0.5
+    for row in policy["concurrency"]:
+        if u < row["codex_used_below"]:
+            return {"codex": row["codex"], "ocgo": row["ocgo"]}
+    return {"codex": 1, "ocgo": 1}
+
+
+def route(prof, st, policy, exclude=()):
+    r = policy["routing"]
+    notes = []
+    if prof.get("backend"):
+        order = [prof["backend"]]
+    elif prof["type"] in r["review_types"]:
+        order = ["ocgo", "codex", "deepseek"]
+        notes.append("review: prefer a non-GPT family for an independent second opinion")
+    elif prof["difficulty"] <= r["ocgo_first_max_difficulty"] and prof["type"] in r["ocgo_first_types"]:
+        order = ["ocgo", "codex", "deepseek"]
+        notes.append("low-difficulty mechanical work: OpenCode Go first to save Codex")
+    else:
+        order = list(r["default_order"])
+    if prof.get("context_tokens", 0) > r["large_context_tokens"] and not prof.get("backend"):
+        order = ["ocgo", "deepseek"] + [b for b in order if b not in ("ocgo", "deepseek")]
+        notes.append("context exceeds codex window: prefer 1M-context backends")
+    order = [b for b in order if b not in exclude]
+    skipped = {}
+    for b in order:
+        d, why = PLANNERS[b](prof, st, policy, bool(prof.get("backend")), notes)
+        if d:
+            if prof.get("model"):
+                d["model"] = prof["model"]
+                if b != "codex":
+                    d["opencode_model"] = f"{'opencode-go' if b == 'ocgo' else 'deepseek'}/{prof['model']}"
+            if prof.get("effort"):
+                d["effort"] = prof["effort"]
+            mode, why_c = claude_mode(st, policy)
+            return {"ok": True, **d, "fallbacks": [x for x in order if x != b],
+                    "claude_review": mode, "reasons": list(dict.fromkeys(notes + [why_c])), "skipped": skipped,
+                    "concurrency": concurrency(st, policy), "profile": prof}
+        skipped[b] = why
+    return {"ok": False, "reasons": list(dict.fromkeys(notes)), "skipped": skipped, "profile": prof}
+
+
+# ---------------------------------------------------------------- execution
+
+RESULT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["status", "summary", "files_changed", "tests", "followups"],
+    "properties": {
+        "status": {"type": "string", "enum": ["done", "partial", "failed"]},
+        "summary": {"type": "string"},
+        "files_changed": {"type": "array", "items": {"type": "string"}},
+        "tests": {"type": "string", "description": "commands run and their outcome, or 'not run: <why>'"},
+        "followups": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+PROMPT_TMPL = """You are an execution agent dispatched by a planning agent. Complete the task below.
+
+Rules:
+- Work only inside the current directory ({wd}). It is a dedicated git worktree; do NOT commit, push, or switch branches.
+- Keep changes minimal and focused on the task; match the surrounding code style.
+- Run the most relevant tests/linters if they exist and report the outcome honestly.
+- If something blocks you, stop and report status "partial" or "failed" with the reason; do not fake success.
+
+TASK:
+{task}
+
+When finished, your FINAL message must be ONLY a JSON object (no prose, no code fence) with keys:
+status ("done"|"partial"|"failed"), summary (string), files_changed (array of paths), tests (string), followups (array of strings).
+"""
+
+MODEL_UNAVAILABLE_RE = re.compile(r"(at capacity|try a different model|model is not supported|not supported when using|model .{0,40}not (found|available))", re.I)
+OPENCODE_ABORT_RE = re.compile(r"stream error.*(usage limit exceeded|insufficient balance|quota exceeded|rate.?limit)", re.I)
+RATE_LIMIT_RE = re.compile(r"(\b429\b|rate.?limit|usage limit|quota|too many requests|insufficient balance|spend.?control)", re.I)
+
+
+def set_status(rdir, **kw):
+    s = jload(f"{rdir}/status.json", {}) or {}
+    s.update(kw)
+    s["updated"] = NOW()
+    jsave(f"{rdir}/status.json", s)
+
+
+def descendants(pid):
+    out, todo = [], [int(pid)]
+    while todo:
+        cur = todo.pop()
+        rc, txt, _ = sh(["pgrep", "-P", str(cur)], timeout=5)
+        kids = [int(x) for x in txt.split()] if rc == 0 else []
+        out += kids
+        todo += kids
+    return out
+
+
+def kill_tree(pid, grace=3):
+    """Terminate a process, its process group and every descendant (executors spawn shells in new groups)."""
+    procs = [int(pid)] + descendants(pid)
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for p in procs:
+            for fn in (lambda q: os.killpg(q, sig), lambda q: os.kill(q, sig)):
+                try:
+                    fn(p)
+                except Exception:
+                    pass
+        if sig == signal.SIGTERM:
+            time.sleep(grace)
+            procs = [p for p in procs if pid_alive(p)]
+            if not procs:
+                return
+
+
+def run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
+    """Run an executor. abort_re: pattern that, once seen in stderr, means the executor will only retry
+    silently (e.g. opencode on a plan usage limit) — kill it early and return 75 so the caller can fall back."""
+    rdir = os.path.dirname(out_path)
+    with open(out_path, "w") as out, open(out_path + ".err", "w") as err:
+        p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=out, stderr=err, stdin=subprocess.DEVNULL,
+                             start_new_session=True)
+        set_status(rdir, executor_pid=p.pid, events=out_path, attempt_started=NOW())
+        end = NOW() + timeout
+        while True:
+            try:
+                return p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            if NOW() >= end:
+                kill_tree(p.pid)
+                return 124
+            if abort_re is not None:
+                try:
+                    with open(out_path + ".err", errors="ignore") as f:
+                        f.seek(max(0, os.path.getsize(out_path + ".err") - 65536))
+                        if abort_re.search(f.read()):
+                            kill_tree(p.pid)
+                            return 75
+                except OSError:
+                    pass
+
+
+def extract_json(text):
+    if not text:
+        return None
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    for m in reversed(list(re.finditer(r"\{", text))):
+        try:
+            obj = json.loads(text[m.start():text.rfind("}") + 1])
+            if isinstance(obj, dict) and "status" in obj:
+                return obj
+        except Exception:
+            continue
+    return None
+
+
+def exec_codex(d, st, prompt, wd, rdir, timeout, evp):
+    schema = f"{rdir}/schema.json"
+    jsave(schema, RESULT_SCHEMA)
+    last = f"{rdir}/last.json"
+    cmd = [st["codex"]["binary"], "exec", "-m", d["model"], "-c", f'model_reasoning_effort="{d["effort"]}"',
+           "-s", load_policy()["codex"]["sandbox"], "-C", wd, "--json", "--skip-git-repo-check",
+           "--output-schema", schema, "-o", last, prompt]
+    rc = run_proc(cmd, wd, os.environ.copy(), timeout, evp)
+    usage, thread, errors = {}, None, []
+    for line in open(evp, errors="ignore"):
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        if ev.get("type") == "thread.started":
+            thread = ev.get("thread_id")
+        elif ev.get("type") == "turn.completed":
+            usage = ev.get("usage") or usage
+        elif ev.get("type") in ("error", "turn.failed"):
+            errors.append(json.dumps(ev)[:500])
+    final = None
+    if os.path.exists(last):
+        final = extract_json(open(last).read())
+    err_text = "\n".join(errors) + open(evp + ".err", errors="ignore").read()[-3000:]
+    return rc, final, {"usage": usage, "thread_id": thread}, err_text
+
+
+def exec_opencode(d, st, prompt, wd, rdir, timeout, evp):
+    env = opencode_env()
+    # Non-interactive executor: allow edits/shell inside the worktree only.
+    env["OPENCODE_CONFIG_CONTENT"] = json.dumps({"permission": {"edit": "allow", "bash": "allow",
+                                                                "webfetch": "allow", "external_directory": "deny"}})
+    # ERROR-level logs on stderr surface provider errors that opencode otherwise retries silently.
+    cmd = [st["ocgo"]["binary"] or opencode_bin(), "run", "--pure", "--print-logs", "--log-level", "ERROR",
+           "-m", d["opencode_model"], "--format", "json", "--dir", wd]
+    if d.get("effort"):
+        cmd += ["--variant", d["effort"]]
+    cmd.append(prompt)
+    rc = run_proc(cmd, wd, env, timeout, evp, abort_re=OPENCODE_ABORT_RE)
+    texts, cost, tokens, session, errors = [], 0.0, {"input": 0, "output": 0, "reasoning": 0, "cache_read": 0}, None, []
+    for line in open(evp, errors="ignore"):
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        session = ev.get("sessionID") or session
+        part = ev.get("part") or {}
+        if ev.get("type") == "text" and part.get("text"):
+            texts.append(part["text"])
+        elif ev.get("type") == "step_finish":
+            cost += part.get("cost") or 0
+            t = part.get("tokens") or {}
+            tokens["input"] += t.get("input", 0)
+            tokens["output"] += t.get("output", 0)
+            tokens["reasoning"] += t.get("reasoning", 0)
+            tokens["cache_read"] += (t.get("cache") or {}).get("read", 0)
+        elif ev.get("type") == "error":
+            errors.append(json.dumps(ev)[:500])
+    final = extract_json(texts[-1]) if texts else None
+    err_text = "\n".join(errors) + open(evp + ".err", errors="ignore").read()[-3000:]
+    if errors and rc == 0:
+        rc = 1
+    return rc, final, {"usage": tokens, "cost_usd": round(cost, 6), "session_id": session}, err_text
+
+
+EXECUTORS = {"codex": exec_codex, "ocgo": exec_opencode, "deepseek": exec_opencode}
+
+
+def git(args, cwd, timeout=60):
+    return sh(["git", *args], cwd=cwd, timeout=timeout)
+
+
+def prepare_workspace(cwd, rid, use_worktree):
+    rc, top, _ = git(["rev-parse", "--show-toplevel"], cwd)
+    if rc != 0 or not use_worktree:
+        return {"mode": "in-place", "path": cwd, "repo": top.strip() if rc == 0 else None}
+    top = top.strip()
+    rc, head, _ = git(["rev-parse", "HEAD"], top)
+    if rc != 0:
+        return {"mode": "in-place", "path": cwd, "repo": top, "note": "repo has no commits; ran in place"}
+    _, dirty, _ = git(["status", "--porcelain"], top)
+    branch = f"openswarm/{rid}"
+    if load_policy().get("workspace", {}).get("sibling_worktrees", True):
+        # Multi-repo workspaces commit relative links to sibling repos (e.g. node_modules/@x/sdk ->
+        # ../../../sibling-repo/...). A worktree beside the base repo keeps those links resolving.
+        wt = os.path.join(os.path.dirname(top), f".openswarm-wt-{os.path.basename(top)}-{rid}")
+    else:
+        wt = f"{WORKTREES}/{os.path.basename(top)}-{rid}"
+        os.makedirs(WORKTREES, exist_ok=True)
+    rc, _, err = git(["worktree", "add", "-q", "-b", branch, wt, "HEAD"], top, timeout=300)
+    if rc != 0:
+        # Never silently fall back to editing the shared checkout: concurrent runs and the
+        # user's own uncommitted work live there. Fail the run instead.
+        raise SystemExit(f"openswarm: worktree creation failed ({err.strip()[:200]}); refusing in-place fallback")
+    rel = os.path.relpath(os.path.realpath(cwd), os.path.realpath(top))
+    path = os.path.join(wt, rel) if rel != "." else wt
+    linked = link_dependency_dirs(top, wt)
+    if linked:  # `node_modules/` in .gitignore matches directories only, not the symlinks we just created
+        rc, ex, _ = git(["rev-parse", "--git-path", "info/exclude"], wt)
+        if rc == 0:
+            ex = ex.strip() if os.path.isabs(ex.strip()) else os.path.join(wt, ex.strip())
+            os.makedirs(os.path.dirname(ex), exist_ok=True)
+            have = []
+            if os.path.exists(ex):
+                with open(ex) as fh:
+                    have = fh.read().splitlines()
+            with open(ex, "a") as f:
+                for rel in linked:
+                    if "/" + rel not in have:
+                        f.write("/" + rel + "\n")
+    return {"mode": "worktree", "path": path, "root": wt, "repo": top, "branch": branch, "base": head.strip(),
+            "base_dirty": bool(dirty.strip()), "linked": linked,
+            "note": "base had uncommitted changes that are NOT in the worktree" if dirty.strip() else None}
+
+
+def link_dependency_dirs(base, wt):
+    """Gitignored dependency dirs (node_modules, .venv) never reach a fresh worktree, so tests cannot
+    import anything. Symlink the base repo's copies in (absolute targets keep their internal relative
+    links resolving). Returns repo-relative paths so finalize_workspace never commits the links."""
+    names = set(load_policy().get("workspace", {}).get("link_dirs", ["node_modules", ".venv", "venv"]))
+    linked = []
+    for dirpath, dirnames, _ in os.walk(base):
+        rel = os.path.relpath(dirpath, base)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        for d in list(dirnames):
+            if d in names:
+                src = os.path.join(dirpath, d)
+                dst_parent = os.path.join(wt, rel) if rel != "." else wt
+                dst = os.path.join(dst_parent, d)
+                if os.path.isdir(dst_parent) and not os.path.lexists(dst):
+                    try:
+                        os.symlink(os.path.realpath(src), dst)
+                        linked.append(os.path.relpath(dst, wt))
+                    except OSError:
+                        pass
+                elif os.path.isdir(dst) and not os.path.islink(dst):
+                    # Partially tracked (e.g. a committed node_modules/@x/sdk link): fill in the missing entries.
+                    linked += _link_missing_entries(src, dst, wt, depth=2)
+        dirnames[:] = [d for d in dirnames if d not in names and d != ".git" and not d.startswith(".") and depth < 3]
+    return linked
+
+
+def rewrite_verify_paths(cmd, repo, root):
+    for base in {os.path.realpath(repo), repo}:
+        cmd = cmd.replace(base.rstrip(os.sep) + os.sep, root.rstrip(os.sep) + os.sep)
+    return cmd
+
+
+def _link_missing_entries(src, dst, wt, depth):
+    out = []
+    try:
+        entries = os.listdir(src)
+    except OSError:
+        return out
+    for name in entries:
+        s_path, d_path = os.path.join(src, name), os.path.join(dst, name)
+        if not os.path.lexists(d_path):
+            try:
+                os.symlink(os.path.realpath(s_path), d_path)
+                out.append(os.path.relpath(d_path, wt))
+            except OSError:
+                pass
+        elif depth > 1 and os.path.isdir(d_path) and not os.path.islink(d_path) and os.path.isdir(s_path):
+            out += _link_missing_entries(s_path, d_path, wt, depth - 1)  # e.g. @scope/ directories
+    return out
+
+
+def run_verify(cmd, wd, timeout):
+    """Run the planner's acceptance command on the host, outside the executor sandbox."""
+    try:
+        p = subprocess.run(cmd, shell=True, cwd=wd, capture_output=True, text=True, timeout=timeout)
+        rc, out = p.returncode, p.stdout + p.stderr
+    except subprocess.TimeoutExpired as e:
+        rc, out = 124, f"verify timed out after {timeout}s"
+    return {"cmd": cmd, "rc": rc, "tail": out[-1500:], "failing": sorted(failing_tests(out))}
+
+
+FAIL_LINE_RES = [
+    re.compile(r"^✖ (.+?)(?: \(\d[\d.]*m?s\))?$"),          # node --test summary after "failing tests:"
+    re.compile(r"^FAILED (\S+)"),                             # pytest -q / -rf
+    re.compile(r"^not ok \d+ - (.+)$"),                        # TAP
+]
+
+
+def failing_tests(output):
+    """Best-effort set of failing test identifiers from node --test / pytest / TAP output."""
+    text = output.split("failing tests:", 1)[-1] if "failing tests:" in output else output
+    found = set()
+    for line in text.splitlines():
+        for rx in FAIL_LINE_RES:
+            m = rx.match(line.strip())
+            if m:
+                found.add(m.group(1).strip())
+    return found
+
+
+def verify_against_baseline(cmd, ws, timeout):
+    """Run the verify command on the run's base commit in a sibling worktree (dependencies linked).
+    Returns the baseline verify dict including the full output for failure comparison."""
+    bwt = ws["root"] + "-baseline"
+    rc, _, err = git(["worktree", "add", "-q", "--detach", bwt, ws["base"]], ws["repo"])
+    if rc != 0:
+        return {"rc": None, "error": err.strip()[:200]}
+    try:
+        link_dependency_dirs(ws["repo"], bwt)
+        rel = os.path.relpath(ws["path"], ws["root"])
+        p = subprocess.run(rewrite_verify_paths(cmd, ws["root"], bwt), shell=True, capture_output=True, text=True,
+                           cwd=os.path.join(bwt, rel) if rel != "." else bwt, timeout=timeout)
+        return {"rc": p.returncode, "output": p.stdout + p.stderr}
+    except subprocess.TimeoutExpired:
+        return {"rc": 124, "output": ""}
+    finally:
+        git(["worktree", "remove", "--force", bwt], ws["repo"])
+
+
+def adjust_status_for_verify(status, verify):
+    """Host verification is the authority: it upgrades a sandbox-blocked 'partial' and downgrades a false 'done'."""
+    if not verify:
+        return status, None
+    if verify["rc"] == 0 and status == "partial":
+        return "done", "executor reported partial; host verify passed"
+    if verify["rc"] != 0 and status == "done":
+        return "partial", "executor reported done; host verify failed"
+    return status, None
+
+
+JUNK = ["__pycache__/**", "*.pyc", ".DS_Store", "node_modules/**", ".pytest_cache/**", ".venv/**", "*.egg-info/**"]
+
+
+def finalize_workspace(ws, title, backend, rdir, keep):
+    if ws["mode"] != "worktree":
+        rc, diff, _ = git(["diff", "--stat"], ws["path"]) if ws.get("repo") else (1, "", "")
+        return {"diffstat": diff.strip()}
+    root = ws["root"]
+    git(["add", "-A", "--", "."] + [f":(exclude,glob)**/{j}" for j in JUNK]
+        + [f":(exclude){p}" for p in ws.get("linked") or []], root)
+    rc, stat, _ = git(["diff", "--cached", "--stat"], root)
+    commit = None
+    if stat.strip():
+        git(["-c", "user.name=openswarm", "-c", "user.email=openswarm@localhost", "commit", "-q", "--no-verify",
+             "-m", f"openswarm({backend}): {title}"], root)
+        _, c, _ = git(["rev-parse", "HEAD"], root)
+        commit = c.strip()
+        _, patch, _ = git(["format-patch", "-1", "--stdout", commit], root, timeout=120)
+        with open(f"{rdir}/diff.patch", "w") as f:
+            f.write(patch)
+    if not keep:
+        cleanup_worktree(ws, commit)
+    return {"branch": ws["branch"] if commit else None, "commit": commit, "diffstat": stat.strip(),
+            "patch": f"{rdir}/diff.patch" if commit else None,
+            "worktree": root if keep else None,
+            "merge_hint": f"git -C {ws['repo']} merge --no-ff {ws['branch']}  # or cherry-pick {commit[:10]}" if commit else None}
+
+
+def cleanup_worktree(ws, commit):
+    if ws.get("mode") != "worktree":
+        return
+    git(["worktree", "remove", "--force", ws["root"]], ws["repo"])
+    if not commit:
+        git(["branch", "-D", ws["branch"]], ws["repo"])
+
+
+def quota_used(st, d):
+    if d["backend"] == "codex":
+        w = worst_window((st["codex"]["limits"].get(d.get("limit_id", "codex")) or {}).get("windows"))
+        return w["used"] if w else None
+    if d["backend"] == "ocgo":
+        m = next((m for m in st["ocgo"]["models"] if m["id"] == d["model"]), None)
+        return max(m["usage"].values()) if m else None
+    return st["deepseek"].get("balance")
+
+
+def new_run_id():
+    return dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+
+
+def cmd_run(args, policy):
+    if args.run_id:  # detached child: task already stored
+        rid = args.run_id
+        rdir = f"{RUNS}/{rid}"
+        task = open(f"{rdir}/task.md").read()
+    else:
+        task = args.prompt or (open(args.task_file).read() if args.task_file else sys.stdin.read())
+        if not task.strip():
+            sys.exit("empty task")
+        rid = new_run_id()
+        rdir = f"{RUNS}/{rid}"
+        os.makedirs(rdir, exist_ok=True)
+        with open(f"{rdir}/task.md", "w") as f:
+            f.write(task)
+    title = args.title or task.strip().splitlines()[0][:72]
+    prof = profile_from_args(args)
+    budget_min = args.budget_minutes or round(policy["run"]["timeout_seconds"] / 60)
+    if args.detach and not args.run_id:
+        set_status(rdir, id=rid, state="queued", title=title, profile=prof, started=NOW(),
+                   budget_minutes=budget_min, cwd=os.path.abspath(args.cwd))
+        child = [sys.executable, os.path.realpath(__file__), "run", "--run-id", rid,
+                 "--cwd", os.path.abspath(args.cwd), "--title", title, "--budget-minutes", str(budget_min)]
+        for flag in ("type", "difficulty", "context_tokens", "backend", "model", "effort"):
+            v = getattr(args, flag, None)
+            if v:
+                child += [f"--{flag.replace('_', '-')}", str(v)]
+        if getattr(args, "verify", None):
+            child += ["--verify", args.verify]
+        if getattr(args, "verify_baseline", False):
+            child.append("--verify-baseline")
+        for flag in ("no_worktree", "keep_worktree", "no_fallback"):
+            if getattr(args, flag):
+                child.append(f"--{flag.replace('_', '-')}")
+        with open(f"{rdir}/run.out", "w") as out:
+            p = subprocess.Popen(child, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                 start_new_session=True)
+        set_status(rdir, runner_pid=p.pid)
+        print(json.dumps({"id": rid, "state": "started", "runner_pid": p.pid, "run_dir": rdir,
+                          "watch": f"openswarm watch {rid}", "result": f"{rdir}/result.json"}, indent=2))
+        return
+    set_status(rdir, id=rid, state="routing", title=title, profile=prof, started=NOW(),
+               budget_minutes=budget_min, runner_pid=os.getpid(), cwd=os.path.abspath(args.cwd))
+    st = get_state(policy)
+    decision = route(prof, st, policy)
+    if not decision["ok"]:
+        out = {"id": rid, "status": "unroutable", "decision": decision}
+        set_status(rdir, state="unroutable")
+        append_ledger({"id": rid, "ts": NOW(), "title": title, "status": "unroutable", "decision": decision})
+        jsave(f"{rdir}/result.json", out)
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        sys.exit(2)
+    if args.dry_run:
+        set_status(rdir, state="dry-run")
+        print(json.dumps({"id": rid, "dry_run": True, "decision": decision}, indent=2, ensure_ascii=False))
+        return
+    ws = prepare_workspace(os.path.abspath(args.cwd), rid, not args.no_worktree)
+    if args.verify and ws["mode"] == "worktree":
+        # A verify command that names files by their base-repo absolute path would test the base checkout,
+        # not the executor's worktree. Rewrite those paths into the worktree and say so.
+        rewritten = rewrite_verify_paths(args.verify, ws["repo"], ws["root"])
+        if rewritten != args.verify:
+            set_status(rdir, verify_note="verify paths rewritten from base repo to worktree")
+            args.verify = rewritten
+    prompt = PROMPT_TMPL.format(wd=ws["path"], task=task)
+    if args.verify:
+        prompt += (f"\nAfter you finish, the planner runs this acceptance command on the host, outside your sandbox: "
+                   f"`{args.verify}`. If your sandbox blocks running it (ports, network, missing deps), say so in "
+                   f"`tests` instead of treating it as a code failure.\n")
+    attempts, tried = [], []
+    deadline = NOW() + budget_min * 60
+    result = None
+    while True:
+        b = decision["backend"]
+        tried.append(b)
+        before = quota_used(st, decision)
+        t0 = NOW()
+        evp = f"{rdir}/events.{len(attempts) + 1}.{b}.jsonl"
+        set_status(rdir, state="running", backend=b, model=decision["model"], effort=decision.get("effort"),
+                   workspace=ws["path"], attempt=len(attempts) + 1, deadline=deadline)
+        timeout = max(60, int(deadline - NOW()))
+        rc, final, meta, err_text = EXECUTORS[b](decision, st, prompt, ws["path"], rdir, timeout, evp)
+        dur = round(NOW() - t0, 1)
+        err_class = None
+        if rc == 124:
+            err_class = "budget_exceeded"
+        elif rc != 0 and MODEL_UNAVAILABLE_RE.search(err_text or ""):
+            err_class = "model_unavailable"
+        elif rc == 75 or (rc != 0 and RATE_LIMIT_RE.search(err_text or "")):
+            err_class = "rate_limit"
+        elif rc != 0 or final is None:
+            err_class = "exec_error"
+        attempts.append({"backend": b, "model": decision["model"], "effort": decision.get("effort"),
+                         "rc": rc, "seconds": dur, "error_class": err_class, "meta": meta, "events": evp,
+                         "error_tail": (err_text or "")[-600:] if err_class else None, "quota_before": before})
+        if err_class == "rate_limit":
+            key = f"codex/limit/{decision.get('limit_id', 'codex')}" if b == "codex" else (
+                (("ocgo/all" if re.search(r"usage limit exceeded", err_text or "", re.I) else f"ocgo/{decision['model']}")
+                 if b == "ocgo" else "deepseek/all"))
+            trip_breaker(key, policy, err_text[-200:])
+        if err_class == "model_unavailable":  # same backend, next model in the tier
+            trip_breaker(f"{b}/{decision['model']}", policy, err_text[-200:])
+        if final is not None or err_class not in ("rate_limit", "exec_error", "model_unavailable") or not policy["run"]["fallback"] \
+                or args.no_fallback or prof.get("backend") or deadline - NOW() < 120 \
+                or (jload(f"{rdir}/status.json", {}) or {}).get("stop_requested"):
+            result = final
+            break
+        st = probe(policy)
+        nxt = route(prof, st, policy, exclude=tried if err_class == "rate_limit" else ([] if err_class == "model_unavailable" else [b]))
+        if not nxt["ok"]:
+            result = final
+            break
+        if ws["mode"] == "worktree":  # discard partial edits from the failed attempt before retrying
+            git(["reset", "-q", "--hard"], ws["root"])
+            git(["clean", "-qfd"], ws["root"])
+        decision = nxt
+    set_status(rdir, state="finalizing")
+    st_after = probe(policy) if decision["backend"] == "codex" else st
+    attempts[-1]["quota_after"] = quota_used(st_after, decision)
+    changed = ws["mode"] == "worktree" and bool(git(["status", "--porcelain"], ws["root"])[1].strip())
+    # Commit first and verify the committed tree: some suites (release builders) refuse dirty sources.
+    fin = finalize_workspace(ws, title, decision["backend"], rdir, keep=True)
+    verify = None
+    if args.verify and (result is not None or changed):  # a budget-killed executor may still have finished the edit
+        set_status(rdir, state="verifying")
+        verify = run_verify(args.verify, ws["path"], max(60, min(600, int(deadline - NOW()) + 300)))
+    if verify and verify["rc"] not in (0, 124) and getattr(args, "verify_baseline", False) and ws["mode"] == "worktree":
+        # Repos often carry known failures; judge the run by failures it introduced, not by the suite's exit code.
+        base = verify_against_baseline(args.verify, ws, max(60, min(600, int(deadline - NOW()) + 300)))
+        if base.get("rc") is not None:
+            base_fail = failing_tests(base.get("output", ""))
+            new_fail = sorted(set(verify["failing"]) - base_fail)
+            verify["baseline"] = {"rc": base["rc"], "failing": sorted(base_fail), "new_failures": new_fail}
+            if verify["failing"] and not new_fail:
+                verify["rc_raw"], verify["rc"] = verify["rc"], 0
+        else:
+            verify["baseline"] = {"error": base.get("error")}
+    if not args.keep_worktree:
+        cleanup_worktree(ws, fin.get("commit"))
+        fin["worktree"] = None
+    stopped = bool((jload(f"{rdir}/status.json", {}) or {}).get("stop_requested"))
+    status = (result or {}).get("status") or ("stopped" if stopped else
+                                              "budget_exceeded" if attempts[-1]["error_class"] == "budget_exceeded" else "failed")
+    if verify and verify["rc"] == 0 and result is None and status == "budget_exceeded":
+        status, verify_note = "partial", "executor hit the budget without a final report; host verify passed"
+    else:
+        status, verify_note = adjust_status_for_verify(status, verify)
+    out = {
+        "id": rid, "status": status, "title": title, "verify": verify, "verify_note": verify_note,
+        "backend": decision["backend"], "model": decision["model"], "effort": decision.get("effort"),
+        "result": result, "workspace": {k: v for k, v in ws.items() if k in ("mode", "path", "repo", "base", "note")},
+        **fin, "attempts": attempts, "claude_review": decision.get("claude_review"),
+        "decision_reasons": decision.get("reasons"), "run_dir": rdir,
+    }
+    jsave(f"{rdir}/result.json", out)
+    set_status(rdir, state="finished", status=status, finished=NOW(), commit=fin.get("commit"))
+    append_ledger({"id": rid, "ts": NOW(), "title": title, "profile": prof, "status": status,
+                   "backend": decision["backend"], "model": decision["model"], "effort": decision.get("effort"),
+                   "tier": decision.get("tier"), "attempts": [{k: a[k] for k in a if k != "error_tail"} for a in attempts],
+                   "error_class": attempts[-1]["error_class"], "seconds": round(sum(a["seconds"] for a in attempts), 1),
+                   "commit": fin.get("commit"), "files": len((result or {}).get("files_changed") or []),
+                   "reasons": decision.get("reasons")})
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+    sys.exit(0 if status == "done" else 1)
+
+
+# ---------------------------------------------------------------- monitoring
+
+DEFAULT_RISKS = [
+    (r"\bgit\s+(push|reset\s+--hard|checkout\s+-f|clean\s+-[a-z]*f)", "git destructive/push"),
+    (r"\brm\s+-[a-z]*r[a-z]*f?\s+(/|~|\$HOME|\.\.)", "rm -r outside worktree"),
+    (r"--no-verify|--force\b", "bypass/force flag"),
+    # Reading a credential-named file or echoing a credential-named variable; plain `cat` of source/test files and
+    # heredoc writes (`cat >`) no longer match.
+    (r"\b(cat|less|more|head|tail|bat)\s+(?![\s>])[^|;&]*[/\s~.](\.?(auth|credentials?|secrets?)(\.json|\.ya?ml|\.env)?|[\w.-]*(token|secret|password|api[_-]?key)[\w.-]*)(\s|$|[|;&])"
+     r"|\b(printenv|echo|printf)\b[^|;&]*\$\{?[A-Z_]*(TOKEN|SECRET|PASSWORD|API_?KEY)[A-Z_]*"
+     r"|\bprintenv\b\s*($|[|;&]|[A-Z_]*(TOKEN|SECRET|PASSWORD|API_?KEY))", "possible secret print"),
+    (r"\bsudo\b|systemctl\s+(stop|disable|mask)|launchctl\s+(unload|bootout)", "system service / sudo"),
+    # Only real credential reads; a bare "keychain" also matched planners' grep patterns.
+    (r"\bsecurity\s+(find|dump|export)-[a-z-]*(password|keychain|certificate|identity)", "keychain access"),
+    (r"(npm|pnpm|yarn)\s+publish|twine\s+upload|gh\s+(release|pr\s+merge)", "publish/release"),
+]
+
+
+def pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except OSError:
+        return False
+
+
+def short(s, n=220):
+    return re.sub(r"\s+", " ", str(s or ""))[:n]
+
+
+def summarize_event(o):
+    """Normalize codex / opencode events -> (kind, text). kind in msg|cmd|end|error|None."""
+    t = o.get("type", "")
+    it = o.get("item") or {}
+    part = o.get("part") or {}
+    if t == "item.completed" and it.get("type") == "agent_message":
+        return "msg", it.get("text", "")
+    if t == "item.started" and it.get("type") == "command_execution":
+        return "cmd", it.get("command", "")
+    if t in ("turn.completed",):
+        return "end", json.dumps(o.get("usage") or {})
+    if t in ("turn.failed", "error"):
+        return "error", json.dumps(o.get("error") or o, ensure_ascii=False)
+    if t == "text" and part.get("text"):
+        return "msg", part["text"]
+    if t == "tool_use":
+        st = part.get("state") or {}
+        inp = st.get("input") or {}
+        if part.get("tool") == "bash":
+            return "cmd", inp.get("command", "")
+        return "tool", f"{part.get('tool')} {short(inp.get('filePath') or inp.get('path') or '', 120)}"
+    return None, None
+
+
+def cmd_watch(args, policy):
+    """Stream one line per actionable event for a run; designed to be wrapped by Claude's Monitor tool.
+    Exits on run completion, budget expiry, or after --max-minutes (re-arm to keep watching)."""
+    if len(args.run_id) > 1:  # one Monitor for a whole batch: fan out one child watcher per run
+        procs = []
+        for rid in args.run_id:
+            title = (jload(f"{RUNS}/{rid}/status.json", {}) or {}).get("title") or rid
+            child = [sys.executable, os.path.realpath(__file__), "watch", rid, "--label", short(title, 28),
+                     "--stall-minutes", str(args.stall_minutes), "--heartbeat-minutes", str(args.heartbeat_minutes),
+                     "--max-minutes", str(args.max_minutes)] + (["--from-end"] if args.from_end else [])
+            for rx in args.risk or []:
+                child += ["--risk", rx]
+            procs.append(subprocess.Popen(child))
+        sys.exit(max(p.wait() for p in procs))
+    args.run_id = args.run_id[0]
+    rdir = f"{RUNS}/{args.run_id}"
+    if not os.path.isdir(rdir):
+        sys.exit(f"no such run: {args.run_id}")
+    label = args.label or args.run_id[-6:]
+    risks = [(re.compile(rx, re.I), name) for rx, name in DEFAULT_RISKS]
+    risks += [(re.compile(rx, re.I), "custom") for rx in (args.risk or [])]
+    t_start = NOW()
+    last_evt = last_beat = NOW()
+    cur_path, fh = None, None
+    cmds, last_cmd, last_msg, seen = 0, "", "", set()
+
+    def out(kind, msg):
+        print(f"[{label} {time.strftime('%H:%M')}] {kind}: {msg}", flush=True)
+
+    while True:
+        st = jload(f"{rdir}/status.json", {}) or {}
+        if st.get("events") and st["events"] != cur_path and os.path.exists(st["events"]):
+            if fh:
+                out("ATTEMPT", f"switched to {st.get('backend')}/{st.get('model')} (attempt {st.get('attempt')})")
+            cur_path = st["events"]
+            fh = open(cur_path, errors="ignore")
+            if args.from_end:
+                fh.seek(0, 2)
+        line = fh.readline() if fh else ""
+        if line:
+            last_evt = NOW()
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            kind, text = summarize_event(o)
+            if kind == "msg":
+                last_msg = text
+                out("MSG", short(text, 400))
+            elif kind == "cmd":
+                cmds += 1
+                last_cmd = text
+                for rx, name in risks:
+                    if rx.search(text) and (name, text[:80]) not in seen:
+                        seen.add((name, text[:80]))
+                        out(f"RISK[{name}]", short(text, 220))
+            elif kind == "tool":
+                cmds += 1
+                last_cmd = text
+            elif kind == "error":
+                out("ERROR", short(text, 300))
+            continue
+        now = NOW()
+        if st.get("state") == "finished":
+            r = jload(f"{rdir}/result.json", {}) or {}
+            out("DONE", f"status={r.get('status')} backend={r.get('backend')}/{r.get('model')} "
+                        f"commit={(r.get('commit') or '-')[:10]} files={len((r.get('result') or {}).get('files_changed') or [])} "
+                        f"summary={short((r.get('result') or {}).get('summary'), 240)}")
+            return
+        if st.get("state") == "unroutable":
+            out("DONE", "status=unroutable (no backend had headroom)")
+            return
+        runner = st.get("runner_pid")
+        if runner and not pid_alive(runner) and st.get("state") != "finished":
+            out("EXITED", f"runner process gone in state={st.get('state')} (cmds={cmds}); check {rdir}/run.out")
+            return
+        if st.get("deadline") and now > st["deadline"] + 90:
+            out("BUDGET", f"past budget ({st.get('budget_minutes')}m) and still {st.get('state')}")
+        if now - last_evt > args.stall_minutes * 60:
+            out("STALL", f"no events for {(now - last_evt) / 60:.1f}m; last cmd: {short(last_cmd, 160)}")
+            last_evt = now
+        if now - last_beat > args.heartbeat_minutes * 60:
+            el = int((now - st.get("started", now)) / 60)
+            out("HEARTBEAT", f"{st.get('state')} {st.get('backend')}/{st.get('model')} {el}m/{st.get('budget_minutes')}m "
+                             f"cmds={cmds} last: {short(last_msg or last_cmd, 160)}")
+            last_beat = now
+        if args.max_minutes and now - t_start > args.max_minutes * 60:
+            out("WATCH-EXPIRED", f"watch window {args.max_minutes}m ended; run still {st.get('state')} — re-arm: openswarm watch {args.run_id} --from-end")
+            return
+        time.sleep(2)
+
+
+def run_digest(rid):
+    rdir = f"{RUNS}/{rid}"
+    st = jload(f"{rdir}/status.json", {}) or {}
+    r = jload(f"{rdir}/result.json", {}) or {}
+    now = NOW()
+    state = st.get("state", "?")
+    if state not in ("finished", "unroutable", "dry-run") and st.get("runner_pid") and not pid_alive(st["runner_pid"]):
+        state = "dead"
+    cmds, last = 0, ""
+    if st.get("events") and os.path.exists(st["events"]):
+        for line in open(st["events"], errors="ignore"):
+            try:
+                kind, text = summarize_event(json.loads(line))
+            except Exception:
+                continue
+            if kind in ("cmd", "tool"):
+                cmds += 1
+            if kind == "msg":
+                last = text
+    end = st.get("finished") or now
+    return {"id": rid, "state": state, "status": st.get("status") or r.get("status"), "title": st.get("title"),
+            "backend": st.get("backend"), "model": st.get("model"), "effort": st.get("effort"),
+            "elapsed_min": round((end - st.get("started", end)) / 60, 1), "budget_min": st.get("budget_minutes"),
+            "cmds": cmds, "last_msg": short(last, 200), "commit": st.get("commit"),
+            "idle_min": round((now - os.path.getmtime(st["events"])) / 60, 1) if st.get("events") and os.path.exists(st["events"]) and state == "running" else None}
+
+
+def cmd_runs(args, policy):
+    """Snapshot report of recent/active runs — for scheduled check-ins."""
+    if not os.path.isdir(RUNS):
+        print("no runs")
+        return
+    ids = sorted(os.listdir(RUNS), reverse=True)
+    rows = [run_digest(i) for i in ids[: args.n]]
+    if args.active:
+        rows = [r for r in rows if r["state"] in ("queued", "routing", "running", "finalizing", "dead")]
+    if args.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return
+    if not rows:
+        print("no matching runs")
+        return
+    for r in rows:
+        flag = " ⚠ idle %sm" % r["idle_min"] if r["idle_min"] and r["idle_min"] > 10 else ""
+        if r["state"] == "running" and r["budget_min"] and r["elapsed_min"] > r["budget_min"]:
+            flag += " ⚠ over budget"
+        print(f"{r['id']}  {r['state']:<10} {r['status'] or '-':<15} {r['backend'] or '-'}/{r['model'] or '-'}"
+              f"  {r['elapsed_min']}m/{r['budget_min']}m cmds={r['cmds']}{flag}\n    {r['title']}\n    last: {r['last_msg']}")
+
+
+def cmd_report(args, policy):
+    """Compact check-in: quota headroom + active runs + runs finished since --since-minutes. For scheduled reports."""
+    st = get_state(policy)
+    c, cx, oc, ds = st["claude"], st["codex"], st["ocgo"], st["deepseek"]
+    cw = worst_window((cx["limits"].get("codex") or {}).get("windows"))
+    hot = [m for m in oc["models"] if not m["excluded"]]
+    oc_used = max((max(m["usage"].values()) for m in hot), default=0)
+    cl = worst_window({"5h": c["five_hour"], "7d": c["seven_day"]})
+    print(f"[openswarm report {time.strftime('%m-%d %H:%M')}]")
+    print(f"quota  claude({c['plan']}) {('%.0f%%' % (cl['used'] * 100)) if cl and not c['stale'] else 'n/a'}"
+          f" | codex({cx['plan']}) {('%.0f%%' % (cw['used'] * 100)) if cw else 'n/a'}"
+          f"{(' pace %.2fx' % cw['pace']) if cw and cw.get('pace') else ''}"
+          f" | ocgo({oc['plan']}) max-model {oc_used:.0%} | deepseek {ds.get('balance')} {ds.get('currency') or ''}")
+    ids = sorted(os.listdir(RUNS), reverse=True)[:200] if os.path.isdir(RUNS) else []
+    rows = [run_digest(i) for i in ids]
+    active = [r for r in rows if r["state"] in ("queued", "routing", "running", "finalizing", "dead")]
+    cutoff = NOW() - args.since_minutes * 60
+    recent = [r for r in rows if r["state"] == "finished"
+              and (jload(f"{RUNS}/{r['id']}/status.json", {}) or {}).get("finished", 0) >= cutoff]
+    print(f"active {len(active)}")
+    for r in active:
+        warn = []
+        if r["state"] == "dead":
+            warn.append("RUNNER DEAD")
+        if r["idle_min"] and r["idle_min"] > 10:
+            warn.append(f"idle {r['idle_min']}m")
+        if r["budget_min"] and r["elapsed_min"] > r["budget_min"]:
+            warn.append("over budget")
+        print(f"  {r['id']} {r['backend']}/{r['model']} {r['elapsed_min']}m/{r['budget_min']}m cmds={r['cmds']} "
+              f"{'⚠ ' + ', '.join(warn) if warn else ''}\n    {r['title']} — {r['last_msg'][:140]}")
+    tally = {}
+    for r in recent:
+        tally[r["status"]] = tally.get(r["status"], 0) + 1
+    print(f"finished in last {args.since_minutes}m: {len(recent)} {tally if tally else ''}")
+    for r in recent:
+        print(f"  {r['status']:<15} {r['backend']}/{r['model']} {r['elapsed_min']}m  {r['title']}"
+              f"{'  commit ' + r['commit'][:10] if r.get('commit') else ''}")
+    needs = [r for r in active if r["state"] == "dead" or (r["budget_min"] and r["elapsed_min"] > r["budget_min"])]
+    needs += [r for r in recent if r["status"] not in ("done",)]
+    print(f"attention {len(needs)}" + ("" if not needs else ": " + ", ".join(f"{r['id']}({r['status'] or r['state']})" for r in needs)))
+
+
+def cmd_stop(args, policy):
+    rdir = f"{RUNS}/{args.run_id}"
+    st = jload(f"{rdir}/status.json", {}) or {}
+    set_status(rdir, stop_requested=NOW())
+    killed = []
+    # Stop the executor first so the runner can still finalize (commit partial work, write result/ledger).
+    targets = ["executor_pid"] if pid_alive(st.get("executor_pid")) else ["runner_pid"]
+    for k in targets:
+        pid = st.get(k)
+        if pid and pid_alive(pid):
+            kill_tree(pid)
+            killed.append(k)
+    print(json.dumps({"id": args.run_id, "signalled": killed,
+                      "note": "runner finalizes the worktree (commits partial work) when the executor exits"}))
+
+
+def append_ledger(entry):
+    os.makedirs(DATA, exist_ok=True)
+    with open(LEDGER, "a") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+# ---------------------------------------------------------------- CLI
+
+def profile_from_args(a):
+    p = {"type": a.type, "difficulty": max(1, min(5, a.difficulty))}
+    if a.context_tokens:
+        p["context_tokens"] = a.context_tokens
+    for k in ("backend", "model", "effort"):
+        if getattr(a, k, None):
+            p[k] = getattr(a, k)
+    return p
+
+
+def pct(w):
+    if not w:
+        return "  n/a"
+    s = f"{w['used']:>5.0%}"
+    if w.get("hours_to_reset") is not None:
+        s += f" (reset {w['hours_to_reset']}h"
+        s += f", pace {w['pace']}x)" if w.get("pace") else ")"
+    return s
+
+
+def cmd_status(policy, refresh):
+    st = get_state(policy, refresh)
+    c, cx, oc, ds = st["claude"], st["codex"], st["ocgo"], st["deepseek"]
+    print(f"openswarm state @ {st['generated_at_local']}")
+    ls = policy.get("local_sources") or {}
+    print("Sources  " + "  ".join(f"{k}={'on' if v else 'off'}" for k, v in ls.items() if not k.startswith("_"))
+          + ("  (offline: OPENSWARM_STATE_FILE)" if envvar("STATE_FILE") else "") + "\n")
+    print(f"Claude   plan={c['plan']}{' ($' + str((policy.get('claude') or {}).get('plan_usd')) + ')' if (policy.get('claude') or {}).get('plan_usd') else ''} provider={c['provider']} source={c['source'] or '-'} age={'-' if c['age_minutes'] is None else str(c['age_minutes']) + 'm'}"
+          f"{' STALE' if c['stale'] else ''}")
+    print(f"         5h {pct(c['five_hour'])}   7d {pct(c['seven_day'])}")
+    cp = policy.get("codex") or {}
+    print(f"Codex    plan={cx['plan']}{' ($' + str(cp['plan_usd']) + ')' if cp.get('plan_usd') else ''}"
+          f" bin={cx['version']} models from {cx['models_source']}"
+          f"  resets_left={resets_left(policy)} (manual, user-triggered)")
+    for lid, lim in cx["limits"].items():
+        ws = "  ".join(f"{k} {pct(v)}" for k, v in lim["windows"].items())
+        print(f"         limit[{lid}] {ws}  (observed {'?' if lim.get('age_minutes') is None else lim['age_minutes']}m ago)")
+    cm = cx.get("config_model")
+    if cm and cx["models"] and cm not in {m["id"] for m in cx["models"]}:
+        print(f"         ⚠ config.toml default model {cm!r} is not in the current catalog; "
+              f"bare `codex exec` will fail — pass -m or update config")
+    for m in cx["models"]:
+        print(f"         {m['tier']:<8} {m['id']:<16} {'legacy ' if m['legacy'] else ''}efforts={','.join(m['efforts'])}")
+    print(f"OCGo     plan={oc['plan']}{' (inferred)' if oc['plan_inferred'] else ''}")
+    for m in sorted([m for m in oc["models"] if not m["excluded"]], key=lambda m: ("fast balanced deep".split().index(m["tier"]), m["id"])):
+        u = max(m["usage"].values())
+        print(f"         {m['tier']:<8} {m['id']:<22} ${m['cost_out']}/M out  limit ${m['monthly_limit_usd']}/mo  used {u:.0%}"
+              f"  variants={','.join(m['variants']) or '-'}")
+    print(f"DeepSeek balance={ds.get('balance')} {ds.get('currency') or ''} models={ds.get('api_models')}"
+          f"{' ERROR ' + ds['error'] if ds.get('error') else ''}")
+    br = breakers()
+    if br:
+        print(f"Breakers {', '.join(f'{k} until {iso(v)}' for k, v in br.items())}")
+    print(f"\nConcurrency recommendation: {concurrency(st, policy)}")
+    mode, why = claude_mode(st, policy)
+    print(f"Claude review mode: {mode} — {why}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="openswarm", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("probe")
+    sp.add_argument("--quiet", action="store_true")
+    sp = sub.add_parser("status")
+    sp.add_argument("--refresh", action="store_true")
+
+    def add_profile(p):
+        p.add_argument("--type", default="impl",
+                       help="impl|refactor|debug|test|docs|mechanical|review|research|migration|format|rename")
+        p.add_argument("--difficulty", type=int, default=3, help="1 (trivial) .. 5 (hardest)")
+        p.add_argument("--context-tokens", type=int, default=0, help="approx context the executor must read")
+        p.add_argument("--backend", choices=["codex", "ocgo", "deepseek"])
+        p.add_argument("--model")
+        p.add_argument("--effort")
+
+    sp = sub.add_parser("route")
+    add_profile(sp)
+    sp.add_argument("--refresh", action="store_true")
+
+    sp = sub.add_parser("run")
+    add_profile(sp)
+    sp.add_argument("--prompt")
+    sp.add_argument("--task-file")
+    sp.add_argument("--title")
+    sp.add_argument("--cwd", default=os.getcwd())
+    sp.add_argument("--no-worktree", action="store_true")
+    sp.add_argument("--verify-baseline", action="store_true",
+                    help="when verify fails, rerun it on the base commit and pass if no failures are new")
+    sp.add_argument("--verify", help="acceptance command run on the host in the worktree after the executor finishes; "
+                                     "its exit code overrides a sandbox-limited partial/done")
+    sp.add_argument("--keep-worktree", action="store_true")
+    sp.add_argument("--no-fallback", action="store_true")
+    sp.add_argument("--budget-minutes", type=int, help="hard wall-clock budget; executor is killed when exceeded")
+    sp.add_argument("--detach", action="store_true", help="run in background; monitor with `openswarm watch <id>`")
+    sp.add_argument("--run-id", help=argparse.SUPPRESS)
+    sp.add_argument("--dry-run", action="store_true")
+
+    sp = sub.add_parser("watch", help="stream actionable events of a run (for Claude's Monitor tool)")
+    sp.add_argument("run_id", nargs="+", help="one or more run ids; several ids are watched together")
+    sp.add_argument("--label")
+    sp.add_argument("--from-end", action="store_true", help="skip events already written (use when re-arming)")
+    sp.add_argument("--stall-minutes", type=float, default=10)
+    sp.add_argument("--heartbeat-minutes", type=float, default=15)
+    sp.add_argument("--max-minutes", type=float, default=28, help="watch window; exits so the caller re-arms")
+    sp.add_argument("--risk", action="append", help="extra regex to flag in executor shell commands")
+
+    sp = sub.add_parser("runs", help="report recent/active runs (for scheduled check-ins)")
+    sp.add_argument("-n", type=int, default=10)
+    sp.add_argument("--active", action="store_true")
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser("report", help="compact check-in: quotas + active runs + recently finished")
+    sp.add_argument("--since-minutes", type=float, default=60)
+
+    sp = sub.add_parser("stop", help="terminate a running run")
+    sp.add_argument("run_id")
+
+    sp = sub.add_parser("ingest-claude")
+    sp.add_argument("--five-hour", type=float)
+    sp.add_argument("--seven-day", type=float)
+    sp.add_argument("--five-hour-resets")
+    sp.add_argument("--seven-day-resets")
+
+    sp = sub.add_parser("ledger")
+    sp.add_argument("-n", type=int, default=20)
+
+    a = ap.parse_args()
+    policy = load_policy()
+    os.makedirs(DATA, exist_ok=True)
+    if a.cmd == "probe":
+        st = probe(policy)
+        if not a.quiet:
+            print(json.dumps(st, indent=2, ensure_ascii=False))
+    elif a.cmd == "status":
+        cmd_status(policy, a.refresh)
+    elif a.cmd == "route":
+        st = get_state(policy, a.refresh)
+        print(json.dumps(route(profile_from_args(a), st, policy), indent=2, ensure_ascii=False))
+    elif a.cmd == "run":
+        cmd_run(a, policy)
+    elif a.cmd == "watch":
+        cmd_watch(a, policy)
+    elif a.cmd == "runs":
+        cmd_runs(a, policy)
+    elif a.cmd == "report":
+        cmd_report(a, policy)
+    elif a.cmd == "stop":
+        cmd_stop(a, policy)
+    elif a.cmd == "ingest-claude":
+        ingest_claude(a)
+    elif a.cmd == "ledger":
+        for e in recent_ledger(a.n):
+            print(f"{iso(e['ts'])}  {e.get('status'):<10} {e.get('backend') or '-':<8} {e.get('model') or '-':<20} "
+                  f"{e.get('effort') or '-':<7} {e.get('seconds', 0):>6}s  {e.get('title', '')[:60]}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,27 @@
+{
+  "id": "ocgo",
+  "name": "OpenCode Go subscription via opencode run",
+  "role": "secondary executor: mechanical/docs/test work (difficulty 1-2), independent non-GPT reviews, Codex spillover, >272k context",
+  "invoke": "OPENCODE_SKIP_STARTUP=1 opencode run --pure -m opencode-go/<model> [--variant <effort>] --format json --dir <worktree>",
+  "binary_resolution": "OPENSWARM_OPENCODE_BIN, else /opt/homebrew/bin or /usr/local/bin opencode (bypasses interactive shell wrappers), else $PATH",
+  "models_source": "opencode models opencode-go --verbose (live: price, context, variants, release_date, toolcall)",
+  "tiering": "terciles of output price among usable models; newest release preferred within a tier",
+  "plan_source": "auto: 'go' unless 30d spend on a model exceeds the Go cap without a cut-off -> 'plus'",
+  "quota_source": "per-model spend in ~/.local/share/opencode/opencode.db (read-only; local_sources.opencode_db) vs docs limits (5h=20%, 7d=50%, 30d=100% of monthly)",
+  "quota_blind_spot": "traffic that reaches OpenCode Go outside `opencode run` (e.g. through a proxy) is not counted; 429s trip a 30-min breaker",
+  "streaming_events": "tool_use is emitted AFTER a tool finishes -> RISK alerts are post-hoc for opencode",
+  "costTier": "subscription",
+  "privacyRisk": "model_provider",
+  "dataBoundary": "worktree + opencode.ai gateway + upstream model vendor",
+  "excluded_by_default": [
+    "minimax*",
+    "*free*",
+    "*contributor*",
+    "*vision*",
+    "*-exp*",
+    "*preview*",
+    "*luna (use Codex)",
+    "space-bunny",
+    "longcat"
+  ]
+}

@@ -1,0 +1,219 @@
+{
+  "generated_at": 0,
+  "generated_at_local": "synthetic fixture",
+  "claude": {
+    "plan": "pro",
+    "org_type": "",
+    "rate_limit_tier": "",
+    "provider": "official",
+    "metered_by_anthropic": true,
+    "five_hour": null,
+    "seven_day": null,
+    "source": "fixture",
+    "age_minutes": null,
+    "stale": true
+  },
+  "codex": {
+    "binary": "/usr/bin/codex",
+    "version": "0.0.0-fixture",
+    "plan": "plus",
+    "models_source": "fixture",
+    "config_model": null,
+    "limits": {
+      "codex": {
+        "name": "codex",
+        "windows": {
+          "five_hour": {
+            "used": 0.12,
+            "window_minutes": 300,
+            "resets_at": null,
+            "resets_at_local": null,
+            "hours_to_reset": null,
+            "pace": null
+          },
+          "seven_day": {
+            "used": 0.31,
+            "window_minutes": 10080,
+            "resets_at": null,
+            "resets_at_local": null,
+            "hours_to_reset": null,
+            "pace": null
+          }
+        },
+        "observed_at": null,
+        "age_minutes": 3
+      }
+    },
+    "models": [
+      {
+        "id": "gpt-frontier",
+        "description": "Frontier model for the most demanding work",
+        "priority": 1,
+        "tier": "deep",
+        "legacy": false,
+        "efforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ],
+        "default_effort": "medium",
+        "context_window": 272000,
+        "limit_id": "codex"
+      },
+      {
+        "id": "gpt-workhorse",
+        "description": "Balanced everyday workhorse",
+        "priority": 2,
+        "tier": "balanced",
+        "legacy": false,
+        "efforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ],
+        "default_effort": "medium",
+        "context_window": 272000,
+        "limit_id": "codex"
+      },
+      {
+        "id": "gpt-old",
+        "description": "Previous balanced model (legacy)",
+        "priority": 3,
+        "tier": "balanced",
+        "legacy": true,
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default_effort": "medium",
+        "context_window": 200000,
+        "limit_id": "codex"
+      },
+      {
+        "id": "gpt-mini",
+        "description": "Fast and affordable for easier tasks",
+        "priority": 4,
+        "tier": "fast",
+        "legacy": false,
+        "efforts": [
+          "minimal",
+          "low",
+          "medium",
+          "high"
+        ],
+        "default_effort": "low",
+        "context_window": 272000,
+        "limit_id": "codex"
+      }
+    ]
+  },
+  "ocgo": {
+    "binary": "/usr/bin/opencode",
+    "plan": "go",
+    "plan_inferred": true,
+    "limits_source": "fixture",
+    "spend_note": "fixture",
+    "models": [
+      {
+        "id": "cheap-flash",
+        "name": "Cheap Flash",
+        "family": "a",
+        "release_date": "2026-09-01",
+        "cost_in": 0.1,
+        "cost_out": 0.4,
+        "context": 1000000,
+        "variants": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "reasoning": true,
+        "monthly_limit_usd": 60,
+        "spend_usd": {
+          "5h": 0,
+          "7d": 0,
+          "30d": 0
+        },
+        "usage": {
+          "5h": 0,
+          "7d": 0,
+          "30d": 0
+        },
+        "excluded": false,
+        "tier": "fast"
+      },
+      {
+        "id": "mid-coder",
+        "name": "Mid Coder",
+        "family": "b",
+        "release_date": "2026-08-15",
+        "cost_in": 0.5,
+        "cost_out": 2.0,
+        "context": 1000000,
+        "variants": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "reasoning": true,
+        "monthly_limit_usd": 60,
+        "spend_usd": {
+          "5h": 0,
+          "7d": 0,
+          "30d": 0
+        },
+        "usage": {
+          "5h": 0,
+          "7d": 0,
+          "30d": 0
+        },
+        "excluded": false,
+        "tier": "balanced"
+      },
+      {
+        "id": "big-pro",
+        "name": "Big Pro",
+        "family": "c",
+        "release_date": "2026-09-20",
+        "cost_in": 1.5,
+        "cost_out": 6.0,
+        "context": 1000000,
+        "variants": [
+          "high",
+          "max"
+        ],
+        "reasoning": true,
+        "monthly_limit_usd": 15,
+        "spend_usd": {
+          "5h": 0,
+          "7d": 0,
+          "30d": 0
+        },
+        "usage": {
+          "5h": 0,
+          "7d": 0,
+          "30d": 0
+        },
+        "excluded": false,
+        "tier": "deep"
+      }
+    ]
+  },
+  "deepseek": {
+    "plan": "pay-as-you-go",
+    "balance": 55.0,
+    "currency": "CNY",
+    "available": true,
+    "api_models": [
+      "deepseek-v4-pro",
+      "deepseek-flash"
+    ],
+    "opencode_models": [
+      "deepseek-v4-pro",
+      "deepseek-flash"
+    ]
+  }
+}

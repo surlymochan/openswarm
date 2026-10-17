@@ -1,0 +1,12 @@
+{
+  "id": "deepseek",
+  "name": "DeepSeek API (pay-as-you-go) via opencode run",
+  "role": "last-resort executor when Codex and OCGo lack headroom",
+  "invoke": "OPENCODE_SKIP_STARTUP=1 opencode run --pure -m deepseek/<model> --format json --dir <worktree>",
+  "models_source": "GET https://api.deepseek.com/models and `opencode models deepseek`",
+  "quota_source": "GET https://api.deepseek.com/user/balance (key from DEEPSEEK_API_KEY, or a macOS Keychain item listed in policy deepseek.keychain_items)",
+  "floor": "disabled below policy.thresholds.deepseek_min_balance_cny",
+  "costTier": "metered",
+  "privacyRisk": "model_provider",
+  "dataBoundary": "worktree + DeepSeek"
+}

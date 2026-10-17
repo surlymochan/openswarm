@@ -1,0 +1,20 @@
+{
+  "id": "codex",
+  "name": "OpenAI Codex CLI (codex exec)",
+  "role": "primary executor: implementation, refactor, debug (difficulty 2-5)",
+  "invoke": "codex exec -m <model> -c model_reasoning_effort=<effort> -s workspace-write -C <worktree> --json --output-schema <schema> -o <last>",
+  "binary_resolution": "newest candidate whose `codex features list` loads ~/.codex/config.toml (Homebrew 0.147 cannot)",
+  "models_source": "codex debug models (live); fallback ~/.codex/models_cache.json",
+  "plan_source": "OPENSWARM_CODEX_PLAN env or policy codex.plan; opt-in: chatgpt_plan_type claim of ~/.codex/auth.json id_token (local_sources.codex_auth_plan, decoded locally, never sent)",
+  "quota_source": "rate_limits lines in ~/.codex/sessions/**/rollout-*.jsonl (local_sources.codex_sessions; per limit_id, primary/secondary windows)",
+  "steerSupport": "none (one-shot exec)",
+  "sessionPolicy": "keep (codex rollout retained; resumable with `codex exec resume <thread_id>`)",
+  "streaming_events": "item.started command_execution is emitted BEFORE a command runs -> real-time RISK alerts",
+  "costTier": "subscription",
+  "privacyRisk": "model_provider",
+  "dataBoundary": "worktree + OpenAI",
+  "never": [
+    "effort=ultra (self-delegation)",
+    "danger-full-access sandbox"
+  ]
+}

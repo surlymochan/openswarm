@@ -1,0 +1,227 @@
+{
+  "_doc": "openswarm default policy. Override any key in ~/.claude/openswarm/policy.local.json (deep-merged). Fractions are 0..1.",
+  "local_sources": {
+    "_doc": "What openswarm may read from other tools on this machine. Usage metadata only; see README 'What openswarm reads'. Auth-file reads are opt-in.",
+    "codex_sessions": true,
+    "opencode_db": true,
+    "codex_auth_plan": false,
+    "claude_account_plan": false
+  },
+  "efforts": [
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max"
+  ],
+  "never_efforts": [
+    "ultra"
+  ],
+  "difficulty_map": {
+    "1": {
+      "tier": "fast",
+      "effort": "low"
+    },
+    "2": {
+      "tier": "fast",
+      "effort": "medium"
+    },
+    "3": {
+      "tier": "balanced",
+      "effort": "medium"
+    },
+    "4": {
+      "tier": "balanced",
+      "effort": "high"
+    },
+    "5": {
+      "tier": "deep",
+      "effort": "high"
+    }
+  },
+  "thresholds": {
+    "window_soft": 0.85,
+    "window_hard": 0.95,
+    "pace_downgrade": 1.25,
+    "upgrade_if_reset_within_hours": 24,
+    "upgrade_if_used_below": 0.6,
+    "claude_tight": 0.8,
+    "claude_stale_minutes": 180,
+    "deepseek_min_balance_cny": 10,
+    "state_ttl_minutes": 10,
+    "breaker_minutes": 30
+  },
+  "routing": {
+    "ocgo_first_types": [
+      "mechanical",
+      "docs",
+      "test",
+      "format",
+      "rename",
+      "migration"
+    ],
+    "ocgo_first_max_difficulty": 2,
+    "review_types": [
+      "review",
+      "second-opinion",
+      "audit"
+    ],
+    "default_order": [
+      "codex",
+      "ocgo",
+      "deepseek"
+    ],
+    "large_context_tokens": 220000
+  },
+  "codex": {
+    "binary_candidates": [
+      "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+      "$PATH:codex",
+      "~/.codex/packages/standalone/releases/*/bin/codex",
+      "/Applications/.Codex Mini Runtime.app/Contents/Resources/codex"
+    ],
+    "tier_keywords": {
+      "deep": [
+        "frontier",
+        "most demanding",
+        "hardest"
+      ],
+      "fast": [
+        "fast",
+        "affordable",
+        "easier",
+        "efficient",
+        "lightweight"
+      ],
+      "balanced": [
+        "workhorse",
+        "balanced",
+        "everyday",
+        "straightforward"
+      ]
+    },
+    "legacy_keywords": [
+      "older",
+      "previous",
+      "legacy",
+      "retire"
+    ],
+    "limit_id_by_model": {
+      "gpt-reserve": "base_model_inference"
+    },
+    "default_limit_id": "codex",
+    "sandbox": "workspace-write"
+  },
+  "ocgo": {
+    "plan": "auto",
+    "exclude_patterns": [
+      "minimax",
+      "free",
+      "contributor",
+      "vision",
+      "-exp",
+      "preview",
+      "luna",
+      "space-bunny",
+      "longcat"
+    ],
+    "window_fractions": {
+      "5h": 0.2,
+      "7d": 0.5,
+      "30d": 1.0
+    },
+    "monthly_limits_source": "https://opencode.ai/docs/go/ (2026-10-06)",
+    "monthly_limits": {
+      "go": {
+        "glm-5.3-flash": 60,
+        "glm-5.3": 15,
+        "glm-5.2": 60,
+        "kimi-k3": 15,
+        "kimi-k2.7-code": 60,
+        "kimi-k2.6": 60,
+        "longcat-2.0": 60,
+        "mimo-v2.6-flash": 60,
+        "mimo-v2.6-pro": 15,
+        "mimo-v2.5": 60,
+        "mimo-v2.5-pro": 15,
+        "minimax-m3": 60,
+        "minimax-m2.7": 60,
+        "qwen3.8-max": 15,
+        "qwen3.8-flash": 30,
+        "qwen3.7-plus": 60,
+        "deepseek-v4.1-flash": 60,
+        "deepseek-v4-pro": 15,
+        "deepseek-v4-flash": 30,
+        "hy4-preview": 30,
+        "hy3": 60,
+        "space-bunny": 30,
+        "grok-4.7": 15,
+        "grok-4.6": 15,
+        "gpt-6-luna": 15,
+        "gpt-5.6-luna": 15,
+        "_default": 15
+      },
+      "plus": {
+        "glm-5.3-flash": 180,
+        "glm-5.3": 120,
+        "glm-5.2": 180,
+        "kimi-k3": 60,
+        "kimi-k2.7-code": 180,
+        "kimi-k2.6": 240,
+        "longcat-2.0": 240,
+        "mimo-v2.6-flash": 120,
+        "mimo-v2.6-pro": 60,
+        "mimo-v2.5": 120,
+        "mimo-v2.5-pro": 60,
+        "minimax-m3": 180,
+        "minimax-m2.7": 240,
+        "qwen3.8-max": 60,
+        "qwen3.8-flash": 90,
+        "qwen3.7-plus": 180,
+        "deepseek-v4.1-flash": 120,
+        "deepseek-v4-pro": 60,
+        "deepseek-v4-flash": 120,
+        "hy4-preview": 120,
+        "hy3": 240,
+        "space-bunny": 120,
+        "grok-4.7": 60,
+        "grok-4.6": 60,
+        "gpt-6-luna": 60,
+        "gpt-5.6-luna": 60,
+        "_default": 60
+      }
+    }
+  },
+  "deepseek": {
+    "_doc": "API key: DEEPSEEK_API_KEY env, or list macOS Keychain items you created for openswarm, e.g. [\"openswarm-deepseek-api-key\"].",
+    "keychain_items": [],
+    "tiers": {
+      "deep": "deepseek-v4-pro",
+      "balanced": "deepseek-v4-pro",
+      "fast": "deepseek-flash"
+    },
+    "variant_supported": false
+  },
+  "concurrency": [
+    {
+      "codex_used_below": 0.5,
+      "codex": 4,
+      "ocgo": 2
+    },
+    {
+      "codex_used_below": 0.8,
+      "codex": 2,
+      "ocgo": 2
+    },
+    {
+      "codex_used_below": 1.01,
+      "codex": 1,
+      "ocgo": 2
+    }
+  ],
+  "run": {
+    "timeout_seconds": 2400,
+    "fallback": true
+  }
+}
