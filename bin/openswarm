@@ -36,6 +36,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.request
 import uuid
 import queue
@@ -1574,6 +1575,24 @@ def lane_socket_path(name):
     return os.path.join(lane_root(name), "ctl.sock")
 
 
+def lane_last_log_error(name):
+    try:
+        with open(os.path.join(lane_root(name), "supervisor.log"), errors="ignore") as f:
+            lines = f.read().splitlines()
+        return next((line for line in reversed(lines) if line.strip()), None)
+    except OSError:
+        return None
+
+
+def lane_validate_socket_path(name):
+    path = lane_socket_path(name)
+    capacity = 104 if sys.platform == "darwin" else 108
+    limit = capacity - 1  # sockaddr_un.sun_path needs room for the terminating NUL.
+    if len(os.fsencode(path)) > limit:
+        raise RuntimeError(f"lane control socket path exceeds the {capacity}-byte AF_UNIX limit: {path}")
+    return path
+
+
 def lane_config():
     path = envvar("LANES_FILE", os.path.join(DATA, "lanes.json"))
     try:
@@ -1629,11 +1648,11 @@ def lanes_by_name(names=None):
     return [by_name[n] for n in names]
 
 
-def lane_write_state(name, **changes):
-    state = jload(lane_state_path(name), {}) or {}
+def lane_write_state(lane_name, **changes):
+    state = jload(lane_state_path(lane_name), {}) or {}
     state.update(changes)
     state["updated"] = NOW()
-    jsave(lane_state_path(name), state)
+    jsave(lane_state_path(lane_name), state)
     return state
 
 
@@ -1658,7 +1677,7 @@ def lane_call(name, request, timeout=8):
 
 def lane_ctl_listener(name):
     os.makedirs(lane_root(name), exist_ok=True)
-    path = lane_socket_path(name)
+    path = lane_validate_socket_path(name)
     if os.path.lexists(path):
         probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -1815,25 +1834,29 @@ class LaneChild:
 
     def wait_response(self, req_id, timeout=30, event_file=None):
         end = NOW() + timeout
-        while NOW() < end:
-            item = self.next_event(min(0.2, end - NOW()))
-            if item is False:
-                if not self.alive():
-                    raise RuntimeError("executor exited before RPC response")
-                continue
-            if item is None:
-                raise RuntimeError("executor stdout closed before RPC response")
-            if self.lane["backend"] == "codex" and item.get("id") == req_id and ("result" in item or "error" in item):
-                return item.get("result") or item
-            if self.lane["backend"] == "pi" and item.get("id") == req_id and item.get("type") == "response":
-                if not item.get("success"):
-                    raise RuntimeError(f"pi RPC {item.get('command')} failed: {short(item.get('error'), 250)}")
-                return item
-            if event_file and item.get("method") and "id" in item:
-                if lane_approval_response(self, item, event_file):
+        deferred = []
+        try:
+            while NOW() < end:
+                item = self.next_event(min(0.2, end - NOW()))
+                if item is False:
+                    if not self.alive():
+                        raise RuntimeError("executor exited before RPC response")
                     continue
-            self.backlog.append(item)
-        raise RuntimeError("executor RPC response timed out")
+                if item is None:
+                    raise RuntimeError("executor stdout closed before RPC response")
+                if self.lane["backend"] == "codex" and item.get("id") == req_id and ("result" in item or "error" in item):
+                    return item.get("result") or item
+                if self.lane["backend"] == "pi" and item.get("id") == req_id and item.get("type") == "response":
+                    if not item.get("success"):
+                        raise RuntimeError(f"pi RPC {item.get('command')} failed: {short(item.get('error'), 250)}")
+                    return item
+                if event_file and item.get("method") and "id" in item:
+                    if lane_approval_response(self, item, event_file):
+                        continue
+                deferred.append(item)
+            raise RuntimeError("executor RPC response timed out")
+        finally:
+            self.backlog = deferred + self.backlog
 
     def close(self):
         if self.alive():
@@ -2242,6 +2265,7 @@ def cmd_lane_serve(lane, policy):
         child = LaneChild(lane, wt, policy)
         lane_write_state(name, state="idle", child_pid=child.proc.pid, last_error=None)
     except Exception as e:
+        traceback.print_exc()
         lane_write_state(name, state="crashed", last_error=short(e, 500), child_pid=None)
         next_start = NOW() + backoff
     shutdown = False
@@ -2273,6 +2297,7 @@ def cmd_lane_serve(lane, policy):
                 backoff = 1
                 lane_write_state(name, state="idle", child_pid=child.proc.pid, current_run=None, last_error=None)
             except Exception as e:
+                traceback.print_exc()
                 lane_write_state(name, state="crashed", child_pid=None, last_error=short(e, 500))
                 next_start = NOW() + backoff
                 backoff = min(backoff * 2, 60)
@@ -2326,6 +2351,7 @@ def cmd_lane_up(args, policy):
     results = []
     for lane in lanes_by_name(args.names):
         name = lane["name"]
+        lane_validate_socket_path(name)
         state = jload(lane_state_path(name), {}) or {}
         if state.get("supervisor_pid") and pid_alive(state.get("supervisor_pid")):
             ping = {"ok": False}
@@ -2373,9 +2399,9 @@ def cmd_lane_up(args, policy):
                 break
             time.sleep(0.1)
         if not ready:
+            log_error = lane_last_log_error(name)
             results.append({"name": name, "started": False, "ok": False,
-                            "error": startup_error or short(open(logfile, errors="ignore").read()[-1000:], 500)
-                            or "supervisor did not start"})
+                            "error": log_error or startup_error or "supervisor did not start"})
         else:
             lane_state = ping.get("state") or {}
             if lane_state.get("state") == "crashed":
@@ -2988,6 +3014,8 @@ def main():
                 lane = lanes_by_name([a.name])[0]
                 cmd_lane_serve(lane, policy)
         except (ValueError, RuntimeError) as e:
+            if a.lane_cmd == "serve":
+                traceback.print_exc()
             print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False), file=sys.stderr)
             sys.exit(2)
     elif a.cmd == "ingest-claude":

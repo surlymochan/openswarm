@@ -21,8 +21,8 @@ class LaneTests(unittest.TestCase):
         probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             probe.bind(probe_path)
-        except OSError as e:
-            raise unittest.SkipTest(f"sandbox blocks AF_UNIX bind required by lane supervisors: {e}")
+        except PermissionError as e:
+            raise unittest.SkipTest(f"host denies AF_UNIX bind required by lane supervisors: {e}")
         finally:
             probe.close()
             try:
@@ -133,7 +133,27 @@ class LaneTests(unittest.TestCase):
         self.assertEqual(self.git("status", "--porcelain"), "")
         self.assertEqual(self.git("-C", str(self.data / "lanes" / self.lane_name / "wt"), "branch", "--show-current"), "")
 
+    def test_codex_assign_commits_and_writes_normal_result(self):
+        self.start_lane()
+        run_id = self.assign("add the fixture change")
+        state = self.wait_run(run_id)
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual(state["status"], "done")
+        self.assertTrue(result["commit"])
+        self.assertEqual(result["branch"], f"openswarm/{run_id}")
+        self.assertEqual(self.git("show", f"openswarm/{run_id}:lane_result.txt"), "completed")
+
     def test_steer_reaches_active_codex_turn(self):
+        self.start_lane()
+        run_id = self.assign("LANE_TEST_WAIT steer me")
+        self.wait_running(run_id)
+        self.cli("lane", "steer", self.lane_name, "--text", "write steered instruction")
+        self.wait_run(run_id)
+        self.assertEqual((self.data / "lanes" / self.lane_name / "wt" / "lane_result.txt").read_text(),
+                         "write steered instruction")
+
+    def test_steer_reaches_active_pi_turn(self):
+        self.set_config("pi")
         self.start_lane()
         run_id = self.assign("LANE_TEST_WAIT steer me")
         self.wait_running(run_id)
@@ -144,6 +164,16 @@ class LaneTests(unittest.TestCase):
 
     def test_abort_marks_lane_run_stopped(self):
         self.set_config("pi")
+        self.start_lane()
+        run_id = self.assign("LANE_TEST_WAIT abort this")
+        self.wait_running(run_id)
+        self.cli("lane", "abort", self.lane_name)
+        state = self.wait_run(run_id)
+        self.assertEqual(state["status"], "stopped")
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual(result["status"], "stopped")
+
+    def test_abort_marks_codex_lane_run_stopped(self):
         self.start_lane()
         run_id = self.assign("LANE_TEST_WAIT abort this")
         self.wait_running(run_id)
