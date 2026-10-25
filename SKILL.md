@@ -75,6 +75,28 @@ How to react:
 - `STALL`: look at the last command (`$XS runs`) and decide whether to keep waiting or stop.
 - `DONE`: read `~/.claude/openswarm/runs/<id>/result.json`.
 
+## Resident lanes
+
+For long-lived Codex or Pi executors, configure `$OPENSWARM_HOME/lanes.json` with one entry per lane (`name`,
+`backend`, `model`, absolute `repo`, plus Codex `effort` or Pi `provider`). Start and monitor lanes like this:
+
+```bash
+$XS lane up C1 M1                         # omit names to start all configured lanes
+$XS lane status
+$XS lane assign C1 --task-file /tmp/task.md --title "..." --verify 'pytest -q' --budget-minutes 30
+$XS watch <run-id>
+$XS lane steer C1 --text "..."             # delivered to the active turn
+$XS lane abort C1                          # or $XS stop <run-id>
+$XS lane down C1 M1
+$XS lane launchd-plist C1                  # print only; install the plist yourself if wanted
+```
+
+`lane assign` refuses a non-idle lane and immediately returns the normal run id. Review the run through `watch`,
+`runs`, `report`, and `runs/<id>/result.json` as usual. Each lane has a persistent `$OPENSWARM_HOME/lanes/<name>/wt`;
+assignments reset it to the requested `--base` (default: repo `HEAD`) and commit edits on `openswarm/<run-id>`.
+The next assignment reuses that worktree after detaching it. `lane down` aborts an active turn and stops its child
+and supervisor. The printed LaunchAgent plist uses `KeepAlive` and is not installed automatically.
+
 The user gets updates, not a stream. Relay progress in one line per meaningful event. Send a push notification only when the user needs to decide something, something really fails, or a phase finishes.
 
 ## 3. Scheduled reporting, never endless
@@ -152,6 +174,6 @@ Override anything in `~/.claude/openswarm/policy.local.json`, deep-merged over `
 
 ## Files
 
-- `bin/openswarm`: CLI (probe, status, route, run, watch, runs, report, stop, ingest-claude, ledger)
+- `bin/openswarm`: CLI (probe, status, route, run, lane, watch, runs, report, stop, ingest-claude, ledger)
 - `policy.json`: defaults · `backends/*.json`: harness manifests (x-agents style) · `templates/openswarm-workflow.js`: Workflow template · `tests/test_route.py`: routing scenarios
-- `~/.claude/openswarm/`: `state.json`, `quota-claude.json`, `ledger.jsonl`, `breakers.json`, `runs/<id>/` (task, events, result, patch), `worktrees/`
+- `~/.claude/openswarm/`: `state.json`, `quota-claude.json`, `ledger.jsonl`, `breakers.json`, `lanes.json`, `lanes/<name>/` (state, socket, fixed worktree), `runs/<id>/` (task, events, result, patch), `worktrees/`

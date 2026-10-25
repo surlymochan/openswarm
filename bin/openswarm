@@ -9,6 +9,7 @@ Subcommands:
   status           human summary of state + recommended concurrency
   route            pick backend/model/effort for a task profile (JSON out)
   run              route + execute in an isolated git worktree, record ledger (JSON out)
+  lane             manage long-lived Codex app-server / Pi RPC executor lanes
   watch            stream actionable events (progress, risk, stalls) for one or more runs
   runs / report    snapshot of recent runs / compact scheduled check-in
   stop             terminate a run (partial work is still committed to its branch)
@@ -23,16 +24,21 @@ import base64
 import datetime as dt
 import glob
 import json
+import math
 import os
 import re
+import select
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import uuid
+import queue
 
 HOME = os.path.expanduser("~")
 
@@ -1551,6 +1557,926 @@ def cmd_run(args, policy):
     sys.exit(0 if status == "done" else 1)
 
 
+# ---------------------------------------------------------------- resident lanes
+
+LANE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,48}$")
+
+
+def lane_root(name):
+    return os.path.join(DATA, "lanes", name)
+
+
+def lane_state_path(name):
+    return os.path.join(lane_root(name), "state.json")
+
+
+def lane_socket_path(name):
+    return os.path.join(lane_root(name), "ctl.sock")
+
+
+def lane_config():
+    path = envvar("LANES_FILE", os.path.join(DATA, "lanes.json"))
+    try:
+        cfg = jload(path)
+    except Exception:
+        cfg = None
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("lanes"), list):
+        raise ValueError(f"invalid lane config {path}: expected {{\"lanes\":[...]}}")
+    names, out = set(), []
+    for i, lane in enumerate(cfg["lanes"]):
+        where = f"{path}: lanes[{i}]"
+        if not isinstance(lane, dict):
+            raise ValueError(f"invalid lane config {where}: expected an object")
+        name, backend = lane.get("name"), lane.get("backend")
+        if not isinstance(name, str) or not LANE_NAME_RE.fullmatch(name):
+            raise ValueError(f"invalid lane config {where}: name must match {LANE_NAME_RE.pattern}")
+        if name in names:
+            raise ValueError(f"invalid lane config {where}: duplicate lane name {name!r}")
+        names.add(name)
+        if backend not in ("codex", "pi"):
+            raise ValueError(f"invalid lane config {where}: backend must be codex or pi")
+        repo = lane.get("repo")
+        if not isinstance(repo, str) or not os.path.isabs(repo):
+            raise ValueError(f"invalid lane config {where}: repo must be an absolute path")
+        if not os.path.isdir(repo):
+            raise ValueError(f"invalid lane config {where}: repo directory does not exist: {repo}")
+        if not isinstance(lane.get("model"), str) or not lane["model"].strip():
+            raise ValueError(f"invalid lane config {where}: model is required")
+        if backend == "codex" and (not isinstance(lane.get("effort"), str) or not lane["effort"].strip()):
+            raise ValueError(f"invalid lane config {where}: codex effort is required")
+        if backend == "codex" and lane["effort"] not in (load_policy().get("efforts") or []):
+            raise ValueError(f"invalid lane config {where}: codex effort must be one of {load_policy().get('efforts')}")
+        if lane.get("provider") is not None and not isinstance(lane.get("provider"), str):
+            raise ValueError(f"invalid lane config {where}: provider must be a string")
+        if lane.get("binary") is not None and (not isinstance(lane["binary"], str) or not os.path.isabs(lane["binary"])):
+            raise ValueError(f"invalid lane config {where}: binary override must be an absolute path")
+        if lane.get("binary") and not os.access(lane["binary"], os.X_OK):
+            raise ValueError(f"invalid lane config {where}: binary override is not executable")
+        out.append(dict(lane))
+    if not out:
+        raise ValueError(f"invalid lane config {path}: lanes must not be empty")
+    return out
+
+
+def lanes_by_name(names=None):
+    cfg = lane_config()
+    if not names:
+        return cfg
+    by_name = {x["name"]: x for x in cfg}
+    missing = [n for n in names if n not in by_name]
+    if missing:
+        raise ValueError("unknown lane(s): " + ", ".join(missing))
+    return [by_name[n] for n in names]
+
+
+def lane_write_state(name, **changes):
+    state = jload(lane_state_path(name), {}) or {}
+    state.update(changes)
+    state["updated"] = NOW()
+    jsave(lane_state_path(name), state)
+    return state
+
+
+def lane_call(name, request, timeout=8):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(lane_socket_path(name))
+        s.sendall((json.dumps(request, ensure_ascii=False) + "\n").encode())
+        data = bytearray()
+        while b"\n" not in data:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data.extend(chunk)
+        return json.loads(bytes(data).split(b"\n", 1)[0].decode()) if data else {"ok": False, "error": "lane closed control socket"}
+    except (OSError, ValueError) as e:
+        return {"ok": False, "error": f"lane {name} control socket unavailable: {e}"}
+    finally:
+        s.close()
+
+
+def lane_ctl_listener(name):
+    os.makedirs(lane_root(name), exist_ok=True)
+    path = lane_socket_path(name)
+    if os.path.lexists(path):
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.connect(path)
+        except (ConnectionRefusedError, FileNotFoundError):
+            try:
+                os.unlink(path)
+            except OSError as e:
+                raise RuntimeError(f"cannot replace stale lane socket {path}: {e}")
+        except OSError as e:
+            raise RuntimeError(f"cannot inspect existing lane socket {path}: {e}")
+        else:
+            raise RuntimeError(f"lane supervisor is already listening on {path}")
+        finally:
+            probe.close()
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(path)
+    except OSError as e:
+        server.close()
+        raise RuntimeError(f"cannot bind lane control socket {path}: {e}")
+    os.chmod(path, 0o600)
+    server.listen(16)
+    server.setblocking(False)
+    return server
+
+
+def lane_git(args, cwd, timeout=60):
+    rc, out, err = sh(["git", *args], cwd=cwd, timeout=timeout)
+    return rc, out.strip(), err.strip()
+
+
+def lane_prepare_workspace(lane, rid, base_rev=None):
+    repo = os.path.realpath(lane["repo"])
+    rc, top, err = lane_git(["rev-parse", "--show-toplevel"], repo)
+    if rc:
+        raise RuntimeError(f"lane repo is not a git checkout: {err or repo}")
+    repo = os.path.realpath(top)
+    rc, base, err = lane_git(["rev-parse", "--verify", "--end-of-options", f"{base_rev or 'HEAD'}^{{commit}}"], repo)
+    if rc:
+        raise RuntimeError(f"invalid base revision {base_rev!r}: {err}")
+    wt = os.path.join(lane_root(lane["name"]), "wt")
+    os.makedirs(os.path.dirname(wt), exist_ok=True)
+    if not os.path.exists(wt):
+        rc, _, err = lane_git(["worktree", "add", "--detach", "-q", wt, base], repo, timeout=300)
+        if rc:
+            raise RuntimeError(f"lane worktree creation failed: {err[:250]}")
+    else:
+        rc, root, err = lane_git(["rev-parse", "--show-toplevel"], wt)
+        if rc or os.path.realpath(root) != os.path.realpath(wt):
+            raise RuntimeError(f"lane worktree path exists but is not the expected git worktree: {wt}")
+        rc, git_common, _ = lane_git(["rev-parse", "--git-common-dir"], wt)
+        rc2, repo_common, _ = lane_git(["rev-parse", "--git-common-dir"], repo)
+        if rc or rc2:
+            raise RuntimeError(f"lane worktree is invalid: {wt}")
+        if not os.path.isabs(git_common):
+            git_common = os.path.join(wt, git_common)
+        if not os.path.isabs(repo_common):
+            repo_common = os.path.join(repo, repo_common)
+        if os.path.realpath(git_common) != os.path.realpath(repo_common):
+            raise RuntimeError(f"lane worktree belongs to a different repository: {wt}")
+    # Temporarily remove only dependency symlinks created for this worktree. This lets `git clean
+    # -fdx` remove every prior task artifact without deleting linked dependency targets.
+    names = set(load_policy().get("workspace", {}).get("link_dirs", ["node_modules", ".venv", "venv"]))
+    links = []
+    for dirpath, dirnames, _ in os.walk(wt, followlinks=False):
+        for d in list(dirnames):
+            p = os.path.join(dirpath, d)
+            if d in names and os.path.islink(p):
+                links.append(p)
+                dirnames.remove(d)
+    for p in links:
+        os.unlink(p)
+    for args in (["reset", "--hard", base], ["clean", "-fdx"], ["checkout", "-B", f"openswarm/{rid}", base]):
+        rc, _, err = lane_git(args, wt, timeout=300)
+        if rc:
+            raise RuntimeError(f"lane worktree preparation failed ({' '.join(args[:2])}): {err[:250]}")
+    linked = link_dependency_dirs(repo, wt)
+    if linked:
+        rc, ex, _ = lane_git(["rev-parse", "--git-path", "info/exclude"], wt)
+        if rc == 0:
+            ex = ex if os.path.isabs(ex) else os.path.join(wt, ex)
+            os.makedirs(os.path.dirname(ex), exist_ok=True)
+            have = open(ex).read().splitlines() if os.path.exists(ex) else []
+            with open(ex, "a") as f:
+                for rel in linked:
+                    if "/" + rel not in have:
+                        f.write("/" + rel + "\n")
+    return {"mode": "worktree", "path": wt, "root": wt, "repo": repo, "branch": f"openswarm/{rid}",
+            "base": base, "base_dirty": False, "linked": linked, "lane": lane["name"]}
+
+
+class LaneChild:
+    def __init__(self, lane, cwd, policy):
+        self.lane, self.cwd = lane, cwd
+        self.events = queue.Queue()
+        self.backlog = []
+        self.write_lock = threading.Lock()
+        backend = lane["backend"]
+        if backend == "codex":
+            binary = envvar("CODEX_APP_SERVER_BIN") or lane.get("binary") or find_codex(policy)[0]
+            if not binary:
+                raise RuntimeError("codex binary not found; set lane binary or install Codex")
+            cmd = [binary, "app-server"]
+        else:
+            binary = envvar("PI_RPC_BIN") or lane.get("binary") or pi_bin()
+            if not binary:
+                raise RuntimeError("pi binary not found; set lane binary or install Pi")
+            cmd = [binary, "--mode", "rpc", "--no-session"]
+            if lane.get("provider"):
+                cmd += ["--provider", lane["provider"]]
+            cmd += ["--model", lane["model"]]
+        self.proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL, text=True, bufsize=1, start_new_session=True)
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
+        if backend == "codex":
+            try:
+                self.send({"jsonrpc": "2.0", "id": "init", "method": "initialize",
+                           "params": {"clientInfo": {"name": "openswarm", "title": "openswarm", "version": "1"}}})
+                response = self.wait_response("init", 30)
+                if response.get("error"):
+                    raise RuntimeError(f"codex app-server initialize failed: {short(response['error'], 300)}")
+                self.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+            except Exception:
+                self.close()
+                raise
+
+    def _read(self):
+        try:
+            for line in self.proc.stdout:
+                try:
+                    self.events.put(json.loads(line))
+                except ValueError:
+                    continue
+        finally:
+            self.events.put(None)
+
+    def alive(self):
+        return self.proc.poll() is None
+
+    def send(self, obj):
+        with self.write_lock:
+            self.proc.stdin.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            self.proc.stdin.flush()
+
+    def next_event(self, timeout=0):
+        if self.backlog:
+            return self.backlog.pop(0)
+        try:
+            return self.events.get(timeout=timeout)
+        except queue.Empty:
+            return False
+
+    def wait_response(self, req_id, timeout=30, event_file=None):
+        end = NOW() + timeout
+        while NOW() < end:
+            item = self.next_event(min(0.2, end - NOW()))
+            if item is False:
+                if not self.alive():
+                    raise RuntimeError("executor exited before RPC response")
+                continue
+            if item is None:
+                raise RuntimeError("executor stdout closed before RPC response")
+            if self.lane["backend"] == "codex" and item.get("id") == req_id and ("result" in item or "error" in item):
+                return item.get("result") or item
+            if self.lane["backend"] == "pi" and item.get("id") == req_id and item.get("type") == "response":
+                if not item.get("success"):
+                    raise RuntimeError(f"pi RPC {item.get('command')} failed: {short(item.get('error'), 250)}")
+                return item
+            if event_file and item.get("method") and "id" in item:
+                if lane_approval_response(self, item, event_file):
+                    continue
+            self.backlog.append(item)
+        raise RuntimeError("executor RPC response timed out")
+
+    def close(self):
+        if self.alive():
+            kill_tree(self.proc.pid, grace=1)
+        try:
+            self.proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            pass
+        for stream in (self.proc.stdin, self.proc.stdout):
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+
+def lane_record_event(path, event):
+    with open(path, "a") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def lane_control_messages(server, lane, current, child, turn, pending):
+    """Handle currently queued local control-socket requests; return whether shutdown was requested."""
+    down = False
+    try:
+        ready, _, _ = select.select([server], [], [], 0)
+    except Exception:
+        ready = []
+    for _ in ready:
+        conn, _ = server.accept()
+        conn.settimeout(2)
+        try:
+            raw = bytearray()
+            while b"\n" not in raw and len(raw) < 8_000_000:
+                block = conn.recv(65536)
+                if not block:
+                    break
+                raw.extend(block)
+            req = json.loads(bytes(raw).split(b"\n", 1)[0].decode()) if raw else {}
+            op = req.get("op")
+            answer = {"ok": True}
+            if op == "ping":
+                answer["state"] = jload(lane_state_path(lane["name"]), {})
+            elif op == "assign":
+                state = jload(lane_state_path(lane["name"]), {}) or {}
+                if state.get("state") != "idle" or current.get("run_id"):
+                    answer = {"ok": False, "error": f"lane {lane['name']} is busy ({state.get('state')})"}
+                else:
+                    rid = req.get("run_id")
+                    if not rid or not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", rid):
+                        answer = {"ok": False, "error": "invalid run id"}
+                    else:
+                        rdir = os.path.join(RUNS, rid)
+                        os.makedirs(rdir, exist_ok=False)
+                        task = str(req.get("task") or "")
+                        with open(os.path.join(rdir, "task.md"), "w") as f:
+                            f.write(task)
+                        spec = {k: req.get(k) for k in ("title", "verify", "verify_baseline", "budget_minutes", "base")}
+                        spec.update({"run_id": rid, "task": task, "started": NOW()})
+                        current.update(spec)
+                        lane_write_state(lane["name"], state="busy", current_run=rid, last_error=None)
+                        set_status(rdir, id=rid, state="queued", title=spec.get("title") or task.strip().splitlines()[0][:72],
+                                   backend=lane["backend"], model=lane["model"], effort=lane.get("effort"), lane=lane["name"],
+                                   started=spec["started"], budget_minutes=spec.get("budget_minutes"),
+                                   cwd=lane["repo"], runner_pid=os.getpid())
+                        answer = {"ok": True, "id": rid, "state": "queued"}
+            elif op in ("steer", "abort", "down"):
+                active = bool(current.get("run_id"))
+                if op == "steer":
+                    if not active:
+                        answer = {"ok": False, "error": f"lane {lane['name']} is idle"}
+                    else:
+                        text = str(req.get("text") or "")
+                        if turn.get("id") and child and child.alive():
+                            if lane["backend"] == "codex":
+                                child.send({"jsonrpc": "2.0", "id": f"steer-{uuid.uuid4().hex}", "method": "turn/steer",
+                                            "params": {"threadId": turn["thread_id"], "expectedTurnId": turn["id"],
+                                                       "input": [{"type": "text", "text": text}]}})
+                            else:
+                                child.send({"id": f"steer-{uuid.uuid4().hex}", "type": "steer", "message": text})
+                        else:
+                            pending.append(("steer", text))
+                        answer["queued"] = True
+                elif op == "abort":
+                    if not active:
+                        answer = {"ok": False, "error": f"lane {lane['name']} is idle"}
+                    else:
+                        current["stop_requested"] = True
+                        current["abort_requested"] = True
+                        lane_abort_child(lane, child, turn)
+                        answer["aborting"] = True
+                else:
+                    current["down_requested"] = True
+                    current["stop_requested"] = active
+                    current["abort_requested"] = active
+                    down = not active
+                    if active:
+                        lane_abort_child(lane, child, turn)
+                    answer["stopping"] = True
+            else:
+                answer = {"ok": False, "error": "unknown lane control operation"}
+            conn.sendall((json.dumps(answer, ensure_ascii=False) + "\n").encode())
+        except Exception as e:
+            try:
+                conn.sendall((json.dumps({"ok": False, "error": short(e, 300)}) + "\n").encode())
+            except OSError:
+                pass
+        finally:
+            conn.close()
+    return down
+
+
+def lane_abort_child(lane, child, turn):
+    if not turn.get("id"):
+        turn["abort_pending"] = True
+        return
+    if turn.get("abort_sent"):
+        return
+    if not child or not child.alive():
+        return
+    try:
+        if lane["backend"] == "codex" and turn.get("thread_id") and turn.get("id"):
+            child.send({"jsonrpc": "2.0", "id": f"interrupt-{uuid.uuid4().hex}", "method": "turn/interrupt",
+                        "params": {"threadId": turn["thread_id"], "turnId": turn["id"]}})
+        elif lane["backend"] == "pi":
+            child.send({"id": f"abort-{uuid.uuid4().hex}", "type": "abort"})
+        else:
+            turn["abort_pending"] = True
+        turn["abort_sent"] = True
+    except (BrokenPipeError, OSError):
+        pass
+
+
+def lane_begin_turn(lane, child, prompt, worktree, event_file, turn):
+    if lane["backend"] == "codex":
+        req_id = "thread-" + uuid.uuid4().hex
+        child.send({"jsonrpc": "2.0", "id": req_id, "method": "thread/start",
+                    "params": {"cwd": worktree, "model": lane["model"], "approvalPolicy": "never",
+                               "sandbox": load_policy().get("codex", {}).get("sandbox", "workspace-write"),
+                               "ephemeral": True}})
+        reply = child.wait_response(req_id, 60, event_file)
+        if reply.get("error"):
+            raise RuntimeError(f"codex thread/start failed: {short(reply['error'], 300)}")
+        thread = reply.get("thread") or {}
+        turn["thread_id"] = thread.get("id")
+        if not turn["thread_id"]:
+            raise RuntimeError("codex thread/start response did not contain thread.id")
+        req_id = "turn-" + uuid.uuid4().hex
+        child.send({"jsonrpc": "2.0", "id": req_id, "method": "turn/start",
+                    "params": {"threadId": turn["thread_id"], "input": [{"type": "text", "text": prompt}],
+                               "effort": lane["effort"], "outputSchema": RESULT_SCHEMA}})
+        reply = child.wait_response(req_id, 60, event_file)
+        if reply.get("error"):
+            raise RuntimeError(f"codex turn/start failed: {short(reply['error'], 300)}")
+        turn["id"] = (reply.get("turn") or {}).get("id")
+    else:
+        sid = "new-" + uuid.uuid4().hex
+        child.send({"id": sid, "type": "new_session"})
+        child.wait_response(sid, 30, event_file)
+        pid = "prompt-" + uuid.uuid4().hex
+        child.send({"id": pid, "type": "prompt", "message": prompt})
+        turn["id"] = pid
+    if turn.get("abort_pending"):
+        lane_abort_child(lane, child, turn)
+
+
+def lane_approval_response(child, msg, event_file):
+    method = msg.get("method", "")
+    req_id = msg.get("id")
+    if method not in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval",
+                      "item/permissions/requestApproval", "execCommandApproval", "applyPatchApproval"):
+        return False
+    lane_record_event(event_file, {"type": "error", "error": f"declined unexpected approval request: {method}"})
+    result = {"decision": "decline"}
+    if method == "item/permissions/requestApproval":
+        result = {"permissions": {}}
+    if method in ("execCommandApproval", "applyPatchApproval"):
+        result = {"decision": "abort"}
+    child.send({"jsonrpc": "2.0", "id": req_id, "result": result})
+    return True
+
+
+def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending):
+    event_file = os.path.join(rdir, f"events.1.{lane['backend']}.jsonl")
+    open(event_file, "w").close()
+    deadline = spec["started"] + max(0, float(spec["budget_minutes"] or 0)) * 60
+    set_status(rdir, state="running", lane=lane["name"], backend=lane["backend"], model=lane["model"],
+               effort=lane.get("effort"), workspace=ws["path"], events=event_file, attempt=1, deadline=deadline,
+               executor_pid=child.proc.pid)
+    lane_record_event(event_file, {"type": "lane_start", "lane": lane["name"]})
+    lane_begin_turn(lane, child, prompt, ws["path"], event_file, turn)
+    while pending:
+        kind, value = pending.pop(0)
+        if kind == "steer":
+            if lane["backend"] == "codex":
+                child.send({"jsonrpc": "2.0", "id": f"steer-{uuid.uuid4().hex}", "method": "turn/steer",
+                            "params": {"threadId": turn["thread_id"], "expectedTurnId": turn["id"],
+                                       "input": [{"type": "text", "text": value}]}})
+            else:
+                child.send({"id": f"steer-{uuid.uuid4().hex}", "type": "steer", "message": value})
+    final, usage, errors = None, {}, []
+    ended = False
+    budget_hit = NOW() >= deadline
+    abort_deadline = None
+    if budget_hit:
+        lane_abort_child(lane, child, turn)
+        abort_deadline = NOW() + 30
+    elif spec.get("abort_requested"):
+        lane_abort_child(lane, child, turn)
+        abort_deadline = NOW() + 30
+    while not ended:
+        lane_control_messages(server, lane, spec, child, turn, pending)
+        now = NOW()
+        if not budget_hit and now >= deadline:
+            budget_hit = True
+            lane_abort_child(lane, child, turn)
+            abort_deadline = now + 30
+            set_status(rdir, budget_expired=now)
+        if spec.get("abort_requested") and not abort_deadline:
+            lane_abort_child(lane, child, turn)
+            abort_deadline = now + 30
+        if budget_hit and abort_deadline and now >= abort_deadline:
+            lane_record_event(event_file, {"type": "error", "error": "executor did not stop within 30s after interrupt"})
+            child.close()
+            return None, usage, "budget_exceeded", 124, event_file
+        if spec.get("abort_requested") and not budget_hit and abort_deadline and now >= abort_deadline:
+            lane_record_event(event_file, {"type": "error", "error": "executor did not stop within 30s after abort"})
+            child.close()
+            return None, usage, "stopped", 130, event_file
+        msg = child.next_event(0.15)
+        if msg is False:
+            if not child.alive():
+                return None, usage, "exec_error", 1, event_file
+            continue
+        if msg is None:
+            return None, usage, "exec_error", 1, event_file
+        if lane["backend"] == "codex":
+            if "method" in msg and "id" in msg:
+                if lane_approval_response(child, msg, event_file):
+                    continue
+            lane_record_event(event_file, msg)
+            method = msg.get("method")
+            params = msg.get("params") or {}
+            item = params.get("item") or {}
+            if method == "item/completed" and item.get("type") in ("agentMessage", "agent_message"):
+                text = item.get("text") or "".join(x.get("text", "") for x in item.get("content") or [] if isinstance(x, dict))
+                if text:
+                    final = extract_json(text) or final
+            if method == "turn/completed":
+                t = params.get("turn") or {}
+                usage = t.get("usage") or usage
+                ended = True
+            elif method == "turn/failed":
+                errors.append(short(params.get("error") or params, 400))
+                ended = True
+            elif method == "error":
+                errors.append(short(params.get("error") or params, 400))
+        else:
+            lane_record_event(event_file, msg)
+            if msg.get("type") == "message_end":
+                message = msg.get("message") or {}
+                if message.get("role") == "assistant":
+                    for k, v in (message.get("usage") or {}).items():
+                        if isinstance(v, (int, float)):
+                            usage[k] = usage.get(k, 0) + v
+                    text = "".join(b.get("text", "") for b in message.get("content") or []
+                                   if isinstance(b, dict) and b.get("type") == "text")
+                    final = extract_json(text) or final
+                    if message.get("errorMessage"):
+                        errors.append(short(message["errorMessage"], 400))
+            if msg.get("type") == "agent_end":
+                for message in msg.get("messages") or []:
+                    if message.get("role") == "assistant":
+                        text = "".join(b.get("text", "") for b in message.get("content") or []
+                                       if isinstance(b, dict) and b.get("type") == "text")
+                        final = extract_json(text) or final
+                ended = True
+        if not child.alive() and not ended:
+            return None, usage, "exec_error", 1, event_file
+    if spec.get("abort_requested"):
+        return final, usage, "stopped", 130, event_file
+    if budget_hit:
+        return final, usage, "budget_exceeded", 124, event_file
+    if errors:
+        return final, usage, "exec_error", 1, event_file
+    return final, usage, None if final is not None else "exec_error", 0 if final is not None else 1, event_file
+
+
+def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file):
+    rid, rdir = spec["run_id"], os.path.join(RUNS, spec["run_id"])
+    title = spec.get("title") or spec["task"].strip().splitlines()[0][:72]
+    stopped = bool(spec.get("stop_requested"))
+    budget_hit = error_class == "budget_exceeded"
+    attempts = [{"backend": lane["backend"], "model": lane["model"], "effort": lane.get("effort"), "rc": rc,
+                 "seconds": round(NOW() - spec["started"], 3), "error_class": error_class,
+                 "meta": {"usage": usage}, "events": event_file, "error_tail": None}]
+    set_status(rdir, state="finalizing")
+    changed = bool(git(["status", "--porcelain"], ws["root"])[1].strip())
+    fin = finalize_workspace(ws, title, lane["backend"], rdir, keep=True)
+    verify = None
+    if spec.get("verify") and (final is not None or changed):
+        set_status(rdir, state="verifying")
+        timeout = max(60, min(600, int(spec["started"] + max(0, float(spec.get("budget_minutes") or 0)) * 60 - NOW()) + 300))
+        verify = run_verify(spec["verify"], ws["path"], timeout)
+    if verify and verify["rc"] not in (0, 124) and spec.get("verify_baseline"):
+        base = verify_against_baseline(spec["verify"], ws, max(60, min(600, int(NOW() - spec["started"]) + 300)))
+        if base.get("rc") is not None:
+            base_fail = failing_tests(base.get("output", ""))
+            new_fail = sorted(set(verify["failing"]) - base_fail)
+            verify["baseline"] = {"rc": base["rc"], "failing": sorted(base_fail), "new_failures": new_fail}
+            if verify["failing"] and not new_fail:
+                verify["rc_raw"], verify["rc"] = verify["rc"], 0
+        else:
+            verify["baseline"] = {"error": base.get("error")}
+    if stopped:
+        status, verify_note = "stopped", None
+    elif budget_hit and not (verify and verify["rc"] == 0 and final is None):
+        status, verify_note = "budget_exceeded", None
+    elif budget_hit and verify and verify["rc"] == 0 and final is None:
+        status, verify_note = "partial", "executor hit the budget without a final report; host verify passed"
+    else:
+        status = (final or {}).get("status") or "failed"
+        status, verify_note = adjust_status_for_verify(status, verify)
+    if ws.get("mode") == "worktree":
+        detach_at = fin.get("commit") or ws["base"]
+        lane_git(["checkout", "--detach", detach_at], ws["root"])
+    out = {"id": rid, "status": status, "title": title, "lane": lane["name"], "verify": verify,
+           "verify_note": verify_note, "backend": lane["backend"], "model": lane["model"], "effort": lane.get("effort"),
+           "usage": usage, "seconds": attempts[0]["seconds"], "result": final, "workspace":
+           {k: v for k, v in ws.items() if k in ("mode", "path", "repo", "base", "note", "lane")},
+           **fin, "attempts": attempts, "run_dir": rdir}
+    jsave(os.path.join(rdir, "result.json"), out)
+    set_status(rdir, state="finished", status=status, finished=NOW(), commit=fin.get("commit"), lane=lane["name"])
+    append_ledger({"id": rid, "ts": NOW(), "title": title, "status": status, "lane": lane["name"],
+                   "backend": lane["backend"], "model": lane["model"], "effort": lane.get("effort"),
+                   "attempts": attempts, "error_class": error_class, "seconds": attempts[0]["seconds"],
+                   "usage": usage, "commit": fin.get("commit"),
+                   "files": len((final or {}).get("files_changed") or [])})
+    return out
+
+
+def lane_do_run(lane, spec, child, server, current):
+    rid, rdir = spec["run_id"], os.path.join(RUNS, spec["run_id"])
+    ws = None
+    turn, pending = {}, []
+    try:
+        ws = lane_prepare_workspace(lane, rid, spec.get("base"))
+        if spec.get("verify"):
+            rewritten = rewrite_verify_paths(spec["verify"], ws["repo"], ws["root"])
+            if rewritten != spec["verify"]:
+                spec["verify"] = rewritten
+                set_status(rdir, verify_note="verify paths rewritten from base repo to lane worktree")
+        task = spec["task"]
+        prompt = PROMPT_TMPL.format(wd=ws["path"], task=task)
+        if spec.get("verify"):
+            prompt += (f"\nAfter you finish, the planner runs this acceptance command on the host, outside your sandbox: "
+                       f"`{spec['verify']}`. If your sandbox blocks running it (ports, network, missing deps), say so in "
+                       "`tests` instead of treating it as a code failure.\n")
+        final, usage, error_class, rc, evp = lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending)
+        out = lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, evp)
+        return out
+    except Exception as e:
+        error_class = "exec_error"
+        evp = os.path.join(rdir, f"events.1.{lane['backend']}.jsonl")
+        if not os.path.exists(evp):
+            open(evp, "w").close()
+        lane_record_event(evp, {"type": "error", "error": short(e, 400)})
+        if ws is None:
+            # Preserve a visible failed run even if lane worktree preparation was rejected.
+            status = {"id": rid, "status": "failed", "title": spec.get("title"), "lane": lane["name"],
+                      "backend": lane["backend"], "model": lane["model"], "result": None,
+                      "attempts": [{"backend": lane["backend"], "model": lane["model"], "rc": 1,
+                                    "error_class": error_class, "error_tail": short(e, 500)}], "run_dir": rdir}
+            jsave(os.path.join(rdir, "result.json"), status)
+            set_status(rdir, state="finished", status="failed", finished=NOW(), error_class=error_class,
+                       last_error=short(e, 500))
+            append_ledger({"id": rid, "ts": NOW(), "title": spec.get("title"), "status": "failed",
+                           "lane": lane["name"], "backend": lane["backend"], "model": lane["model"],
+                           "error_class": error_class})
+            return status
+        return lane_finalize_run(lane, spec, ws, None, {}, error_class, 1, evp)
+
+
+def cmd_lane_serve(lane, policy):
+    name = lane["name"]
+    server = lane_ctl_listener(name)
+    current, child = {}, None
+    started, backoff, next_start = NOW(), 1, 0
+    lane_write_state(name, name=name, backend=lane["backend"], model=lane["model"], effort=lane.get("effort"),
+                     state="starting", supervisor_pid=os.getpid(), child_pid=None, current_run=None,
+                     started=started, last_error=None)
+    try:
+        wt = os.path.join(lane_root(name), "wt")
+        # Create the fixed worktree before launching a cwd-bound Pi child.
+        os.makedirs(lane_root(name), exist_ok=True)
+        if not os.path.exists(wt):
+            repo = os.path.realpath(lane["repo"])
+            rc, top, err = lane_git(["rev-parse", "--show-toplevel"], repo)
+            if rc:
+                raise RuntimeError(f"lane repo is not a git checkout: {err or repo}")
+            rc, base, err = lane_git(["rev-parse", "--verify", "HEAD^{commit}"], top)
+            if rc:
+                raise RuntimeError(f"lane repo has no commit: {err}")
+            rc, _, err = lane_git(["worktree", "add", "--detach", "-q", wt, base], top, timeout=300)
+            if rc:
+                raise RuntimeError(f"lane worktree creation failed: {err[:250]}")
+        child = LaneChild(lane, wt, policy)
+        lane_write_state(name, state="idle", child_pid=child.proc.pid, last_error=None)
+    except Exception as e:
+        lane_write_state(name, state="crashed", last_error=short(e, 500), child_pid=None)
+        next_start = NOW() + backoff
+    shutdown = False
+    while not shutdown:
+        if child and not child.alive():
+            if current.get("run_id"):
+                spec = current
+                lane_record_event(os.path.join(RUNS, spec["run_id"], f"events.1.{lane['backend']}.jsonl"),
+                                  {"type": "error", "error": "resident executor process exited"})
+                spec.pop("stop_requested", None)
+                lane_write_state(name, state="crashed", last_error="resident executor process exited", child_pid=None)
+                lane_finalize_run(lane, spec, lane_prepare_workspace(lane, spec["run_id"], spec.get("base")),
+                                  None, {}, "exec_error", 1,
+                                  os.path.join(RUNS, spec["run_id"], f"events.1.{lane['backend']}.jsonl"))
+                current.clear()
+            try:
+                child.close()
+            except Exception:
+                pass
+            child = None
+            lane_write_state(name, state="crashed", child_pid=None, current_run=None,
+                             last_error="resident executor process exited")
+            next_start = NOW() + backoff
+            backoff = min(backoff * 2, 60)
+        if child is None and NOW() >= next_start:
+            try:
+                wt = os.path.join(lane_root(name), "wt")
+                child = LaneChild(lane, wt, policy)
+                backoff = 1
+                lane_write_state(name, state="idle", child_pid=child.proc.pid, current_run=None, last_error=None)
+            except Exception as e:
+                lane_write_state(name, state="crashed", child_pid=None, last_error=short(e, 500))
+                next_start = NOW() + backoff
+                backoff = min(backoff * 2, 60)
+        pending = []
+        down = lane_control_messages(server, lane, current, child, {}, pending)
+        if down or current.get("down_requested"):
+            shutdown = True
+            continue
+        if current.get("run_id"):
+            spec = current
+            down_after = False
+            # Run against the existing child. A crash is finalized below, and then restart backoff applies.
+            try:
+                lane_do_run(lane, spec, child, server, current)
+            finally:
+                down_after = bool(spec.get("down_requested"))
+                current.clear()
+            if child and child.alive():
+                lane_write_state(name, state="idle", child_pid=child.proc.pid, current_run=None, last_error=None)
+            else:
+                lane_write_state(name, state="crashed", child_pid=None, current_run=None,
+                                 last_error="resident executor process exited")
+            if down_after:
+                shutdown = True
+            continue
+        if child:
+            lane_write_state(name, state="idle", child_pid=child.proc.pid, current_run=None)
+        timeout = max(0, min(0.5, next_start - NOW())) if child is None else 0.5
+        try:
+            ready, _, _ = select.select([server], [], [], timeout)
+        except Exception:
+            ready = []
+        if ready:
+            # Accept one request. This mirrors lane_control_messages while allowing a newly accepted
+            # assignment to be acknowledged before starting its resident turn.
+            down = lane_control_messages(server, lane, current, child, {}, [])
+            if down:
+                shutdown = True
+    if child:
+        child.close()
+    lane_write_state(name, state="idle", child_pid=None, supervisor_pid=None, current_run=None,
+                     stopped=NOW(), last_error=None)
+    server.close()
+    try:
+        os.unlink(lane_socket_path(name))
+    except OSError:
+        pass
+
+
+def cmd_lane_up(args, policy):
+    results = []
+    for lane in lanes_by_name(args.names):
+        name = lane["name"]
+        state = jload(lane_state_path(name), {}) or {}
+        if state.get("supervisor_pid") and pid_alive(state.get("supervisor_pid")):
+            ping = {"ok": False}
+            for _ in range(100):
+                state = jload(lane_state_path(name), {}) or {}
+                if state.get("state") in ("idle", "busy"):
+                    ping = lane_call(name, {"op": "ping"}, timeout=0.3)
+                    if ping.get("ok"):
+                        break
+                elif state.get("state") == "crashed":
+                    break
+                time.sleep(0.1)
+            if ping.get("ok"):
+                lane_state = ping.get("state") or {}
+                if lane_state.get("state") == "crashed":
+                    results.append({"name": name, "started": False, "ok": False,
+                                    "error": lane_state.get("last_error") or "lane child is crashed"})
+                else:
+                    results.append({"name": name, "started": False, "state": lane_state.get("state")})
+                continue
+            results.append({"name": name, "started": False,
+                            **({"ok": False, "error": state.get("last_error") or "lane child is crashed"}
+                               if state.get("state") == "crashed" else
+                               {"ok": False, "error": f"lane supervisor pid {state['supervisor_pid']} is alive but its control socket is not responding"})})
+            continue
+        os.makedirs(lane_root(name), exist_ok=True)
+        logfile = os.path.join(lane_root(name), "supervisor.log")
+        with open(logfile, "a") as out:
+            p = subprocess.Popen([sys.executable, os.path.realpath(__file__), "lane", "serve", name],
+                                 stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                 start_new_session=True, close_fds=True)
+        ready = False
+        startup_error = None
+        for _ in range(300):
+            if p.poll() is not None:
+                break
+            state = jload(lane_state_path(name), {}) or {}
+            if state.get("supervisor_pid") == p.pid and state.get("state") in ("idle", "busy"):
+                ping = lane_call(name, {"op": "ping"}, timeout=0.3)
+                if ping.get("ok"):
+                    ready = True
+                    break
+            elif state.get("supervisor_pid") == p.pid and state.get("state") == "crashed":
+                startup_error = state.get("last_error")
+                break
+            time.sleep(0.1)
+        if not ready:
+            results.append({"name": name, "started": False, "ok": False,
+                            "error": startup_error or short(open(logfile, errors="ignore").read()[-1000:], 500)
+                            or "supervisor did not start"})
+        else:
+            lane_state = ping.get("state") or {}
+            if lane_state.get("state") == "crashed":
+                results.append({"name": name, "started": True, "ok": False, "supervisor_pid": p.pid,
+                                "error": lane_state.get("last_error") or "lane child is crashed"})
+            else:
+                results.append({"name": name, "started": True, "supervisor_pid": p.pid,
+                                "state": lane_state.get("state")})
+    print(json.dumps({"lanes": results}, indent=2, ensure_ascii=False))
+    if any(x.get("ok") is False for x in results):
+        sys.exit(1)
+
+
+def cmd_lane_down(args):
+    results = []
+    for lane in lanes_by_name(args.names):
+        name = lane["name"]
+        state = jload(lane_state_path(name), {}) or {}
+        pid = state.get("supervisor_pid")
+        if not pid or not pid_alive(pid):
+            results.append({"name": name, "stopped": False, "state": "down"})
+            continue
+        response = lane_call(name, {"op": "down"}, timeout=10)
+        deadline = NOW() + 40
+        while pid_alive(pid) and NOW() < deadline:
+            time.sleep(0.1)
+        if pid_alive(pid):
+            kill_tree(pid, grace=1)
+        results.append({"name": name, "stopped": True, "clean": not pid_alive(pid), "response": response})
+    print(json.dumps({"lanes": results}, indent=2, ensure_ascii=False))
+
+
+def cmd_lane_status():
+    rows = []
+    for lane in lane_config():
+        state = jload(lane_state_path(lane["name"]), {}) or {}
+        pid = state.get("supervisor_pid")
+        lane_state = state.get("state", "down")
+        if not pid:
+            lane_state = "down"
+        elif not pid_alive(pid):
+            lane_state = "crashed"
+        rows.append({"name": lane["name"], "state": lane_state, "backend": lane["backend"],
+                     "model": lane["model"], "pid": state.get("child_pid"), "supervisor_pid": pid,
+                     "current_run": state.get("current_run"),
+                     "uptime_seconds": round(NOW() - state["started"], 1) if state.get("started") else None,
+                     "last_error": state.get("last_error")})
+    print(json.dumps(rows, indent=2, ensure_ascii=False))
+
+
+def cmd_lane_assign(args):
+    lane = lanes_by_name([args.name])[0]
+    task = args.prompt if args.prompt is not None else open(args.task_file).read()
+    if not task.strip():
+        print(json.dumps({"ok": False, "error": "empty task"}))
+        sys.exit(1)
+    rid = new_run_id()
+    title = args.title or task.strip().splitlines()[0][:72]
+    budget = args.budget_minutes if args.budget_minutes is not None else load_policy()["run"]["timeout_seconds"] / 60
+    if not math.isfinite(budget) or budget < 0:
+        print(json.dumps({"ok": False, "error": "budget-minutes must be non-negative"}))
+        sys.exit(1)
+    response = lane_call(lane["name"], {"op": "assign", "run_id": rid, "task": task, "title": title,
+                                         "verify": args.verify, "verify_baseline": args.verify_baseline,
+                                         "budget_minutes": budget, "base": args.base})
+    if response.get("ok"):
+        response.update({"lane": lane["name"], "watch": f"openswarm watch {rid}",
+                         "result": os.path.join(RUNS, rid, "result.json")})
+        print(json.dumps(response, indent=2, ensure_ascii=False))
+    else:
+        print(json.dumps(response, indent=2, ensure_ascii=False))
+        sys.exit(1)
+
+
+def cmd_lane_simple(args):
+    lane = lanes_by_name([args.name])[0]
+    if args.lane_cmd == "steer":
+        result = lane_call(lane["name"], {"op": "steer", "text": args.text})
+    else:
+        result = lane_call(lane["name"], {"op": "abort"})
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    if not result.get("ok"):
+        sys.exit(1)
+
+
+def cmd_lane_plist(args):
+    import plistlib
+    lane = lanes_by_name([args.name])[0]
+    name = lane["name"]
+    label = f"com.openswarm.lane.{name}"
+    log = os.path.join(lane_root(name), "supervisor.log")
+    obj = {"Label": label, "ProgramArguments": [sys.executable, os.path.realpath(__file__), "lane", "serve", name],
+           "RunAtLoad": True, "KeepAlive": True, "StandardOutPath": log, "StandardErrorPath": log}
+    obj["EnvironmentVariables"] = {"OPENSWARM_HOME": DATA}
+    lanes_file = envvar("LANES_FILE")
+    if lanes_file:
+        obj["EnvironmentVariables"]["OPENSWARM_LANES_FILE"] = lanes_file
+    plist = plistlib.dumps(obj, fmt=plistlib.FMT_XML).decode()
+    print(json.dumps({"name": name, "plist": plist}, indent=2, ensure_ascii=False))
+
+
 # ---------------------------------------------------------------- monitoring
 
 DEFAULT_RISKS = [
@@ -1585,6 +2511,25 @@ def short(s, n=220):
 
 def summarize_event(o):
     """Normalize codex / opencode events -> (kind, text). kind in msg|cmd|end|error|None."""
+    # Codex app-server sends JSON-RPC notifications; unwrap them into the same
+    # actionable classes used by the one-shot `codex exec --json` stream.
+    if o.get("method"):
+        t = o.get("method", "")
+        p = o.get("params") or {}
+        it = p.get("item") or {}
+        if t == "item/completed" and it.get("type") in ("agentMessage", "agent_message"):
+            text = it.get("text") or "".join(x.get("text", "") for x in it.get("content") or [] if isinstance(x, dict))
+            return "msg", text
+        if t == "item/agentMessage/delta":
+            return "msg", p.get("delta", "")
+        if t == "item/started" and it.get("type") in ("commandExecution", "command_execution"):
+            return "cmd", it.get("command", "")
+        if t == "turn/completed":
+            return "end", json.dumps((p.get("turn") or {}).get("usage") or {})
+        if t in ("turn/failed", "error"):
+            return "error", json.dumps(p.get("error") or p, ensure_ascii=False)
+        # Pi RPC events use `type`, not `method`; keep progress and tool calls visible.
+        return None, None
     t = o.get("type", "")
     it = o.get("item") or {}
     part = o.get("part") or {}
@@ -1604,6 +2549,17 @@ def summarize_event(o):
         if part.get("tool") == "bash":
             return "cmd", inp.get("command", "")
         return "tool", f"{part.get('tool')} {short(inp.get('filePath') or inp.get('path') or '', 120)}"
+    if t == "message_update":
+        delta = o.get("assistantMessageEvent") or {}
+        if delta.get("type") == "text_delta":
+            return "msg", delta.get("delta", "")
+    if t == "tool_execution_start":
+        args = o.get("args") or {}
+        return "cmd", args.get("command") or f"{o.get('toolName', 'tool')}"
+    if t == "agent_end":
+        return "end", ""
+    if t in ("extension_error", "auto_retry_end") and o.get("success") is False:
+        return "error", short(o.get("error") or o.get("finalError"), 400)
     return None, None
 
 
@@ -1719,11 +2675,15 @@ def run_digest(rid):
             if kind == "msg":
                 last = text
     end = st.get("finished") or now
-    return {"id": rid, "state": state, "status": st.get("status") or r.get("status"), "title": st.get("title"),
-            "backend": st.get("backend"), "model": st.get("model"), "effort": st.get("effort"),
-            "elapsed_min": round((end - st.get("started", end)) / 60, 1), "budget_min": st.get("budget_minutes"),
-            "cmds": cmds, "last_msg": short(last, 200), "commit": st.get("commit"),
-            "idle_min": round((now - os.path.getmtime(st["events"])) / 60, 1) if st.get("events") and os.path.exists(st["events"]) and state == "running" else None}
+    out = {"id": rid, "state": state, "status": st.get("status") or r.get("status"), "title": st.get("title"),
+           "backend": st.get("backend"), "model": st.get("model"), "effort": st.get("effort"),
+           "elapsed_min": round((end - st.get("started", end)) / 60, 1), "budget_min": st.get("budget_minutes"),
+           "cmds": cmds, "last_msg": short(last, 200), "commit": st.get("commit"),
+           "idle_min": round((now - os.path.getmtime(st["events"])) / 60, 1) if st.get("events") and os.path.exists(st["events"]) and state == "running" else None}
+    lane = st.get("lane") or r.get("lane")
+    if lane:
+        out["lane"] = lane
+    return out
 
 
 def cmd_runs(args, policy):
@@ -1745,7 +2705,8 @@ def cmd_runs(args, policy):
         flag = " ⚠ idle %sm" % r["idle_min"] if r["idle_min"] and r["idle_min"] > 10 else ""
         if r["state"] == "running" and r["budget_min"] and r["elapsed_min"] > r["budget_min"]:
             flag += " ⚠ over budget"
-        print(f"{r['id']}  {r['state']:<10} {r['status'] or '-':<15} {r['backend'] or '-'}/{r['model'] or '-'}"
+        lane = f" lane={r['lane']}" if r.get("lane") else ""
+        print(f"{r['id']}  {r['state']:<10} {r['status'] or '-':<15} {r['backend'] or '-'}/{r['model'] or '-'}{lane}"
               f"  {r['elapsed_min']}m/{r['budget_min']}m cmds={r['cmds']}{flag}\n    {r['title']}\n    last: {r['last_msg']}")
 
 
@@ -1777,14 +2738,16 @@ def cmd_report(args, policy):
             warn.append(f"idle {r['idle_min']}m")
         if r["budget_min"] and r["elapsed_min"] > r["budget_min"]:
             warn.append("over budget")
-        print(f"  {r['id']} {r['backend']}/{r['model']} {r['elapsed_min']}m/{r['budget_min']}m cmds={r['cmds']} "
+        print(f"  {r['id']} {r['backend']}/{r['model']}"
+              f"{' lane=' + r['lane'] if r.get('lane') else ''} {r['elapsed_min']}m/{r['budget_min']}m cmds={r['cmds']} "
               f"{'⚠ ' + ', '.join(warn) if warn else ''}\n    {r['title']} — {r['last_msg'][:140]}")
     tally = {}
     for r in recent:
         tally[r["status"]] = tally.get(r["status"], 0) + 1
     print(f"finished in last {args.since_minutes}m: {len(recent)} {tally if tally else ''}")
     for r in recent:
-        print(f"  {r['status']:<15} {r['backend']}/{r['model']} {r['elapsed_min']}m  {r['title']}"
+        print(f"  {r['status']:<15} {r['backend']}/{r['model']}"
+              f"{' lane=' + r['lane'] if r.get('lane') else ''} {r['elapsed_min']}m  {r['title']}"
               f"{'  commit ' + r['commit'][:10] if r.get('commit') else ''}")
     needs = [r for r in active if r["state"] == "dead" or (r["budget_min"] and r["elapsed_min"] > r["budget_min"])]
     needs += [r for r in recent if r["status"] not in ("done",)]
@@ -1794,6 +2757,13 @@ def cmd_report(args, policy):
 def cmd_stop(args, policy):
     rdir = f"{RUNS}/{args.run_id}"
     st = jload(f"{rdir}/status.json", {}) or {}
+    if st.get("lane"):
+        response = lane_call(st["lane"], {"op": "abort"})
+        print(json.dumps({"id": args.run_id, "lane": st["lane"],
+                          "signalled": ["abort"] if response.get("ok") else [],
+                          "response": response,
+                          "note": "lane supervisor remains running; it finalizes the stopped run"}, ensure_ascii=False))
+        return
     set_status(rdir, stop_requested=NOW())
     killed = []
     # Stop the executor first so the runner can still finalize (commit partial work, write result/ledger).
@@ -1942,6 +2912,33 @@ def main():
     sp = sub.add_parser("stop", help="terminate a running run")
     sp.add_argument("run_id")
 
+    sp = sub.add_parser("lane", help="manage resident executor lanes")
+    lane_sub = sp.add_subparsers(dest="lane_cmd", required=True)
+    lp = lane_sub.add_parser("up", help="start configured lane supervisors")
+    lp.add_argument("names", nargs="*", help="lane names; default starts all configured lanes")
+    lp = lane_sub.add_parser("down", help="stop lane turns, children, and supervisors")
+    lp.add_argument("names", nargs="*", help="lane names; default stops all configured lanes")
+    lane_sub.add_parser("status", help="show configured lane state")
+    lp = lane_sub.add_parser("assign", help="assign one task to an idle lane")
+    lp.add_argument("name")
+    task_group = lp.add_mutually_exclusive_group(required=True)
+    task_group.add_argument("--task-file")
+    task_group.add_argument("--prompt")
+    lp.add_argument("--title")
+    lp.add_argument("--verify")
+    lp.add_argument("--verify-baseline", action="store_true")
+    lp.add_argument("--budget-minutes", type=float)
+    lp.add_argument("--base")
+    lp = lane_sub.add_parser("steer", help="steer the active turn")
+    lp.add_argument("name")
+    lp.add_argument("--text", required=True)
+    lp = lane_sub.add_parser("abort", help="abort the active turn")
+    lp.add_argument("name")
+    lp = lane_sub.add_parser("launchd-plist", help="print an uninstalled LaunchAgent plist")
+    lp.add_argument("name")
+    lp = lane_sub.add_parser("serve", help=argparse.SUPPRESS)
+    lp.add_argument("name")
+
     sp = sub.add_parser("ingest-claude")
     sp.add_argument("--five-hour", type=float)
     sp.add_argument("--seven-day", type=float)
@@ -1973,6 +2970,26 @@ def main():
         cmd_report(a, policy)
     elif a.cmd == "stop":
         cmd_stop(a, policy)
+    elif a.cmd == "lane":
+        try:
+            if a.lane_cmd == "up":
+                cmd_lane_up(a, policy)
+            elif a.lane_cmd == "down":
+                cmd_lane_down(a)
+            elif a.lane_cmd == "status":
+                cmd_lane_status()
+            elif a.lane_cmd == "assign":
+                cmd_lane_assign(a)
+            elif a.lane_cmd in ("steer", "abort"):
+                cmd_lane_simple(a)
+            elif a.lane_cmd == "launchd-plist":
+                cmd_lane_plist(a)
+            elif a.lane_cmd == "serve":
+                lane = lanes_by_name([a.name])[0]
+                cmd_lane_serve(lane, policy)
+        except (ValueError, RuntimeError) as e:
+            print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False), file=sys.stderr)
+            sys.exit(2)
     elif a.cmd == "ingest-claude":
         ingest_claude(a)
     elif a.cmd == "ledger":

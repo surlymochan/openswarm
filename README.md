@@ -154,6 +154,36 @@ openswarm report --since-minutes 60  # one-screen digest for scheduled check-ins
 openswarm stop <id>                  # kill the executor; partial work is still committed to its branch
 ```
 
+## Resident lanes
+
+Use lanes when you want a persistent Codex app-server or Pi RPC process that accepts one task at a time and can be
+steered or aborted while working. Configure `$OPENSWARM_HOME/lanes.json`:
+
+```json
+{"lanes":[
+  {"name":"C1","backend":"codex","model":"gpt-6-luna","effort":"xhigh","repo":"/abs/repo"},
+  {"name":"M1","backend":"pi","provider":"minimax-cn","model":"MiniMax-M3.1-Flash","repo":"/abs/repo"}
+]}
+```
+
+Each lane keeps a fixed worktree under `$OPENSWARM_HOME/lanes/<name>/wt`. Start lanes and dispatch tasks with:
+
+```bash
+openswarm lane up C1 M1                  # no names starts every configured lane; safe to repeat
+openswarm lane status
+openswarm lane assign C1 --task-file /tmp/task.md --title "Parser fix" --verify 'pytest -q' --budget-minutes 30
+openswarm watch <run-id>
+openswarm lane steer C1 --text "Add a regression test before finishing"
+openswarm lane abort C1                  # openswarm stop <run-id> also aborts a lane turn
+openswarm lane down C1 M1
+openswarm lane launchd-plist C1           # prints a KeepAlive LaunchAgent plist; does not install it
+```
+
+Lane runs use the normal `runs/<id>` files, `openswarm/<id>` commit branch, host verification, ledger, `watch`,
+`runs`, and `report` paths. `--base REV` selects the commit used to reset a lane worktree for one assignment.
+An optional lane `binary` absolute path overrides the detected Codex/Pi executable, which is useful for wrappers and
+offline protocol testing. Approval prompts from Codex app-server receive a decline response.
+
 You can try routing with no backend installed:
 
 ```bash
@@ -203,13 +233,13 @@ Cursor CLI is a fourth executor, opt-in only (`--backend cursor`).
 
 | Path | What |
 | --- | --- |
-| `bin/openswarm` | The CLI: `probe`, `status`, `route`, `run`, `watch`, `runs`, `report`, `stop`, `ingest-claude`, `ledger` |
+| `bin/openswarm` | The CLI: `probe`, `status`, `route`, `run`, `lane`, `watch`, `runs`, `report`, `stop`, `ingest-claude`, `ledger` |
 | `SKILL.md` | Claude Code skill: the planner's operating manual |
 | `policy.json` | Defaults: thresholds, difficulty map, model caps, local data sources |
 | `backends/*.json` | One manifest per executor: invocation, quota source, data boundary |
 | `templates/openswarm-workflow.js` | Parallel fan-out template for Claude Code workflows |
 | `examples/demo-state.json` | Synthetic state for offline demos |
-| `~/.claude/openswarm/` (`$OPENSWARM_HOME`) | Runtime data: `state.json`, `ledger.jsonl`, `breakers.json`, `runs/<id>/` |
+| `~/.claude/openswarm/` (`$OPENSWARM_HOME`) | Runtime data: `state.json`, `ledger.jsonl`, `breakers.json`, `lanes.json`, `lanes/<name>/`, `runs/<id>/` |
 
 ## Configuration
 
