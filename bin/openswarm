@@ -855,6 +855,10 @@ RESULT_SCHEMA = {
     },
 }
 
+REPORT_INSTRUCTION = """When finished, your FINAL message must be ONLY a JSON object (no prose, no code fence) with keys:
+status ("done"|"partial"|"failed"), summary (string), files_changed (array of paths), tests (string), followups (array of strings).
+"""
+
 PROMPT_TMPL = """You are an execution agent dispatched by a planning agent. Complete the task below.
 
 Rules:
@@ -866,9 +870,7 @@ Rules:
 TASK:
 {task}
 
-When finished, your FINAL message must be ONLY a JSON object (no prose, no code fence) with keys:
-status ("done"|"partial"|"failed"), summary (string), files_changed (array of paths), tests (string), followups (array of strings).
-"""
+""" + REPORT_INSTRUCTION
 
 MODEL_UNAVAILABLE_RE = re.compile(r"(at capacity|try a different model|model is not supported|not supported when using|model .{0,40}not (found|available))", re.I)
 OPENCODE_ABORT_RE = re.compile(r"stream error.*(usage limit exceeded|insufficient balance|quota exceeded|rate.?limit)", re.I)
@@ -2264,9 +2266,11 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending):
                     ended = True
                 elif turn.get("steer_queue"):
                     correction = turn["steer_queue"].pop(0)
+                    # The follow-up prompt replaces the cancelled one, so it has to restate the report
+                    # requirement; otherwise the agent finishes the work without printing the JSON report.
                     lane_cursor_start_prompt(child, turn,
                                              "Correction to the interrupted task: apply this update while continuing the task.\n\n"
-                                             + correction)
+                                             + correction + "\n\n" + REPORT_INSTRUCTION)
                     if turn.get("steer_queue"):
                         lane_cursor_cancel(child, turn)
                 else:
@@ -2280,7 +2284,11 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending):
         return final, usage, "budget_exceeded", 124, event_file
     if errors:
         return final, usage, "exec_error", 1, event_file
-    return final, usage, None if final is not None else "exec_error", 0 if final is not None else 1, event_file
+    if final is None:
+        # The turn ended normally (cursor end_turn / codex turn completed / pi agent_end) but no JSON
+        # report was printed. The work may still be committed, so this is not an execution failure.
+        return final, usage, "no_report", 1, event_file
+    return final, usage, None, 0, event_file
 
 
 def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file):
@@ -2315,6 +2323,13 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file)
         status, verify_note = "budget_exceeded", None
     elif budget_hit and verify and verify["rc"] == 0 and final is None:
         status, verify_note = "partial", "executor hit the budget without a final report; host verify passed"
+    elif error_class == "no_report" and (fin.get("commit") or changed):
+        # The executor ended its turn without a final report but left a change behind: partial, not failed.
+        status = "partial"
+        status, _ = adjust_status_for_verify(status, verify)
+        verify_note = "executor ended without a final report"
+        if status == "done":
+            verify_note += "; host verify passed"
     else:
         status = (final or {}).get("status") or "failed"
         status, verify_note = adjust_status_for_verify(status, verify)

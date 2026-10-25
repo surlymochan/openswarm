@@ -229,11 +229,51 @@ class LaneTests(unittest.TestCase):
         correction = prompts[1]["params"]["prompt"][0]["text"]
         self.assertIn("Correction to the interrupted task", correction)
         self.assertIn("write steered instruction", correction)
+        # The follow-up prompt replaces the cancelled one, so it has to restate the report
+        # requirement; without it the agent ends the turn without printing the JSON report.
+        self.assertIn("your FINAL message must be ONLY a JSON object", correction)
+        self.assertLess(correction.index("write steered instruction"),
+                        correction.index("your FINAL message must be ONLY a JSON object"))
         self.assertTrue(any(entry.get("method") == "session/cancel" for entry in log))
         events = (self.data / "runs" / run_id / "events.1.cursor.jsonl").read_text()
         self.assertIn('"mode": "cancel-and-continue"', events)
         self.assertIn("write steered instruction",
                       (self.data / "lanes" / self.lane_name / "wt" / "lane_result.txt").read_text())
+
+    def test_cursor_turn_without_report_is_partial(self):
+        self.set_config("cursor")
+        self.start_lane()
+        run_id = self.assign("LANE_TEST_NO_REPORT make the change")
+        state = self.wait_run(run_id)
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual(state["status"], "partial")
+        self.assertEqual(result["status"], "partial")
+        self.assertIsNone(result["result"])
+        self.assertEqual(result["attempts"][0]["error_class"], "no_report")
+        self.assertIn("executor ended without a final report", result["verify_note"])
+        self.assertTrue(result["commit"])
+        self.assertIn("lane_result.txt", self.git("ls-tree", "--name-only", f"openswarm/{run_id}"))
+        ledger = [json.loads(line) for line in (self.data / "ledger.jsonl").read_text().splitlines()]
+        self.assertTrue(any(entry["id"] == run_id and entry["status"] == "partial" for entry in ledger))
+
+    def test_cursor_turn_without_report_honours_verify(self):
+        self.set_config("cursor")
+        self.start_lane()
+        run_id = self.assign("LANE_TEST_NO_REPORT make the change", "--verify", "true")
+        state = self.wait_run(run_id)
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual(state["status"], "done")
+        self.assertIn("executor ended without a final report", result["verify_note"])
+
+    def test_cursor_turn_without_report_or_change_is_failed(self):
+        self.set_config("cursor")
+        self.start_lane()
+        run_id = self.assign("LANE_TEST_NO_REPORT LANE_TEST_NO_CHANGE leave the tree alone")
+        state = self.wait_run(run_id)
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(result["status"], "failed")
+        self.assertIsNone(result["commit"])
 
     def test_cursor_abort_marks_run_stopped(self):
         self.set_config("cursor")

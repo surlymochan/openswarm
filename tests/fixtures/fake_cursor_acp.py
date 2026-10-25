@@ -6,6 +6,9 @@ import select
 import sys
 import time
 
+# The prompt asks for a JSON report with this wording; a prompt without it gets no report.
+REPORT_MARKER = "your FINAL message must be ONLY a JSON object"
+
 
 def send(message):
     sys.stdout.write(json.dumps(message) + "\n")
@@ -101,6 +104,10 @@ for line in sys.stdin:
         if "LANE_TEST_NO_CHANGE" not in prompt:
             with open(os.path.join(cwd, "lane_result.txt"), "w") as stream:
                 stream.write(prompt)
+        if "LANE_TEST_NO_REPORT" in prompt or REPORT_MARKER not in prompt:
+            # The live agent ends the turn without a JSON report when the prompt does not ask for one.
+            response(request, {"stopReason": "end_turn"})
+            continue
         result = {"status": "done", "summary": "fake Cursor ACP completed", "files_changed": ["lane_result.txt"],
                   "tests": "fake ACP executor", "followups": []}
         report = json.dumps(result)
