@@ -77,25 +77,31 @@ How to react:
 
 ## Resident lanes
 
-For long-lived Codex or Pi executors, configure `$OPENSWARM_HOME/lanes.json` with one entry per lane (`name`,
-`backend`, `model`, absolute `repo`, plus Codex `effort` or Pi `provider`). Start and monitor lanes like this:
+For long-lived Codex, Cursor Agent ACP, or Pi executors, configure `$OPENSWARM_HOME/lanes.json` with one entry per lane (`name`,
+`backend`, `model`, absolute `repo`, plus Codex `effort` or Pi `provider`). A Cursor lane runs `cursor-agent acp` over local stdio JSON-RPC; it does not use Cursor Cloud or HTTP. Cursor defaults to `composer-2.5`, and resolves `cursor-agent` from `PATH` then `~/.local/bin/cursor-agent`. Start and monitor lanes like this:
 
 ```bash
-$XS lane up C1 M1                         # omit names to start all configured lanes
+$XS lane up C1 K1 M1                      # omit names to start all configured lanes
 $XS lane status
 $XS lane assign C1 --task-file /tmp/task.md --title "..." --verify 'pytest -q' --budget-minutes 30
 $XS watch <run-id>
 $XS lane steer C1 --text "..."             # delivered to the active turn
 $XS lane abort C1                          # or $XS stop <run-id>
-$XS lane down C1 M1
+$XS lane down C1 K1 M1
 $XS lane launchd-plist C1                  # print only; install the plist yourself if wanted
+$XS lane systemd-unit K1                   # print a system unit only; install it yourself if wanted
 ```
 
 `lane assign` refuses a non-idle lane and immediately returns the normal run id. Review the run through `watch`,
 `runs`, `report`, and `runs/<id>/result.json` as usual. Each lane has a persistent `$OPENSWARM_HOME/lanes/<name>/wt`;
 assignments reset it to the requested `--base` (default: repo `HEAD`) and commit edits on `openswarm/<run-id>`.
-The next assignment reuses that worktree after detaching it. `lane down` aborts an active turn and stops its child
-and supervisor. The printed LaunchAgent plist uses `KeepAlive` and is not installed automatically.
+The next assignment reuses that worktree after detaching it. Cursor `lane steer` cancels the active ACP prompt,
+waits for its cancelled response, then sends the steer text as a correction in the same session. Cursor permission
+requests are answered with the offered `allow_always` option, or `allow_once` when that is unavailable. `lane down`
+aborts an active turn and stops its child and supervisor. The printed LaunchAgent plist uses `KeepAlive` and the
+systemd unit uses `Restart=always`, `MemoryMax=900M`, `CPUQuota=150%`, and `Nice=10`; neither is installed
+automatically. On small Linux lane hosts, omit `--verify` to keep verification load off the agent host; the planner
+can verify elsewhere.
 
 The user gets updates, not a stream. Relay progress in one line per meaningful event. Send a push notification only when the user needs to decide something, something really fails, or a phase finishes.
 

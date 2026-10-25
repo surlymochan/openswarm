@@ -9,7 +9,7 @@ Subcommands:
   status           human summary of state + recommended concurrency
   route            pick backend/model/effort for a task profile (JSON out)
   run              route + execute in an isolated git worktree, record ledger (JSON out)
-  lane             manage long-lived Codex app-server / Pi RPC executor lanes
+  lane             manage long-lived Codex app-server / Cursor ACP / Pi RPC executor lanes
   watch            stream actionable events (progress, risk, stalls) for one or more runs
   runs / report    snapshot of recent runs / compact scheduled check-in
   stop             terminate a run (partial work is still committed to its branch)
@@ -1612,13 +1612,15 @@ def lane_config():
         if name in names:
             raise ValueError(f"invalid lane config {where}: duplicate lane name {name!r}")
         names.add(name)
-        if backend not in ("codex", "pi"):
-            raise ValueError(f"invalid lane config {where}: backend must be codex or pi")
+        if backend not in ("codex", "cursor", "pi"):
+            raise ValueError(f"invalid lane config {where}: backend must be codex, cursor, or pi")
         repo = lane.get("repo")
         if not isinstance(repo, str) or not os.path.isabs(repo):
             raise ValueError(f"invalid lane config {where}: repo must be an absolute path")
         if not os.path.isdir(repo):
             raise ValueError(f"invalid lane config {where}: repo directory does not exist: {repo}")
+        if backend == "cursor" and lane.get("model") is None:
+            lane["model"] = "composer-2.5"
         if not isinstance(lane.get("model"), str) or not lane["model"].strip():
             raise ValueError(f"invalid lane config {where}: model is required")
         if backend == "codex" and (not isinstance(lane.get("effort"), str) or not lane["effort"].strip()):
@@ -1782,7 +1784,7 @@ class LaneChild:
             if not binary:
                 raise RuntimeError("codex binary not found; set lane binary or install Codex")
             cmd = [binary, "app-server"]
-        else:
+        elif backend == "pi":
             binary = envvar("PI_RPC_BIN") or lane.get("binary") or pi_bin()
             if not binary:
                 raise RuntimeError("pi binary not found; set lane binary or install Pi")
@@ -1790,6 +1792,11 @@ class LaneChild:
             if lane.get("provider"):
                 cmd += ["--provider", lane["provider"]]
             cmd += ["--model", lane["model"]]
+        else:
+            binary = envvar("CURSOR_BIN") or lane.get("binary") or cursor_bin()
+            if not binary:
+                raise RuntimeError("cursor-agent binary not found; set lane binary or install cursor-agent")
+            cmd = [binary, "acp"]
         self.proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.DEVNULL, text=True, bufsize=1, start_new_session=True)
         self.reader = threading.Thread(target=self._read, daemon=True)
@@ -1802,6 +1809,18 @@ class LaneChild:
                 if response.get("error"):
                     raise RuntimeError(f"codex app-server initialize failed: {short(response['error'], 300)}")
                 self.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+            except Exception:
+                self.close()
+                raise
+        elif backend == "cursor":
+            try:
+                self.send({"jsonrpc": "2.0", "id": "init", "method": "initialize",
+                           "params": {"protocolVersion": 1, "clientCapabilities": {},
+                                      "clientInfo": {"name": "openswarm", "title": "openswarm", "version": "1"}}})
+                response = self.wait_response("init", 30)
+                if response.get("error"):
+                    raise RuntimeError(f"cursor-agent ACP initialize failed: {short(response['error'], 300)}")
+                self.initialize = response.get("result") or {}
             except Exception:
                 self.close()
                 raise
@@ -1846,12 +1865,16 @@ class LaneChild:
                     raise RuntimeError("executor stdout closed before RPC response")
                 if self.lane["backend"] == "codex" and item.get("id") == req_id and ("result" in item or "error" in item):
                     return item.get("result") or item
+                if self.lane["backend"] == "cursor" and item.get("id") == req_id and ("result" in item or "error" in item):
+                    return item
                 if self.lane["backend"] == "pi" and item.get("id") == req_id and item.get("type") == "response":
                     if not item.get("success"):
                         raise RuntimeError(f"pi RPC {item.get('command')} failed: {short(item.get('error'), 250)}")
                     return item
                 if event_file and item.get("method") and "id" in item:
                     if lane_approval_response(self, item, event_file):
+                        continue
+                    if self.lane["backend"] == "cursor" and lane_acp_request(self, item, event_file):
                         continue
                 deferred.append(item)
             raise RuntimeError("executor RPC response timed out")
@@ -1915,12 +1938,14 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                             f.write(task)
                         spec = {k: req.get(k) for k in ("title", "verify", "verify_baseline", "budget_minutes", "base")}
                         spec.update({"run_id": rid, "task": task, "started": NOW()})
+                        spec["_event_file"] = os.path.join(rdir, f"events.1.{lane['backend']}.jsonl")
+                        open(spec["_event_file"], "w").close()
                         current.update(spec)
                         lane_write_state(lane["name"], state="busy", current_run=rid, last_error=None)
                         set_status(rdir, id=rid, state="queued", title=spec.get("title") or task.strip().splitlines()[0][:72],
                                    backend=lane["backend"], model=lane["model"], effort=lane.get("effort"), lane=lane["name"],
                                    started=spec["started"], budget_minutes=spec.get("budget_minutes"),
-                                   cwd=lane["repo"], runner_pid=os.getpid())
+                                   cwd=lane["repo"], runner_pid=os.getpid(), events=spec["_event_file"])
                         answer = {"ok": True, "id": rid, "state": "queued"}
             elif op in ("steer", "abort", "down"):
                 active = bool(current.get("run_id"))
@@ -1929,7 +1954,13 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                         answer = {"ok": False, "error": f"lane {lane['name']} is idle"}
                     else:
                         text = str(req.get("text") or "")
-                        if turn.get("id") and child and child.alive():
+                        if lane["backend"] == "cursor":
+                            event_file = current.get("_event_file") or os.path.join(
+                                RUNS, current.get("run_id", ""), f"events.1.{lane['backend']}.jsonl")
+                            lane_record_event(event_file, {"type": "steer", "mode": "cancel-and-continue", "text": text})
+                            turn.setdefault("steer_queue", []).append(text)
+                            lane_cursor_cancel(child, turn)
+                        elif turn.get("id") and child and child.alive():
                             if lane["backend"] == "codex":
                                 child.send({"jsonrpc": "2.0", "id": f"steer-{uuid.uuid4().hex}", "method": "turn/steer",
                                             "params": {"threadId": turn["thread_id"], "expectedTurnId": turn["id"],
@@ -1982,6 +2013,10 @@ def lane_abort_child(lane, child, turn):
                         "params": {"threadId": turn["thread_id"], "turnId": turn["id"]}})
         elif lane["backend"] == "pi":
             child.send({"id": f"abort-{uuid.uuid4().hex}", "type": "abort"})
+        elif lane["backend"] == "cursor" and turn.get("session_id") and turn.get("cursor_prompt_id"):
+            child.send({"jsonrpc": "2.0", "method": "session/cancel",
+                        "params": {"sessionId": turn["session_id"]}})
+            turn["cursor_cancel_sent"] = True
         else:
             turn["abort_pending"] = True
         turn["abort_sent"] = True
@@ -2011,15 +2046,88 @@ def lane_begin_turn(lane, child, prompt, worktree, event_file, turn):
         if reply.get("error"):
             raise RuntimeError(f"codex turn/start failed: {short(reply['error'], 300)}")
         turn["id"] = (reply.get("turn") or {}).get("id")
-    else:
+    elif lane["backend"] == "pi":
         sid = "new-" + uuid.uuid4().hex
         child.send({"id": sid, "type": "new_session"})
         child.wait_response(sid, 30, event_file)
         pid = "prompt-" + uuid.uuid4().hex
         child.send({"id": pid, "type": "prompt", "message": prompt})
         turn["id"] = pid
+    else:
+        sid = "session-" + uuid.uuid4().hex
+        child.send({"jsonrpc": "2.0", "id": sid, "method": "session/new",
+                    "params": {"cwd": worktree, "mcpServers": []}})
+        reply = child.wait_response(sid, 60, event_file)
+        if reply.get("error"):
+            raise RuntimeError(f"cursor-agent ACP session/new failed: {short(reply['error'], 300)}")
+        result = reply.get("result") or {}
+        turn["session_id"] = result.get("sessionId")
+        if not turn["session_id"]:
+            raise RuntimeError("cursor-agent ACP session/new response did not contain sessionId")
+        options = result.get("configOptions") or []
+        selects = [option for option in options if isinstance(option, dict) and option.get("type") == "select"]
+        matching = [option for option in selects if lane["model"] in lane_cursor_option_values(option)]
+        if not matching:
+            model_options = [option for option in selects if option.get("category") == "model"] or selects
+            available = sorted({value for option in model_options for value in lane_cursor_option_values(option)})
+            raise RuntimeError(f"cursor-agent ACP model {lane['model']!r} is unavailable; available values: "
+                               f"{', '.join(available) if available else '(none reported)'}")
+        option = matching[0]
+        req_id = "model-" + uuid.uuid4().hex
+        child.send({"jsonrpc": "2.0", "id": req_id, "method": "session/set_config_option",
+                    "params": {"sessionId": turn["session_id"], "configId": option.get("id"),
+                               "value": lane["model"]}})
+        selected = child.wait_response(req_id, 60, event_file)
+        if selected.get("error"):
+            raise RuntimeError(f"cursor-agent ACP model selection failed: {short(selected['error'], 300)}")
+        lane_cursor_start_prompt(child, turn, prompt)
     if turn.get("abort_pending"):
         lane_abort_child(lane, child, turn)
+
+
+def lane_cursor_option_values(option):
+    values = []
+    for item in option.get("options") or []:
+        if not isinstance(item, dict):
+            continue
+        if isinstance(item.get("value"), str):
+            values.append(item["value"])
+        elif isinstance(item.get("options"), list):
+            values.extend(lane_cursor_option_values(item))
+    return values
+
+
+def lane_cursor_start_prompt(child, turn, prompt):
+    req_id = "prompt-" + uuid.uuid4().hex
+    turn["id"] = req_id
+    turn["cursor_prompt_id"] = req_id
+    turn["cursor_cancel_sent"] = False
+    turn["cursor_text"] = []
+    child.send({"jsonrpc": "2.0", "id": req_id, "method": "session/prompt",
+                "params": {"sessionId": turn["session_id"], "prompt": [{"type": "text", "text": prompt}]}})
+
+
+def lane_cursor_cancel(child, turn):
+    if turn.get("session_id") and turn.get("cursor_prompt_id") and not turn.get("cursor_cancel_sent"):
+        child.send({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": turn["session_id"]}})
+        turn["cursor_cancel_sent"] = True
+
+
+def lane_acp_request(child, msg, event_file):
+    if msg.get("method") != "session/request_permission":
+        return False
+    params = msg.get("params") or {}
+    options = params.get("options") or []
+    selected = next((option for kind in ("allow_always", "allow_once") for option in options
+                     if isinstance(option, dict) and option.get("kind") == kind), None)
+    tool_call = params.get("toolCall") or {}
+    title = tool_call.get("title")
+    lane_record_event(event_file, {"type": "permission_request", "title": title,
+                                   "tool_call_id": tool_call.get("toolCallId"), "kind": tool_call.get("kind"),
+                                   "selected": selected.get("kind") if selected else None})
+    outcome = {"outcome": "selected", "optionId": selected.get("optionId")} if selected else {"outcome": "cancelled"}
+    child.send({"jsonrpc": "2.0", "id": msg.get("id"), "result": {"outcome": outcome}})
+    return True
 
 
 def lane_approval_response(child, msg, event_file):
@@ -2039,8 +2147,9 @@ def lane_approval_response(child, msg, event_file):
 
 
 def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending):
-    event_file = os.path.join(rdir, f"events.1.{lane['backend']}.jsonl")
-    open(event_file, "w").close()
+    event_file = spec.get("_event_file") or os.path.join(rdir, f"events.1.{lane['backend']}.jsonl")
+    if not os.path.exists(event_file):
+        open(event_file, "w").close()
     deadline = spec["started"] + max(0, float(spec["budget_minutes"] or 0)) * 60
     set_status(rdir, state="running", lane=lane["name"], backend=lane["backend"], model=lane["model"],
                effort=lane.get("effort"), workspace=ws["path"], events=event_file, attempt=1, deadline=deadline,
@@ -2054,8 +2163,11 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending):
                 child.send({"jsonrpc": "2.0", "id": f"steer-{uuid.uuid4().hex}", "method": "turn/steer",
                             "params": {"threadId": turn["thread_id"], "expectedTurnId": turn["id"],
                                        "input": [{"type": "text", "text": value}]}})
-            else:
+            elif lane["backend"] == "pi":
                 child.send({"id": f"steer-{uuid.uuid4().hex}", "type": "steer", "message": value})
+            else:
+                turn.setdefault("steer_queue", []).append(value)
+                lane_cursor_cancel(child, turn)
     final, usage, errors = None, {}, []
     ended = False
     budget_hit = NOW() >= deadline
@@ -2113,7 +2225,7 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending):
                 ended = True
             elif method == "error":
                 errors.append(short(params.get("error") or params, 400))
-        else:
+        elif lane["backend"] == "pi":
             lane_record_event(event_file, msg)
             if msg.get("type") == "message_end":
                 message = msg.get("message") or {}
@@ -2133,6 +2245,33 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending):
                                        if isinstance(b, dict) and b.get("type") == "text")
                         final = extract_json(text) or final
                 ended = True
+        else:
+            if msg.get("method") and "id" in msg and lane_acp_request(child, msg, event_file):
+                continue
+            lane_record_event(event_file, msg)
+            if msg.get("method") == "session/update":
+                update = (msg.get("params") or {}).get("update") or {}
+                if update.get("sessionUpdate") == "agent_message_chunk":
+                    content = update.get("content") or {}
+                    if content.get("type") == "text":
+                        turn.setdefault("cursor_text", []).append(content.get("text") or "")
+            elif msg.get("id") == turn.get("cursor_prompt_id") and ("result" in msg or "error" in msg):
+                if msg.get("error"):
+                    error = msg.get("error") or {}
+                    if error.get("code") != -32800:
+                        errors.append(short(error, 400))
+                if spec.get("abort_requested") or budget_hit:
+                    ended = True
+                elif turn.get("steer_queue"):
+                    correction = turn["steer_queue"].pop(0)
+                    lane_cursor_start_prompt(child, turn,
+                                             "Correction to the interrupted task: apply this update while continuing the task.\n\n"
+                                             + correction)
+                    if turn.get("steer_queue"):
+                        lane_cursor_cancel(child, turn)
+                else:
+                    final = extract_json("".join(turn.get("cursor_text") or [])) or final
+                    ended = True
         if not child.alive() and not ended:
             return None, usage, "exec_error", 1, event_file
     if spec.get("abort_requested"):
@@ -2503,6 +2642,30 @@ def cmd_lane_plist(args):
     print(json.dumps({"name": name, "plist": plist}, indent=2, ensure_ascii=False))
 
 
+def systemd_quote(value):
+    return '"' + str(value).replace("%", "%%").replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def cmd_lane_systemd(args):
+    import pwd
+    lane = lanes_by_name([args.name])[0]
+    user = pwd.getpwuid(os.getuid()).pw_name
+    home = os.path.expanduser("~")
+    path = os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+    local_bin = os.path.join(home, ".local", "bin")
+    path = os.pathsep.join(dict.fromkeys([*path.split(os.pathsep), local_bin]))
+    command = [sys.executable, os.path.realpath(__file__), "lane", "serve", lane["name"]]
+    lines = ["[Unit]", f"Description=openswarm lane {lane['name']}", "After=network.target", "",
+             "[Service]", "Type=simple", f"User={user}", f"ExecStart={' '.join(systemd_quote(x) for x in command)}",
+             f"Environment={systemd_quote('OPENSWARM_HOME=' + DATA)}", f"Environment={systemd_quote('PATH=' + path)}",
+             "Restart=always", "MemoryMax=900M", "CPUQuota=150%", "Nice=10"]
+    lanes_file = envvar("LANES_FILE")
+    if lanes_file:
+        lines.append(f"Environment={systemd_quote('OPENSWARM_LANES_FILE=' + lanes_file)}")
+    lines.extend(["", "[Install]", "WantedBy=multi-user.target", ""])
+    print("\n".join(lines))
+
+
 # ---------------------------------------------------------------- monitoring
 
 DEFAULT_RISKS = [
@@ -2543,6 +2706,21 @@ def summarize_event(o):
         t = o.get("method", "")
         p = o.get("params") or {}
         it = p.get("item") or {}
+        if t == "session/update":
+            update = p.get("update") or {}
+            kind = update.get("sessionUpdate")
+            if kind == "agent_message_chunk":
+                content = update.get("content") or {}
+                return ("msg", content.get("text", "")) if content.get("type") == "text" else (None, None)
+            if kind in ("tool_call", "tool_call_update"):
+                title = update.get("title") or update.get("name") or "tool"
+                status = update.get("status")
+                return "cmd", f"{title}{' [' + status + ']' if status else ''}"
+            if kind == "plan":
+                entries = update.get("entries") or []
+                return "msg", "Plan: " + "; ".join(str(x.get("content", "")) for x in entries if isinstance(x, dict))
+        if t == "session/request_permission":
+            return "msg", "Permission request: " + str((p.get("toolCall") or {}).get("title") or "tool access")
         if t == "item/completed" and it.get("type") in ("agentMessage", "agent_message"):
             text = it.get("text") or "".join(x.get("text", "") for x in it.get("content") or [] if isinstance(x, dict))
             return "msg", text
@@ -2557,6 +2735,10 @@ def summarize_event(o):
         # Pi RPC events use `type`, not `method`; keep progress and tool calls visible.
         return None, None
     t = o.get("type", "")
+    if t == "steer":
+        return "msg", f"Steer ({o.get('mode', 'queued')}): {o.get('text', '')}"
+    if t == "permission_request":
+        return "msg", f"Permission granted ({o.get('selected') or 'cancelled'}): {o.get('title') or 'tool access'}"
     it = o.get("item") or {}
     part = o.get("part") or {}
     if t == "item.completed" and it.get("type") == "agent_message":
@@ -2641,6 +2823,8 @@ def cmd_watch(args, policy):
             elif kind == "cmd":
                 cmds += 1
                 last_cmd = text
+                if st.get("backend") == "cursor":
+                    out("CMD", short(text, 400))
                 for rx, name in risks:
                     if rx.search(text) and (name, text[:80]) not in seen:
                         seen.add((name, text[:80]))
@@ -2962,6 +3146,8 @@ def main():
     lp.add_argument("name")
     lp = lane_sub.add_parser("launchd-plist", help="print an uninstalled LaunchAgent plist")
     lp.add_argument("name")
+    lp = lane_sub.add_parser("systemd-unit", help="print an uninstalled system systemd unit")
+    lp.add_argument("name")
     lp = lane_sub.add_parser("serve", help=argparse.SUPPRESS)
     lp.add_argument("name")
 
@@ -3010,6 +3196,8 @@ def main():
                 cmd_lane_simple(a)
             elif a.lane_cmd == "launchd-plist":
                 cmd_lane_plist(a)
+            elif a.lane_cmd == "systemd-unit":
+                cmd_lane_systemd(a)
             elif a.lane_cmd == "serve":
                 lane = lanes_by_name([a.name])[0]
                 cmd_lane_serve(lane, policy)

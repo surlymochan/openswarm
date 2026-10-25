@@ -156,12 +156,13 @@ openswarm stop <id>                  # kill the executor; partial work is still 
 
 ## Resident lanes
 
-Use lanes when you want a persistent Codex app-server or Pi RPC process that accepts one task at a time and can be
-steered or aborted while working. Configure `$OPENSWARM_HOME/lanes.json`:
+Use lanes when you want a persistent Codex app-server, Cursor Agent ACP, or Pi RPC process that accepts one task at a time and can be
+steered or aborted while working. Cursor lanes run the local `cursor-agent acp` JSON-RPC process over stdio; they do not use Cursor Cloud or HTTP. Configure `$OPENSWARM_HOME/lanes.json`:
 
 ```json
 {"lanes":[
   {"name":"C1","backend":"codex","model":"gpt-6-luna","effort":"xhigh","repo":"/abs/repo"},
+  {"name":"K1","backend":"cursor","model":"composer-2.5","repo":"/abs/repo"},
   {"name":"M1","backend":"pi","provider":"minimax-cn","model":"MiniMax-M3.1-Flash","repo":"/abs/repo"}
 ]}
 ```
@@ -169,20 +170,28 @@ steered or aborted while working. Configure `$OPENSWARM_HOME/lanes.json`:
 Each lane keeps a fixed worktree under `$OPENSWARM_HOME/lanes/<name>/wt`. Start lanes and dispatch tasks with:
 
 ```bash
-openswarm lane up C1 M1                  # no names starts every configured lane; safe to repeat
+openswarm lane up C1 K1 M1               # no names starts every configured lane; safe to repeat
 openswarm lane status
 openswarm lane assign C1 --task-file /tmp/task.md --title "Parser fix" --verify 'pytest -q' --budget-minutes 30
 openswarm watch <run-id>
 openswarm lane steer C1 --text "Add a regression test before finishing"
 openswarm lane abort C1                  # openswarm stop <run-id> also aborts a lane turn
-openswarm lane down C1 M1
+openswarm lane down C1 K1 M1
 openswarm lane launchd-plist C1           # prints a KeepAlive LaunchAgent plist; does not install it
+openswarm lane systemd-unit K1             # prints a system systemd unit; does not install it
 ```
 
 Lane runs use the normal `runs/<id>` files, `openswarm/<id>` commit branch, host verification, ledger, `watch`,
 `runs`, and `report` paths. `--base REV` selects the commit used to reset a lane worktree for one assignment.
-An optional lane `binary` absolute path overrides the detected Codex/Pi executable, which is useful for wrappers and
-offline protocol testing. Approval prompts from Codex app-server receive a decline response.
+An optional lane `binary` absolute path overrides the detected executable, which is useful for wrappers and offline
+protocol testing. Cursor defaults to model `composer-2.5`; its binary is `cursor-agent` on `PATH`, then
+`~/.local/bin/cursor-agent`. Codex app-server approval prompts receive a decline response. Cursor permission requests
+receive the offered `allow_always` choice, falling back to `allow_once`. Cursor `lane steer` cancels the active prompt,
+waits for its response, then continues in the same ACP session with the steer text as a correction.
+
+On small Linux lane hosts, omit `--verify` so test suites and their dependencies do not compete with the agent for
+memory and CPU. The planner can run acceptance checks on its host. `lane systemd-unit` prints a system service with
+`MemoryMax=900M`, `CPUQuota=150%`, and `Nice=10`; review and install it separately if needed.
 
 You can try routing with no backend installed:
 

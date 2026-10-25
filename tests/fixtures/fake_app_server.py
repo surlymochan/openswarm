@@ -28,16 +28,19 @@ for line in sys.stdin:
     method = req.get("method")
     params = req.get("params") or {}
     if method == "initialize":
+        send({"jsonrpc": "2.0", "method": "fixture/unrelated", "params": {"before": method}})
         response(req, {"serverInfo": {"name": "fake-app-server", "version": "1"}})
     elif method == "initialized":
         continue
     elif method == "thread/start":
         cwd = params.get("cwd", cwd)
+        send({"jsonrpc": "2.0", "method": "fixture/unrelated", "params": {"before": method}})
         response(req, {"thread": {"id": thread_id}, "model": params.get("model")})
     elif method == "turn/start":
         prompt = (params.get("input") or [{}])[0].get("text", "")
         if "LANE_TEST_CRASH" in prompt:
             os._exit(17)
+        send({"jsonrpc": "2.0", "method": "fixture/unrelated", "params": {"before": method}})
         response(req, {"turn": {"id": turn_id, "status": "inProgress"}})
         send({"jsonrpc": "2.0", "method": "item/started", "params": {
             "threadId": thread_id, "turnId": turn_id,
