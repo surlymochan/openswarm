@@ -1,12 +1,12 @@
 ---
 name: openswarm
-description: Claude plans, Codex / OpenCode Go / DeepSeek execute. Use when work involves writing or changing code across files, batch refactors, migrations, test writing, or the user says "let Codex do it", "dispatch", "swarm", "openswarm", or wants to save Claude quota. Auto-discovers the latest GPT / OpenCode Go / DeepSeek models and reasoning efforts, reads live quotas and plan tiers on every side, routes each task to the most economical capable model, runs it in an isolated git worktree with a hard time budget, streams progress/risk/stall alerts, and reports on a schedule instead of running forever. Integrates with dynamic Workflow scripts and agent teams.
+description: Claude plans, executors write the code — Codex, Pi (e.g. MiniMax), Cursor Agent, OpenCode Go, DeepSeek. Use when work involves writing or changing code across files, batch refactors, migrations, test writing, or the user says "let Codex do it", "dispatch", "swarm", "openswarm", "lane", or wants to save Claude quota. One-shot runs or resident lanes (Codex app-server, Pi RPC, Cursor ACP) that take tasks one at a time and can be steered or aborted mid-turn; lanes and runs can live on other hosts reached over SSH. Reads live quotas, routes each task to the most economical capable model, runs it in an isolated git worktree with a hard time budget, verifies on the host, streams progress/risk/stall alerts, and reports on a schedule instead of running forever.
 ---
 
 # openswarm
 
 **Division of labour:** Claude decomposes work, writes acceptance criteria, reviews, and integrates.
-Executors write code: **Codex** (main), **OpenCode Go** (cheap/mechanical, non-GPT second opinions, overflow, >272k context), and **DeepSeek** (metered last resort).
+Executors write code: **Codex** (main), **OpenCode Go** (cheap/mechanical, non-GPT second opinions, overflow, >272k context), and **DeepSeek** (metered last resort). **Pi** (any provider it is configured for, such as MiniMax) and **Cursor Agent** are opt-in, as one-shot backends or resident lanes.
 Claude Pro is the tightest quota here, so keep Claude's own tokens for planning and review and send the typing to executors.
 
 CLI: `~/.claude/skills/openswarm/bin/openswarm` (alias it as `XS` in your commands). Runtime data lives in `~/.claude/openswarm/`.
@@ -102,6 +102,19 @@ aborts an active turn and stops its child and supervisor. The printed LaunchAgen
 systemd unit uses `Restart=always`, `MemoryMax=900M`, `CPUQuota=150%`, and `Nice=10`; neither is installed
 automatically. On small Linux lane hosts, omit `--verify` to keep verification load off the agent host; the planner
 can verify elsewhere.
+
+Cursor ACP lists model values with their parameters (for example `composer-2.5[fast=true]`). Set `model` to a value
+exactly as `cursor-agent acp` lists it; a bare name that is not in the list fails the assignment with the list.
+
+### Executor hosts over SSH
+
+Lanes and runs do not have to be on the planner's machine. Install openswarm on the executor host, keep a clone of the
+repo there, and drive it with `ssh <host> openswarm ...` (`lane assign`, `run --detach`, `watch`, `runs`, `stop`).
+Point Monitor at `ssh <host> openswarm watch <id>`. Move code with git, not files: push the base to the host's
+repo (or a bare mirror) before assigning, then fetch `openswarm/<id>` back, review, and commit on the planner side.
+Executor commits use `--no-verify`, so re-commit on the planner side where the repository's hooks run.
+For hosts that pause when idle (cloud sandboxes), send a large batch at once and let them pause after it; do not
+trickle single tasks to them.
 
 The user gets updates, not a stream. Relay progress in one line per meaningful event. Send a push notification only when the user needs to decide something, something really fails, or a phase finishes.
 
