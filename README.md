@@ -117,6 +117,7 @@ Routing decisions use live quota data, not guesses.
   - `SKILL.md` teaches Claude Code the whole loop.
   - `templates/openswarm-workflow.js` fans tasks out in parallel.
   - `openswarm report` gives scheduled check-ins.
+- **GitHub issue bus.** Routes tasks to uncontrolled external executors through a dedicated repository, while controlled hosts continue to use SSH fleet lanes.
 - **Zero dependencies.** One Python file using only the standard library.
 
 ## Quickstart
@@ -282,6 +283,31 @@ OPENSWARM_HOME=$(mktemp -d) OPENSWARM_STATE_FILE=examples/demo-state.json bin/op
 
 In Claude Code, just say things like *"dispatch this to Codex"*, *"swarm these five refactors"*, or *"use
 openswarm"*. The skill takes it from there.
+
+## GitHub issue bus
+
+Use the issue bus for executors you do not control, such as a cloud agent, another person's agent, or an unmanaged host. For hosts you control, use [SSH fleet lanes](#fleet-and-batch-dispatch).
+
+Initialize a dedicated bus repository and set its allowlist in `$OPENSWARM_HOME/policy.local.json`:
+
+```sh
+openswarm bus init <bus-owner>/<bus-repo>
+```
+
+```json
+{"bus":{"repo":"<bus-owner>/<bus-repo>","allowed_executors":["<github-login>"],"poll_seconds":60,"labels_prefix":"openswarm"}}
+```
+
+Dispatch from a target GitHub repository after the base commit has been pushed:
+
+```sh
+openswarm run --backend github-issue --cwd <target-repo> --base <commit> \
+  --budget-minutes 40 --verify '<acceptance-command>' --task-file task.md
+openswarm bus status
+openswarm bus-worker --bus <bus-owner>/<bus-repo> --name <executor-name> --backend codex --once
+```
+
+See [docs/BUS.md](docs/BUS.md) for the issue/result schema and worker setup. The planner accepts comments only from allowlisted GitHub logins, validates the reported branch and commit, fetches and verifies locally, and never pushes or merges into the target repository. Workers stop on the `openswarm:cancelled` label.
 
 ## How routing works
 

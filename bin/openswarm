@@ -13,6 +13,8 @@ Subcommands:
   fleet            inspect hosts and forward openswarm commands over local / SSH / instabox transports
   batch            queue task cards across fleet hosts and collect their branches
   verify-remote    verify a fleet run on another host in a temporary worktree
+  bus              initialize or inspect a GitHub issue bus repository
+  bus-worker       run the reference GitHub issue bus executor
   watch            stream actionable events (progress, risk, stalls) for one or more runs
   runs / report    snapshot of recent runs / compact scheduled check-in
   stop             terminate a run (partial work is still committed to its branch)
@@ -45,6 +47,7 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.parse
 import urllib.request
 import uuid
 import queue
@@ -1802,6 +1805,28 @@ def cmd_run(args, policy):
     title = args.title or task.strip().splitlines()[0][:72]
     prof = profile_from_args(args)
     budget_min = args.budget_minutes if args.budget_minutes is not None else policy["run"]["timeout_seconds"] / 60
+    if args.backend == "github-issue":
+        try:
+            cmd_bus_run(args, policy, rid, rdir, task, title, budget_min)
+        except (BusError, ValueError) as error:
+            state = jload(f"{rdir}/status.json", {}) or {}
+            if state.get("bus_issue") and state.get("bus_repo"):
+                try:
+                    bus_cancel_issue(state["bus_repo"], state["bus_issue"], bus_config(policy),
+                                     "planner encountered a bus error")
+                except Exception:
+                    pass
+            output = {"id": rid, "status": "failed", "error_class": "bus_error", "error": str(error),
+                      "title": title, "backend": "github-issue", "result": None, "branch": None,
+                      "commit": None, "bus": {"issue_url": state.get("bus_issue_url"), "executor": None,
+                                                "pr_url": None}, "run_dir": rdir}
+            jsave(f"{rdir}/result.json", output)
+            append_ledger({"id": rid, "ts": NOW(), "title": title, "status": "failed",
+                           "backend": "github-issue", "error_class": "bus_error", "summary": str(error)[:300]})
+            set_status(rdir, state="finished", status="failed", finished=NOW(), error_class="bus_error")
+            print(json.dumps(output, indent=2, ensure_ascii=False), file=sys.stderr)
+            raise SystemExit(2)
+        return
     st = get_state(policy)
     decision = route(prof, st, policy)
     if not decision["ok"]:
@@ -2012,6 +2037,639 @@ def cmd_run(args, policy):
     set_status(rdir, state="finished", status=status, finished=NOW(), commit=fin.get("commit"))
     print(json.dumps(out, indent=2, ensure_ascii=False))
     sys.exit(3 if budget_denial else 0 if status == "done" else 1)
+
+
+# ---------------------------------------------------------------- GitHub issue bus
+
+BUS_STATES = ("queued", "claimed", "done", "failed", "cancelled")
+BUS_EXECUTOR_BACKENDS = ("codex", "ocgo", "deepseek", "cursor", "pi")
+BUS_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+BUS_RUN_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
+BUS_SHA_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
+
+
+class BusError(RuntimeError):
+    pass
+
+
+def gh_transport(endpoint, method="GET", payload=None, allow_not_found=False):
+    """The sole GitHub transport: authenticated REST calls through the installed gh CLI."""
+    command = [envvar("GH_BIN", "gh"), "api", endpoint]
+    input_text = None
+    if method != "GET":
+        command += ["--method", method]
+    if payload is not None:
+        command += ["--input", "-"]
+        input_text = json.dumps(payload, ensure_ascii=False)
+    try:
+        proc = subprocess.run(command, input=input_text, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise BusError(f"gh api failed: {error}")
+    if proc.returncode:
+        detail = (proc.stderr or proc.stdout).strip()
+        if allow_not_found and re.search(r"(?:HTTP )?404|Not Found", detail, re.I):
+            return None
+        raise BusError(f"gh api {method} {endpoint} failed: {detail[:500]}")
+    if not proc.stdout.strip():
+        return {}
+    try:
+        return json.loads(proc.stdout)
+    except ValueError:
+        return proc.stdout
+
+
+def gh_pages(endpoint):
+    rows, page = [], 1
+    while True:
+        sep = "&" if "?" in endpoint else "?"
+        result = gh_transport(f"{endpoint}{sep}per_page=100&page={page}")
+        if not isinstance(result, list):
+            return rows
+        rows.extend(result)
+        if len(result) < 100:
+            return rows
+        page += 1
+
+
+def bus_config(policy, repo=None):
+    cfg = dict(policy.get("bus") or {})
+    if repo:
+        cfg["repo"] = repo
+    if not BUS_REPO_RE.fullmatch(str(cfg.get("repo") or "")):
+        raise BusError("configure policy.bus.repo as owner/repo")
+    allowed = cfg.get("allowed_executors") or []
+    if not isinstance(allowed, list) or any(not isinstance(login, str) or not login.strip() for login in allowed):
+        raise BusError("policy.bus.allowed_executors must be a list of GitHub logins")
+    cfg["allowed_executors"] = [login.strip().casefold() for login in allowed]
+    cfg["poll_seconds"] = max(0.01, float(cfg.get("poll_seconds", 60)))
+    prefix = str(cfg.get("labels_prefix") or "openswarm").strip().rstrip(":")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", prefix):
+        raise BusError("policy.bus.labels_prefix must be a simple label prefix")
+    cfg["labels_prefix"] = prefix
+    return cfg
+
+
+def bus_label(cfg, state):
+    return f"{cfg['labels_prefix']}:{state}"
+
+
+def bus_label_names(cfg):
+    return {state: bus_label(cfg, state) for state in BUS_STATES}
+
+
+def issue_label_names(issue):
+    names = {label.get("name") if isinstance(label, dict) else label for label in issue.get("labels") or []}
+    return {name for name in names if isinstance(name, str)}
+
+
+def bus_set_issue_labels(repo, number, cfg, add=(), remove=()):
+    issue = gh_transport(f"repos/{repo}/issues/{number}")
+    labels = issue_label_names(issue)
+    labels.difference_update(remove)
+    labels.update(add)
+    return gh_transport(f"repos/{repo}/issues/{number}/labels", "PUT", {"labels": sorted(labels)})
+
+
+def bus_comment(repo, number, body):
+    return gh_transport(f"repos/{repo}/issues/{number}/comments", "POST", {"body": body})
+
+
+def bus_cancel_issue(repo, number, cfg, reason):
+    states = {state: bus_label(cfg, state) for state in BUS_STATES}
+    bus_set_issue_labels(repo, number, cfg, add=[states["cancelled"]],
+                         remove=[states[s] for s in ("queued", "claimed", "done", "failed")])
+    bus_comment(repo, number, f"openswarm cancelled this run: {reason}")
+
+
+def bus_remote(cwd):
+    code, root, _ = git(["rev-parse", "--show-toplevel"], cwd)
+    if code:
+        raise BusError("--cwd must be inside a git repository")
+    root = root.strip()
+    code, remote, _ = git(["remote", "get-url", "origin"], root)
+    if code:
+        raise BusError("github-issue requires a GitHub origin remote")
+    remote = remote.strip()
+    match = re.match(r"^(?:git@|ssh://git@)github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?$", remote)
+    if match:
+        target = f"{match.group(1)}/{match.group(2)}"
+    else:
+        parsed = urllib.parse.urlparse(remote)
+        parts = parsed.path.strip("/").removesuffix(".git").split("/")
+        if parsed.hostname != "github.com" or len(parts) != 2:
+            raise BusError("github-issue requires a GitHub origin remote")
+        target = "/".join(parts)
+    return root, remote, target
+
+
+def bus_base_commit(root, remote, requested):
+    code, base, _ = git(["rev-parse", "--verify", "--end-of-options", f"{requested or 'HEAD'}^{{commit}}"], root)
+    if code:
+        raise BusError("base commit is unavailable locally")
+    base = base.strip()
+    code, refs, _ = git(["ls-remote", "--heads", "--tags", remote], root, timeout=60)
+    if code or base not in {line.split()[0] for line in refs.splitlines() if line.split()}:
+        raise BusError("push the base first")
+    return base
+
+
+def bus_task_metadata(run_id, target_repo, base, args, budget_min):
+    if not BUS_RUN_ID_RE.fullmatch(run_id):
+        raise BusError("invalid run id")
+    metadata = {"run_id": run_id, "repo": target_repo, "base": base,
+                "branch_hint": f"openswarm/{run_id}", "budget_minutes": budget_min,
+                "report_schema": RESULT_SCHEMA}
+    if args.verify:
+        metadata["verify"] = args.verify
+    return metadata
+
+
+def bus_extract_task(body):
+    matches = list(re.finditer(r"```openswarm-task\s*\n(.*?)\n```", body or "", re.S))
+    if not matches or (body or "")[matches[-1].end():].strip():
+        return None
+    match = matches[-1]
+    try:
+        task = json.loads(match.group(1))
+    except ValueError:
+        return None
+    if not isinstance(task, dict) or not BUS_RUN_ID_RE.fullmatch(str(task.get("run_id") or "")):
+        return None
+    if not BUS_REPO_RE.fullmatch(str(task.get("repo") or "")) or not BUS_SHA_RE.fullmatch(str(task.get("base") or "")):
+        return None
+    if task.get("branch_hint") != f"openswarm/{task['run_id']}":
+        return None
+    budget = task.get("budget_minutes")
+    if isinstance(budget, bool) or not isinstance(budget, (int, float)) or not math.isfinite(budget) or budget <= 0:
+        return None
+    if task.get("verify") is not None and not isinstance(task.get("verify"), str):
+        return None
+    return task
+
+
+def bus_comments(repo, number):
+    return gh_pages(f"repos/{repo}/issues/{number}/comments")
+
+
+def bus_claim(comment):
+    body = comment.get("body")
+    if not isinstance(body, str):
+        return None
+    match = re.fullmatch(r"/claim\s+([A-Za-z0-9_.-]{1,64})", body.strip())
+    return match.group(1) if match else None
+
+
+def bus_winning_claim(comments, allowed):
+    claims = [comment for comment in comments
+              if str((comment.get("user") or {}).get("login") or "").casefold() in allowed and bus_claim(comment)]
+    return min(claims, key=lambda c: (to_epoch(c.get("created_at")) or 0, int(c.get("id") or 0))) if claims else None
+
+
+def bus_parse_result(body):
+    matches = list(re.finditer(r"```openswarm-result\s*\n(.*?)\n```", body or "", re.S))
+    if not matches or (body or "")[matches[-1].end():].strip():
+        return None
+    match = matches[-1]
+    try:
+        result = json.loads(match.group(1))
+    except ValueError:
+        return None
+    required = ("status", "summary", "files_changed", "tests", "followups", "branch", "commit")
+    if not isinstance(result, dict) or any(key not in result for key in required):
+        return None
+    if result.get("status") not in ("done", "partial", "failed") or not isinstance(result.get("summary"), str):
+        return None
+    if not isinstance(result.get("files_changed"), list) or not all(isinstance(x, str) for x in result["files_changed"]):
+        return None
+    if not isinstance(result.get("tests"), str) or not isinstance(result.get("followups"), list):
+        return None
+    if result.get("branch") is not None and not isinstance(result["branch"], str):
+        return None
+    if result.get("branch") is not None and result["branch"] != result["branch"].strip():
+        return None
+    if result.get("branch") is not None and not re.fullmatch(r"openswarm/[A-Za-z0-9_.-]{1,100}", result["branch"]):
+        return None
+    if result.get("commit") is not None and (not isinstance(result["commit"], str)
+                                               or not BUS_SHA_RE.fullmatch(result["commit"])):
+        return None
+    if not all(isinstance(value, str) for value in result["followups"]):
+        return None
+    if result.get("pr_url") is not None and not isinstance(result["pr_url"], str):
+        return None
+    return result
+
+
+def bus_create_issue(repo, cfg, title, task, metadata, executor=None):
+    body = task.rstrip() + "\n\n```openswarm-task\n" + json.dumps(metadata, ensure_ascii=False, indent=2) + "\n```\n"
+    labels = [bus_label(cfg, "queued")]
+    if executor:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", executor):
+            raise BusError("executor routing label must be a simple name")
+        route_label = f"executor:{executor}"
+        endpoint = f"repos/{repo}/labels/{urllib.parse.quote(route_label, safe='')}"
+        if gh_transport(endpoint, allow_not_found=True) is None:
+            gh_transport(f"repos/{repo}/labels", "POST", {"name": route_label, "color": "c5def5",
+                                                              "description": f"Route task to {executor}"})
+        labels.append(route_label)
+    return gh_transport(f"repos/{repo}/issues", "POST", {
+        "title": f"[openswarm] {title}", "body": body, "labels": labels,
+    })
+
+
+def bus_event(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as stream:
+        stream.write(json.dumps({"type": "text", "part": {"text": text}}, ensure_ascii=False) + "\n")
+
+
+def bus_fetch_branch(root, remote, run_id, branch, expected_commit):
+    if branch != f"openswarm/{run_id}" or not BUS_SHA_RE.fullmatch(str(expected_commit or "")):
+        raise BusError("result branch or commit is invalid")
+    ref = f"refs/remotes/openswarm-bus/{run_id}"
+    code, _, error = git(["fetch", "--no-tags", remote, f"+refs/heads/{branch}:{ref}"], root, timeout=300)
+    if code:
+        raise BusError(f"could not fetch result branch: {error.strip()[:250]}")
+    code, actual, _ = git(["rev-parse", "--verify", ref], root)
+    if code or actual.strip().lower() != expected_commit.lower():
+        raise BusError("fetched branch does not match the reported commit")
+    code, _, error = git(["branch", "-f", branch, ref], root)
+    if code:
+        raise BusError(f"could not create local result branch: {error.strip()[:250]}")
+    return actual.strip()
+
+
+def bus_verify(root, commit, command, timeout):
+    if not command:
+        return None
+    path = tempfile.mkdtemp(prefix="openswarm-bus-verify-")
+    os.rmdir(path)
+    code, _, error = git(["worktree", "add", "-q", "--detach", path, commit], root, timeout=300)
+    if code:
+        return {"cmd": command, "rc": 125, "tail": error.strip()[-1200:], "failing": []}
+    try:
+        link_dependency_dirs(root, path)
+        return run_verify(rewrite_verify_paths(command, root, path), path, timeout)
+    finally:
+        git(["worktree", "remove", "--force", path], root)
+        shutil.rmtree(path, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- GitHub bus run lifecycle
+
+def bus_finish_run(rid, rdir, title, root, remote, issue, result, executor, status, started, verify_command=None):
+    now = NOW()
+    elapsed = round(now - started, 3)
+    verify = None
+    branch = commit = None
+    diffstat = ""
+    verify_note = None
+    task = bus_extract_task((issue or {}).get("body", "")) or {}
+    error = None
+    if result and result.get("branch") and result.get("commit"):
+        try:
+            commit = bus_fetch_branch(root, remote, rid, result["branch"], result["commit"])
+            branch = f"openswarm/{rid}"
+            _, diffstat, _ = git(["diff", "--stat", task.get("base", f"{commit}^"), commit], root)
+            if verify_command and status not in ("stopped", "budget_exceeded"):
+                set_status(rdir, state="verifying")
+                deadline = (jload(f"{rdir}/status.json", {}) or {}).get("deadline", now)
+                verify = bus_verify(root, commit, verify_command, max(60, min(600, int(deadline - NOW()) + 300)))
+                status, verify_note = adjust_status_for_verify(status, verify)
+        except (BusError, OSError) as failure:
+            error = str(failure)
+            status = "failed"
+    bus_info = {"issue_url": (issue or {}).get("html_url"), "executor": executor,
+                "pr_url": (result or {}).get("pr_url")}
+    output = {
+        "id": rid, "status": status, "error_class": "bus_error" if error else None, "title": title,
+        "backend": "github-issue", "model": None, "effort": None, "usage": None,
+        "seconds": elapsed, "verify": verify, "verify_note": verify_note,
+        "result": {key: result.get(key) for key in ("status", "summary", "files_changed", "tests", "followups")}
+                  if result else None,
+        "branch": branch, "commit": commit, "diffstat": diffstat, "patch": None,
+        "worktree": None, "merge_hint": f"git merge --no-ff {branch}" if branch else None,
+        "workspace": {"mode": "github-issue", "repo": root, "base": task.get("base")},
+        "attempts": [{"backend": "github-issue", "model": None, "seconds": elapsed,
+                      "error_class": "bus_error" if error else None}],
+        "bus": bus_info, "run_dir": rdir,
+    }
+    if error:
+        output["error"] = error
+    jsave(f"{rdir}/result.json", output)
+    append_ledger({"id": rid, "ts": now, "title": title, "status": status, "backend": "github-issue",
+                   "seconds": elapsed, "summary": (result or {}).get("summary"), "commit": commit,
+                   "files": len((result or {}).get("files_changed") or []), "bus": bus_info,
+                   "error_class": output["error_class"]})
+    set_status(rdir, state="finished", status=status, finished=now, commit=commit, bus=bus_info)
+    print(json.dumps(output, indent=2, ensure_ascii=False))
+    raise SystemExit(0 if status == "done" else 1)
+
+
+def cmd_bus_run(args, policy, rid, rdir, task, title, budget_min):
+    cfg = bus_config(policy)
+    root, remote, target_repo = bus_remote(os.path.abspath(args.cwd))
+    code, base, _ = git(["rev-parse", "--verify", "--end-of-options", f"{getattr(args, 'base', None) or 'HEAD'}^{{commit}}"], root)
+    if code:
+        raise BusError("base commit is unavailable locally")
+    base = base.strip()
+    code, remote_refs, _ = git(["ls-remote", "--heads", "--tags", remote], root, timeout=60)
+    if code or base not in {line.split()[0] for line in remote_refs.splitlines() if line.split()}:
+        raise BusError("push the base first")
+    metadata = {"run_id": rid, "repo": target_repo, "base": base,
+                "branch_hint": f"openswarm/{rid}", "budget_minutes": budget_min,
+                "report_schema": RESULT_SCHEMA}
+    if args.verify:
+        metadata["verify"] = args.verify
+    if args.dry_run:
+        set_status(rdir, id=rid, state="dry-run", title=title, backend="github-issue", bus_repo=cfg["repo"])
+        print(json.dumps({"id": rid, "dry_run": True, "backend": "github-issue", "bus_repo": cfg["repo"],
+                          "repo": target_repo, "base": base}, indent=2))
+        return
+    try:
+        admit_budget(policy, "github-issue", budget_min, rdir, id=rid, state="queued", title=title,
+                     started=NOW(), runner_pid=os.getpid(), cwd=root)
+    except BudgetExceeded as budget_error_value:
+        budget_error(budget_error_value)
+    if args.detach and not args.run_id:
+        child = [sys.executable, os.path.realpath(__file__), "run", "--run-id", rid, "--cwd", root,
+                 "--title", title, "--budget-minutes", str(budget_min), "--backend", "github-issue"]
+        for flag in ("base", "verify", "executor"):
+            value = getattr(args, flag, None)
+            if value:
+                child += [f"--{flag.replace('_', '-')}", str(value)]
+        if getattr(args, "verify_baseline", False):
+            child.append("--verify-baseline")
+        with open(f"{rdir}/run.out", "w") as out:
+            process = subprocess.Popen(child, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                       start_new_session=True)
+        set_status(rdir, id=rid, state="queued", title=title, started=NOW(), budget_minutes=budget_min,
+                   cwd=root, backend="github-issue", runner_pid=process.pid, bus_repo=cfg["repo"])
+        print(json.dumps({"id": rid, "state": "started", "runner_pid": process.pid, "run_dir": rdir,
+                          "watch": f"openswarm watch {rid}", "result": f"{rdir}/result.json"}, indent=2))
+        return
+    started = NOW()
+    deadline = started + budget_min * 60
+    states = {state: bus_label(cfg, state) for state in BUS_STATES}
+    event_path = f"{rdir}/events.jsonl"
+    set_status(rdir, id=rid, state="running", title=title, started=started, budget_minutes=budget_min,
+               deadline=deadline, backend="github-issue", events=event_path, cwd=root, bus_repo=cfg["repo"],
+               bus_target_repo=target_repo, bus_base=base)
+    if (jload(f"{rdir}/status.json", {}) or {}).get("stop_requested"):
+        bus_finish_run(rid, rdir, title, root, remote, None, None, None, "stopped", started)
+    issue = bus_create_issue(cfg["repo"], cfg, title, task, metadata, getattr(args, "executor", None))
+    number = issue.get("number")
+    if not number:
+        raise BusError("GitHub did not return an issue number")
+    set_status(rdir, bus_issue=int(number), bus_issue_url=issue.get("html_url"))
+    bus_event(event_path, f"created issue {issue.get('html_url') or number}")
+    seen_comments, result, executor, final_status = set(), None, None, None
+    while not final_status:
+        if (jload(f"{rdir}/status.json", {}) or {}).get("stop_requested"):
+            current = gh_transport(f"repos/{cfg['repo']}/issues/{number}")
+            if states["cancelled"] not in issue_label_names(current):
+                bus_cancel_issue(cfg["repo"], number, cfg, "planner requested stop")
+            final_status = "stopped"
+            break
+        current = gh_transport(f"repos/{cfg['repo']}/issues/{number}")
+        comments = bus_comments(cfg["repo"], number)
+        for comment in comments:
+            comment_id = str(comment.get("id") or "")
+            if comment_id and comment_id not in seen_comments:
+                seen_comments.add(comment_id)
+                login = (comment.get("user") or {}).get("login") or "unknown"
+                bus_event(event_path, f"{login}: {short(comment.get('body') or '', 320)}")
+        names = issue_label_names(current)
+        if states["cancelled"] in names:
+            final_status = "stopped"
+            break
+        claim = bus_winning_claim(comments, cfg["allowed_executors"])
+        if claim:
+            claim_login = str((claim.get("user") or {}).get("login") or "")
+            for comment in reversed(comments):
+                if str((comment.get("user") or {}).get("login") or "").casefold() != claim_login.casefold():
+                    continue
+                parsed = bus_parse_result(comment.get("body") or "")
+                if not parsed:
+                    continue
+                if states["failed"] in names:
+                    parsed["status"] = "failed"
+                    result, final_status = parsed, "failed"
+                elif states["done"] in names:
+                    result, final_status = parsed, parsed["status"]
+                if final_status:
+                    executor = bus_claim(claim)
+                    break
+        if final_status:
+            break
+        if NOW() >= deadline:
+            bus_cancel_issue(cfg["repo"], number, cfg, "planner budget expired")
+            final_status = "budget_exceeded"
+            break
+        time.sleep(min(cfg["poll_seconds"], max(0.01, deadline - NOW())))
+    bus_finish_run(rid, rdir, title, root, remote, issue, result, executor, final_status or "failed", started,
+                   getattr(args, "verify", None))
+
+
+def cmd_bus_init(args, policy):
+    cfg = bus_config(policy, args.repo)
+    repo = cfg["repo"]
+    colors = {"queued": "0e8a16", "claimed": "fbca04", "done": "1d76db", "failed": "d73a4a", "cancelled": "6f42c1"}
+    existing = gh_pages(f"repos/{repo}/labels")
+    known = {item.get("name") for item in existing if isinstance(item, dict)}
+    created = []
+    for state in BUS_STATES:
+        name = bus_label(cfg, state)
+        if name not in known:
+            gh_transport(f"repos/{repo}/labels", "POST", {"name": name, "color": colors[state],
+                                                             "description": f"openswarm bus {state} task"})
+            created.append(name)
+    template = ("name: openswarm task\nabout: Submit an openswarm task card\ntitle: '[openswarm] '\nlabels:\n"
+                f"  - {bus_label(cfg, 'queued')}\nbody:\n  - type: markdown\n    attributes:\n      value: |\n"
+                "        Add the task description. Planner metadata is appended in an `openswarm-task` JSON block.\n"
+                "        Labels transition queued -> claimed -> done/failed; planners can cancel with the cancelled label.\n"
+                "        Executors claim with `/claim <executor-name>` and report in an `openswarm-result` JSON block.\n")
+    with open(os.path.join(SKILL_DIR, "docs", "BUS.md")) as stream:
+        bus_readme = stream.read()
+    files = {"README.md": bus_readme, ".github/ISSUE_TEMPLATE/openswarm.yml": template}
+    updated = []
+    for path, content in files.items():
+        endpoint = f"repos/{repo}/contents/{urllib.parse.quote(path, safe='/')}"
+        current = gh_transport(endpoint, allow_not_found=True)
+        if current and current.get("content"):
+            try:
+                prior = base64.b64decode(current["content"].replace("\n", "")).decode()
+            except Exception:
+                prior = None
+            if prior == content:
+                continue
+        payload = {"message": f"Initialize openswarm issue bus: {path}",
+                   "content": base64.b64encode(content.encode()).decode()}
+        if current and current.get("sha"):
+            payload["sha"] = current["sha"]
+        gh_transport(endpoint, "PUT", payload)
+        updated.append(path)
+    print(json.dumps({"ok": True, "repo": repo, "created_labels": created, "updated_files": updated}, indent=2))
+
+
+def cmd_bus_status(args, policy):
+    cfg = bus_config(policy, getattr(args, "repo", None))
+    states = {state: bus_label(cfg, state) for state in BUS_STATES}
+    rows = []
+    for issue in gh_pages(f"repos/{cfg['repo']}/issues?state=open"):
+        if "pull_request" in issue:
+            continue
+        names = issue_label_names(issue)
+        if not any(states[value] in names for value in BUS_STATES) and not str(issue.get("title") or "").startswith("[openswarm]"):
+            continue
+        comments = bus_comments(cfg["repo"], issue["number"])
+        claim = bus_winning_claim(comments, cfg["allowed_executors"])
+        created = to_epoch(issue.get("created_at"))
+        state = next((value for value in BUS_STATES if states[value] in names), "open")
+        rows.append({"number": issue.get("number"), "title": issue.get("title"), "url": issue.get("html_url"),
+                     "state": state, "executor": bus_claim(claim) if claim else None,
+                     "age_minutes": max(0, int((NOW() - created) / 60)) if created else None})
+    if args.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+    elif not rows:
+        print("no open openswarm issues")
+    else:
+        for row in rows:
+            age = f"{row['age_minutes']}m" if row["age_minutes"] is not None else "-"
+            print(f"#{row['number']} {row['state']:<10} executor={row['executor'] or '-':<20} age={age}  {row['title']}")
+
+
+def bus_issue_task(issue):
+    task = bus_extract_task(issue.get("body") or "")
+    if not task:
+        return None, ""
+    card = re.sub(r"\n?```openswarm-task\s*\n.*?\n```\s*$", "", issue.get("body") or "", flags=re.S).strip()
+    return task, card
+
+
+def bus_worker_clone(task, workdir):
+    url = envvar("BUS_TARGET_URL") or f"https://github.com/{task['repo']}.git"
+    code, _, error = sh(["git", "clone", "--no-checkout", url, workdir], timeout=300)
+    if code:
+        raise BusError(f"target clone failed: {error.strip()[:300]}")
+    code, _, error = sh(["git", "fetch", "origin", task["base"]], cwd=workdir, timeout=300)
+    if code:
+        raise BusError(f"could not fetch task base: {error.strip()[:300]}")
+    code, _, error = sh(["git", "checkout", "--detach", task["base"]], cwd=workdir, timeout=60)
+    if code:
+        raise BusError(f"could not check out task base: {error.strip()[:300]}")
+
+
+def bus_worker_open_pr(repo, branch, title, task):
+    default = gh_transport(f"repos/{repo}").get("default_branch") or "main"
+    body = f"Automated openswarm result for run `{task['run_id']}`.\n\nBase commit: `{task['base']}`."
+    response = gh_transport(f"repos/{repo}/pulls", "POST", {"title": title, "head": branch,
+                                                              "base": default, "body": body, "draft": True})
+    return response.get("html_url")
+
+
+def bus_worker_run(issue, cfg, args, policy):
+    task, task_card = bus_issue_task(issue)
+    if not task:
+        return False
+    labels = {state: bus_label(cfg, state) for state in BUS_STATES}
+    names = issue_label_names(issue)
+    if labels["queued"] not in names or labels["cancelled"] in names:
+        return False
+    executor_labels = [value for value in names if value.startswith("executor:")]
+    if executor_labels and f"executor:{args.name}" not in executor_labels:
+        return False
+    login = str((gh_transport("user") or {}).get("login") or "").casefold()
+    if not login or login not in cfg["allowed_executors"]:
+        raise BusError("the authenticated GitHub account is not in policy.bus.allowed_executors")
+    bus_set_issue_labels(cfg["repo"], issue["number"], cfg, add=[labels["claimed"]], remove=[labels["queued"]])
+    own_claim = bus_comment(cfg["repo"], issue["number"], f"/claim {args.name}")
+    winner = bus_winning_claim(bus_comments(cfg["repo"], issue["number"]), cfg["allowed_executors"])
+    if not winner or str(winner.get("id")) != str(own_claim.get("id")):
+        return False
+    base_dir = os.path.join(DATA, "bus-worker", task["run_id"])
+    repo_path = os.path.join(base_dir, "repo")
+    os.makedirs(base_dir, exist_ok=True)
+    if os.path.exists(repo_path):
+        shutil.rmtree(repo_path)
+    try:
+        bus_worker_clone(task, repo_path)
+        rdir = os.path.join(RUNS, task["run_id"])
+        os.makedirs(rdir, exist_ok=True)
+        with open(os.path.join(rdir, "task.md"), "w") as stream:
+            stream.write(task_card)
+        worker_budget = min(float(task["budget_minutes"]), float(args.budget_minutes))
+        if worker_budget <= 0:
+            raise BusError("worker budget must be greater than zero")
+        command = [sys.executable, os.path.realpath(__file__), "run", "--run-id", task["run_id"],
+                   "--cwd", repo_path, "--base", task["base"], "--title", issue.get("title", "openswarm task"),
+                   "--budget-minutes", str(worker_budget),
+                   "--backend", args.backend]
+        if args.model:
+            command += ["--model", args.model]
+        if task.get("verify"):
+            command += ["--verify", str(task["verify"])]
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                   start_new_session=True)
+        while process.poll() is None:
+            current = gh_transport(f"repos/{cfg['repo']}/issues/{issue['number']}")
+            if labels["cancelled"] in issue_label_names(current):
+                subprocess.run([sys.executable, os.path.realpath(__file__), "stop", task["run_id"]],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+                process.wait(timeout=60)
+                return False
+            time.sleep(min(cfg["poll_seconds"], 2))
+        process.communicate()
+        if labels["cancelled"] in issue_label_names(gh_transport(f"repos/{cfg['repo']}/issues/{issue['number']}")):
+            return False
+        local = jload(os.path.join(rdir, "result.json"), {}) or {}
+        nested = local.get("result") or {}
+        branch, commit = local.get("branch"), local.get("commit")
+        report_status = nested.get("status") or local.get("status") or "failed"
+        summary = nested.get("summary") or local.get("error") or f"worker run ended with {report_status}"
+        pr_url = None
+        if labels["cancelled"] in issue_label_names(gh_transport(f"repos/{cfg['repo']}/issues/{issue['number']}")):
+            return False
+        if branch and commit:
+            code, _, push_error = sh(["git", "push", "origin", f"{branch}:{branch}"], cwd=repo_path, timeout=300)
+            if code:
+                report_status = "failed"
+                summary += f"; push failed: {push_error.strip()[:180]}"
+            elif (policy.get("bus") or {}).get("open_pr"):
+                pr_url = bus_worker_open_pr(task["repo"], branch, issue.get("title", "openswarm task"), task)
+        if labels["cancelled"] in issue_label_names(gh_transport(f"repos/{cfg['repo']}/issues/{issue['number']}")):
+            return False
+        report = {"status": report_status if report_status in ("done", "partial", "failed") else "failed",
+                  "summary": summary, "files_changed": nested.get("files_changed") or [],
+                  "tests": nested.get("tests") or "not run: executor did not return a test report",
+                  "followups": nested.get("followups") or [], "branch": branch, "commit": commit, "pr_url": pr_url}
+        terminal = "failed" if report["status"] == "failed" else "done"
+        body = "```openswarm-result\n" + json.dumps(report, ensure_ascii=False, indent=2) + "\n```"
+        bus_comment(cfg["repo"], issue["number"], body)
+        bus_set_issue_labels(cfg["repo"], issue["number"], cfg, add=[labels[terminal]],
+                             remove=[labels["queued"], labels["claimed"]])
+        return True
+    except Exception as error:
+        current = gh_transport(f"repos/{cfg['repo']}/issues/{issue['number']}")
+        if labels["cancelled"] in issue_label_names(current):
+            return False
+        report = {"status": "failed", "summary": str(error)[:500], "files_changed": [],
+                  "tests": "not run: worker failed before verification", "followups": [], "branch": None,
+                  "commit": None, "pr_url": None}
+        bus_comment(cfg["repo"], issue["number"], "```openswarm-result\n" + json.dumps(report, indent=2) + "\n```")
+        bus_set_issue_labels(cfg["repo"], issue["number"], cfg, add=[labels["failed"]],
+                             remove=[labels["queued"], labels["claimed"]])
+        return True
+
+
+def cmd_bus_worker(args, policy):
+    cfg = bus_config(policy, args.bus)
+    while True:
+        for issue in gh_pages(f"repos/{cfg['repo']}/issues?state=open"):
+            if "pull_request" not in issue and bus_worker_run(issue, cfg, args, policy) and args.once:
+                return
+        if args.once:
+            return
+        time.sleep(cfg["poll_seconds"])
 
 
 # ---------------------------------------------------------------- resident lanes
@@ -4301,6 +4959,14 @@ def cmd_report(args, policy):
 def cmd_stop(args, policy):
     rdir = f"{RUNS}/{args.run_id}"
     st = jload(f"{rdir}/status.json", {}) or {}
+    if st.get("backend") == "github-issue":
+        set_status(rdir, stop_requested=NOW())
+        if st.get("bus_issue") and st.get("bus_repo"):
+            cfg = bus_config(policy)
+            bus_cancel_issue(st["bus_repo"], st["bus_issue"], cfg, "planner requested stop")
+        print(json.dumps({"id": args.run_id, "signalled": ["cancelled"] if st.get("bus_issue") else [],
+                          "note": "the GitHub issue was cancelled; the bus runner will finalize shortly"}))
+        return
     if st.get("lane"):
         response = lane_call(st["lane"], {"op": "abort"})
         print(json.dumps({"id": args.run_id, "lane": st["lane"],
@@ -4407,12 +5073,13 @@ def main():
     sp = sub.add_parser("status")
     sp.add_argument("--refresh", action="store_true")
 
-    def add_profile(p):
+    def add_profile(p, include_bus=False):
         p.add_argument("--type", default="impl",
                        help="impl|refactor|debug|test|docs|mechanical|review|research|migration|format|rename")
         p.add_argument("--difficulty", type=int, default=3, help="1 (trivial) .. 5 (hardest)")
         p.add_argument("--context-tokens", type=int, default=0, help="approx context the executor must read")
-        p.add_argument("--backend", choices=["codex", "ocgo", "deepseek", "cursor", "pi"],
+        backends = ["codex", "ocgo", "deepseek", "cursor", "pi"] + (["github-issue"] if include_bus else [])
+        p.add_argument("--backend", choices=backends,
                        help="force a backend. cursor and pi are opt-in and are not chosen unless named here or listed in routing")
         p.add_argument("--model")
         p.add_argument("--effort")
@@ -4422,7 +5089,7 @@ def main():
     sp.add_argument("--refresh", action="store_true")
 
     sp = sub.add_parser("run")
-    add_profile(sp)
+    add_profile(sp, include_bus=True)
     sp.add_argument("--prompt")
     sp.add_argument("--task-file")
     sp.add_argument("--title")
@@ -4439,6 +5106,7 @@ def main():
     sp.add_argument("--detach", action="store_true", help="run in background; monitor with `openswarm watch <id>`")
     sp.add_argument("--run-id", help=argparse.SUPPRESS)
     sp.add_argument("--dry-run", action="store_true")
+    sp.add_argument("--executor", help="optional GitHub bus executor routing label")
 
     sp = sub.add_parser("watch", help="stream actionable events of a run (for Claude's Monitor tool)")
     sp.add_argument("run_id", nargs="+", help="one or more run ids; several ids are watched together")
@@ -4510,6 +5178,22 @@ def main():
     sp.add_argument("--verify", required=True)
     sp.add_argument("--timeout", type=float, default=600)
 
+    sp = sub.add_parser("bus", help="initialize or inspect a GitHub issue bus repository")
+    bus_sub = sp.add_subparsers(dest="bus_cmd", required=True)
+    bp = bus_sub.add_parser("init", help="create protocol labels, issue template, and README")
+    bp.add_argument("repo", help="bus repository owner/name")
+    bp = bus_sub.add_parser("status", help="show open bus issues and their executor/age")
+    bp.add_argument("--repo", help="override policy.bus.repo")
+    bp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser("bus-worker", help="run the reference GitHub issue bus worker")
+    sp.add_argument("--bus", required=True, help="bus repository owner/name")
+    sp.add_argument("--name", required=True, help="executor name used in /claim comments")
+    sp.add_argument("--backend", choices=BUS_EXECUTOR_BACKENDS, default="codex")
+    sp.add_argument("--model")
+    sp.add_argument("--budget-minutes", type=float, default=40)
+    sp.add_argument("--once", action="store_true", help="claim at most one queued issue, then exit")
+
     sp = sub.add_parser("lane", help="manage resident executor lanes")
     lane_sub = sp.add_subparsers(dest="lane_cmd", required=True)
     lp = lane_sub.add_parser("up", help="start configured lane supervisors")
@@ -4572,6 +5256,21 @@ def main():
         cmd_report(a, policy)
     elif a.cmd == "stop":
         cmd_stop(a, policy)
+    elif a.cmd == "bus":
+        try:
+            if a.bus_cmd == "init":
+                cmd_bus_init(a, policy)
+            else:
+                cmd_bus_status(a, policy)
+        except (BusError, ValueError) as error:
+            print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False), file=sys.stderr)
+            sys.exit(2)
+    elif a.cmd == "bus-worker":
+        try:
+            cmd_bus_worker(a, policy)
+        except (BusError, ValueError) as error:
+            print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False), file=sys.stderr)
+            sys.exit(2)
     elif a.cmd in ("fleet", "batch", "verify-remote"):
         try:
             if a.cmd == "fleet":

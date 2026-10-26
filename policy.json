@@ -233,6 +233,14 @@
     "timeout_seconds": 2400,
     "fallback": true
   },
+  "bus": {
+    "_doc": "GitHub issue bus for executors outside the controlled fleet. Configure bus.repo and allowed_executors in policy.local.json.",
+    "repo": null,
+    "allowed_executors": [],
+    "poll_seconds": 60,
+    "labels_prefix": "openswarm",
+    "open_pr": false
+  },
   "workspace": {
     "_doc": "prepare maps a repo absolute path or basename to a command run in its worktree. When configured, prepare_replaces_links are installed locally instead of symlinked from the base checkout.",
     "prepare": {},
