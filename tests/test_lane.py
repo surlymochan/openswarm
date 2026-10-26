@@ -41,7 +41,7 @@ class LaneTests(unittest.TestCase):
                 pass
         self.tmp.cleanup()
 
-    def set_config(self, backend=None, model=None):
+    def set_config(self, backend=None, model=None, fallback_models=None):
         if backend:
             self.backend = backend
         fixture = {"codex": "fake_app_server.py", "cursor": "fake_cursor_acp.py", "pi": "fake_pi_rpc.py"}[self.backend]
@@ -51,6 +51,7 @@ class LaneTests(unittest.TestCase):
         (self.data / "lanes").mkdir(parents=True, exist_ok=True)
         (self.data / "lanes.json").write_text(json.dumps({"lanes": [{
             "name": self.lane_name, "backend": self.backend, "model": model,
+            **({"fallback_models": fallback_models} if fallback_models is not None else {}),
             **({"effort": "xhigh"} if self.backend == "codex" else
                ({"provider": "fake-provider"} if self.backend == "pi" else {})),
             "repo": str(self.repo), "binary": str(binary),
@@ -132,6 +133,21 @@ class LaneTests(unittest.TestCase):
         self.assertTrue(result["commit"])
         self.assertEqual(result["branch"], f"openswarm/{run_id}")
         self.assertEqual(self.git("show", f"openswarm/{run_id}:lane_result.txt"), "completed")
+
+    def test_codex_retries_model_unavailable_turn_with_lane_fallback(self):
+        self.set_config(model="fake-model", fallback_models=["gpt-6-luna"])
+        self.env["FAKE_APP_SERVER_OVERLOAD_MODEL"] = "fake-model"
+        self.start_lane()
+        run_id = self.assign("retry the overloaded turn")
+        self.assertEqual(self.wait_run(run_id)["status"], "done")
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual(result["model"], "gpt-6-luna")
+        self.assertEqual([attempt["model"] for attempt in result["attempts"]], ["fake-model", "gpt-6-luna"])
+        self.assertEqual([attempt["error_class"] for attempt in result["attempts"]], ["model_unavailable", None])
+        self.assertTrue((self.data / "lanes" / self.lane_name / "wt" / "lane_partial.txt").exists())
+        self.assertTrue((self.data / "runs" / run_id / "events.2.codex.jsonl").exists())
+        self.assertIn("Selected model is at capacity", result["attempts"][0]["error_tail"])
+        self.assertIn("codex/fake-model", json.loads((self.data / "breakers.json").read_text()))
 
     def cursor_log(self):
         path = pathlib.Path(self.env["FAKE_CURSOR_ACP_LOG"])

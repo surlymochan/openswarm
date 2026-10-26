@@ -55,6 +55,15 @@ class FleetTests(unittest.TestCase):
             xs.cmd_fleet(argparse.Namespace(fleet_cmd="status", json=False))
         transport.assert_not_called()
 
+    def test_text_status_uses_reachable_snapshot_without_lanes(self):
+        self.config([{"name": "box", "kind": "instabox", "box": "task-box"}])
+        output = io.StringIO()
+        with mock.patch.object(xs, "sh", return_value=(0, "task-box  Running\n", "")), \
+                mock.patch.object(xs, "host_run", return_value=(0, b'{"lanes": [], "active_runs": []}', b"")), \
+                contextlib.redirect_stdout(output):
+            xs.cmd_fleet(argparse.Namespace(fleet_cmd="status", json=False))
+        self.assertEqual(output.getvalue(), "box  reachable  lanes=0 active=0\n")
+
     def test_transport_argv_binary_input_and_timeout(self):
         for host, prefix in [({"kind": "ssh", "ssh": "alias"}, ["ssh", "alias", "--"]),
                              ({"kind": "instabox", "box": "task-box"}, ["instabox", "ssh", "task-box", "--"])]:

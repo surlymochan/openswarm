@@ -86,6 +86,17 @@ class FakeFleetFixture:
 
 
 class BatchTests(FakeFleetFixture, unittest.TestCase):
+    def test_markdown_summary_preserves_zero_numeric_cells(self):
+        summary = {"id": "zeros", "state": "finished", "cards": [{
+            "card": "zero.md", "host": "b1", "status": "done", "verify_rc": 0,
+            "branch": "branch", "commit": "commit", "seconds": 0, "summary": "ok",
+        }]}
+        directory = self.data / "batches" / "zeros"
+        directory.mkdir(parents=True)
+        xs.batch_save(summary)
+        markdown = (directory / "summary.md").read_text()
+        self.assertIn("| zero.md | b1 | done | 0 | branch | commit | 0 | ok |", markdown)
+
     def test_distribution_queueing_bundle_fetch_failure_and_summaries(self):
         for i, text in enumerate(("card zero", "FAIL card one", "card two", "card three", "card four")):
             (self.cards / f"{i}.md").write_text(text)

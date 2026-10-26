@@ -877,7 +877,7 @@ TASK:
 
 """ + REPORT_INSTRUCTION
 
-MODEL_UNAVAILABLE_RE = re.compile(r"(at capacity|try a different model|model is not supported|not supported when using|model .{0,40}not (found|available))", re.I)
+MODEL_UNAVAILABLE_RE = re.compile(r"(at capacity|server.?overloaded|overloaded|try a different model|model is not supported|not supported when using|model .{0,40}not (found|available))", re.I)
 OPENCODE_ABORT_RE = re.compile(r"stream error.*(usage limit exceeded|insufficient balance|quota exceeded|rate.?limit)", re.I)
 RATE_LIMIT_RE = re.compile(r"(\b429\b|rate.?limit|usage limit|quota|too many requests|insufficient balance|spend.?control)", re.I)
 
@@ -1641,6 +1641,11 @@ def lane_config():
             lane["model"] = "composer-2.5"
         if not isinstance(lane.get("model"), str) or not lane["model"].strip():
             raise ValueError(f"invalid lane config {where}: model is required")
+        fallback_models = lane.get("fallback_models")
+        if fallback_models is not None and (not isinstance(fallback_models, list) or
+                                            any(not isinstance(model, str) or not model.strip()
+                                                for model in fallback_models)):
+            raise ValueError(f"invalid lane config {where}: fallback_models must be a list of non-empty strings")
         if backend == "codex" and (not isinstance(lane.get("effort"), str) or not lane["effort"].strip()):
             raise ValueError(f"invalid lane config {where}: codex effort is required")
         if backend == "codex" and lane["effort"] not in (load_policy().get("efforts") or []):
@@ -2174,13 +2179,15 @@ def lane_approval_response(child, msg, event_file):
     return True
 
 
-def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending):
-    event_file = spec.get("_event_file") or os.path.join(rdir, f"events.1.{lane['backend']}.jsonl")
+def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, attempt=1):
+    event_file = (spec.get("_event_file") if attempt == 1 else None) or \
+                 os.path.join(rdir, f"events.{attempt}.{lane['backend']}.jsonl")
+    spec["_event_file"] = event_file
     if not os.path.exists(event_file):
         open(event_file, "w").close()
     deadline = spec["started"] + max(0, float(spec["budget_minutes"] or 0)) * 60
     set_status(rdir, state="running", lane=lane["name"], backend=lane["backend"], model=lane["model"],
-               effort=lane.get("effort"), workspace=ws["path"], events=event_file, attempt=1, deadline=deadline,
+               effort=lane.get("effort"), workspace=ws["path"], events=event_file, attempt=attempt, deadline=deadline,
                executor_pid=child.proc.pid)
     lane_record_event(event_file, {"type": "lane_start", "lane": lane["name"]})
     lane_begin_turn(lane, child, prompt, ws["path"], event_file, turn)
@@ -2220,18 +2227,18 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending):
         if budget_hit and abort_deadline and now >= abort_deadline:
             lane_record_event(event_file, {"type": "error", "error": "executor did not stop within 30s after interrupt"})
             child.close()
-            return None, usage, "budget_exceeded", 124, event_file
+            return None, usage, "budget_exceeded", 124, event_file, "executor did not stop within 30s after interrupt"
         if spec.get("abort_requested") and not budget_hit and abort_deadline and now >= abort_deadline:
             lane_record_event(event_file, {"type": "error", "error": "executor did not stop within 30s after abort"})
             child.close()
-            return None, usage, "stopped", 130, event_file
+            return None, usage, "stopped", 130, event_file, "executor did not stop within 30s after abort"
         msg = child.next_event(0.15)
         if msg is False:
             if not child.alive():
-                return None, usage, "exec_error", 1, event_file
+                return None, usage, "exec_error", 1, event_file, "resident executor process exited"
             continue
         if msg is None:
-            return None, usage, "exec_error", 1, event_file
+            return None, usage, "exec_error", 1, event_file, "resident executor stdout closed"
         if lane["backend"] == "codex":
             if "method" in msg and "id" in msg:
                 if lane_approval_response(child, msg, event_file):
@@ -2303,29 +2310,30 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending):
                     final = extract_json("".join(turn.get("cursor_text") or [])) or final
                     ended = True
         if not child.alive() and not ended:
-            return None, usage, "exec_error", 1, event_file
+            return None, usage, "exec_error", 1, event_file, "resident executor process exited"
     if spec.get("abort_requested"):
-        return final, usage, "stopped", 130, event_file
+        return final, usage, "stopped", 130, event_file, None
     if budget_hit:
-        return final, usage, "budget_exceeded", 124, event_file
+        return final, usage, "budget_exceeded", 124, event_file, None
     if errors:
-        return final, usage, "exec_error", 1, event_file
+        return final, usage, "exec_error", 1, event_file, errors[-1]
     if final is None:
         # The turn ended normally (cursor end_turn / codex turn completed / pi agent_end) but no JSON
         # report was printed. The work may still be committed, so this is not an execution failure.
-        return final, usage, "no_report", 1, event_file
-    return final, usage, None, 0, event_file
+        return final, usage, "no_report", 1, event_file, None
+    return final, usage, None, 0, event_file, None
 
 
-def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file):
+def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file, attempts=None):
     rid, rdir = spec["run_id"], os.path.join(RUNS, spec["run_id"])
     title = spec.get("title") or spec["task"].strip().splitlines()[0][:72]
     stopped = bool(spec.get("stop_requested"))
     budget_hit = error_class == "budget_exceeded"
     model = lane.get("resolved_model", lane["model"])
-    attempts = [{"backend": lane["backend"], "model": model, "effort": lane.get("effort"), "rc": rc,
-                 "seconds": round(NOW() - spec["started"], 3), "error_class": error_class,
-                 "meta": {"usage": usage}, "events": event_file, "error_tail": None}]
+    if attempts is None:
+        attempts = [{"backend": lane["backend"], "model": model, "effort": lane.get("effort"), "rc": rc,
+                     "seconds": round(NOW() - spec["started"], 3), "error_class": error_class,
+                     "meta": {"usage": usage}, "events": event_file, "error_tail": None}]
     set_status(rdir, state="finalizing")
     changed = bool(git(["status", "--porcelain"], ws["root"])[1].strip())
     fin = finalize_workspace(ws, title, lane["backend"], rdir, keep=True)
@@ -2366,14 +2374,15 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file)
     out = {"id": rid, "status": status, "title": title, "lane": lane["name"], "verify": verify,
            "verify_note": verify_note, "backend": lane["backend"], "model": model, "effort": lane.get("effort"),
            **({"resolved_model": model} if lane["backend"] == "cursor" else {}),
-           "usage": usage, "seconds": attempts[0]["seconds"], "result": final, "workspace":
+           "usage": usage, "seconds": round(sum(attempt["seconds"] for attempt in attempts), 3), "result": final, "workspace":
            {k: v for k, v in ws.items() if k in ("mode", "path", "repo", "base", "note", "lane")},
            **fin, "attempts": attempts, "run_dir": rdir}
     jsave(os.path.join(rdir, "result.json"), out)
     set_status(rdir, state="finished", status=status, finished=NOW(), commit=fin.get("commit"), lane=lane["name"])
     append_ledger({"id": rid, "ts": NOW(), "title": title, "status": status, "lane": lane["name"],
                    "backend": lane["backend"], "model": model, "effort": lane.get("effort"),
-                   "attempts": attempts, "error_class": error_class, "seconds": attempts[0]["seconds"],
+                   "attempts": attempts, "error_class": error_class,
+                   "seconds": round(sum(attempt["seconds"] for attempt in attempts), 3),
                    "usage": usage, "commit": fin.get("commit"),
                    "files": len((final or {}).get("files_changed") or [])})
     return out
@@ -2399,8 +2408,32 @@ def lane_do_run(lane, spec, child, server, current):
             prompt += (f"\nAfter you finish, the planner runs this acceptance command on the host, outside your sandbox: "
                        f"`{spec['verify']}`. If your sandbox blocks running it (ports, network, missing deps), say so in "
                        "`tests` instead of treating it as a code failure.\n")
-        final, usage, error_class, rc, evp = lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending)
-        out = lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, evp)
+        models = []
+        for model in [lane["model"], *(lane.get("fallback_models") or [])]:
+            if model not in models:
+                models.append(model)
+        allow_fallback = len(models) > 1
+        attempts = []
+        final, usage, error_class, rc, evp, error_tail = None, {}, "exec_error", 1, None, None
+        attempt_lane = lane
+        for number, model in enumerate(models, 1):
+            attempt_lane = dict(lane, model=model)
+            turn, pending = {}, []
+            started = NOW()
+            final, usage, error_class, rc, evp, error_tail = lane_run_turn(
+                attempt_lane, child, spec, prompt, ws, rdir, server, turn, pending, attempt=number)
+            if allow_fallback and error_class == "exec_error" and MODEL_UNAVAILABLE_RE.search(error_tail or ""):
+                error_class = "model_unavailable"
+            attempts.append({"backend": attempt_lane["backend"], "model": model, "effort": attempt_lane.get("effort"),
+                             "rc": rc, "seconds": round(NOW() - started, 3), "error_class": error_class,
+                             "meta": {"usage": usage}, "events": evp, "error_tail": error_tail})
+            if error_class != "model_unavailable":
+                break
+            trip_breaker(f"{attempt_lane['backend']}/{model}", load_policy(), error_tail or "model unavailable")
+            if number == len(models) or spec.get("abort_requested"):
+                break
+        out = lane_finalize_run(attempt_lane, spec, ws, final, usage, error_class, rc, evp,
+                                attempts=attempts if allow_fallback else None)
         return out
     except Exception as e:
         error_class = "exec_error"
@@ -2944,7 +2977,7 @@ def batch_save(summary):
     directory = os.path.join(DATA, "batches", summary["id"])
     jsave(os.path.join(directory, "summary.json"), summary)
     def cell(value):
-        return short(value, 240).replace("|", "\\|")
+        return short(str(value), 240).replace("|", "\\|")
     lines = [f"# Batch {summary['id']}", "", f"State: {summary['state']}", "",
              "| Card | Host | Status | Verify rc | Branch | Commit | Seconds | Summary |",
              "| --- | --- | --- | --- | --- | --- | --- | --- |"]

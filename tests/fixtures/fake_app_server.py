@@ -19,6 +19,9 @@ def response(req, result=None):
 thread_id = "fake-thread"
 turn_id = "fake-turn"
 cwd = os.getcwd()
+model = None
+overload_model = os.environ.get("FAKE_APP_SERVER_OVERLOAD_MODEL")
+overload_used = False
 
 for line in sys.stdin:
     try:
@@ -34,6 +37,7 @@ for line in sys.stdin:
         continue
     elif method == "thread/start":
         cwd = params.get("cwd", cwd)
+        model = params.get("model")
         send({"jsonrpc": "2.0", "method": "fixture/unrelated", "params": {"before": method}})
         response(req, {"thread": {"id": thread_id}, "model": params.get("model")})
     elif method == "turn/start":
@@ -42,6 +46,15 @@ for line in sys.stdin:
             os._exit(17)
         send({"jsonrpc": "2.0", "method": "fixture/unrelated", "params": {"before": method}})
         response(req, {"turn": {"id": turn_id, "status": "inProgress"}})
+        if overload_model == model and not overload_used:
+            overload_used = True
+            with open(os.path.join(cwd, "lane_partial.txt"), "w") as f:
+                f.write("kept after overload")
+            send({"jsonrpc": "2.0", "method": "turn/failed", "params": {
+                "threadId": thread_id, "turn": {"id": turn_id},
+                "error": {"message": "Selected model is at capacity",
+                          "data": {"codexErrorInfo": "serverOverloaded"}}}})
+            continue
         send({"jsonrpc": "2.0", "method": "item/started", "params": {
             "threadId": thread_id, "turnId": turn_id,
             "item": {"id": "fake-command", "type": "commandExecution", "command": "python fake task"}}})
