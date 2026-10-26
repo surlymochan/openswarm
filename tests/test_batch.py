@@ -86,6 +86,17 @@ class FakeFleetFixture:
 
 
 class BatchTests(FakeFleetFixture, unittest.TestCase):
+    def test_budget_refuses_batch_before_launch(self):
+        (self.cards / "one.md").write_text("one")
+        policy = xs.deep_merge(xs.load_policy(), {"budget": {"daily_executor_minutes": 0}})
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), mock.patch.object(xs, "execute_batch") as execute, \
+                self.assertRaises(SystemExit) as e:
+            xs.cmd_batch(self.args(), policy)
+        self.assertEqual(e.exception.code, 3)
+        self.assertEqual(json.loads(output.getvalue())["error"], "budget_exceeded_daily")
+        execute.assert_not_called()
+
     def test_markdown_summary_preserves_zero_numeric_cells(self):
         summary = {"id": "zeros", "state": "finished", "cards": [{
             "card": "zero.md", "host": "b1", "status": "done", "verify_rc": 0,

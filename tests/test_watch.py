@@ -69,6 +69,7 @@ class WatchTests(unittest.TestCase):
                 {"type": "message_end", "message": {"role": "assistant", "content": [
                     {"type": "text", "text": "last message " + "x" * 250}]}},
                 {"type": "tool_execution_start", "args": {"command": "git push"}},
+                {"type": "risk_blocked", "risk": "secret print", "command": "echo [redacted]"},
                 {"type": "error", "error": "expected test error"}]) + "\n")
             xs.jsave(str(rdir / "status.json"), {"state": "running", "backend": "pi", "lane": "L1",
                                                 "events": str(events), "started": xs.NOW() - 120})
@@ -80,6 +81,7 @@ class WatchTests(unittest.TestCase):
                 xs.cmd_watch(args, {})
             lines = output.getvalue().splitlines()
             self.assertTrue(any("RISK[" in line for line in lines))
+            self.assertTrue(any("RISK[secret print]" in line and "(blocked)" in line for line in lines))
             self.assertTrue(any("ERROR:" in line for line in lines))
             beat = next(line for line in lines if "HEARTBEAT:" in line)
             self.assertIn("2m/", beat)

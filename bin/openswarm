@@ -26,6 +26,9 @@ import argparse
 import base64
 import datetime as dt
 import glob
+import fnmatch
+import fcntl
+import html
 import json
 import math
 import os
@@ -45,6 +48,7 @@ import traceback
 import urllib.request
 import uuid
 import queue
+from zoneinfo import ZoneInfo
 
 HOME = os.path.expanduser("~")
 
@@ -574,6 +578,119 @@ def recent_ledger(n=50):
 
 # ---------------------------------------------------------------- routing
 
+def ledger_entries():
+    try:
+        with open(LEDGER) as stream:
+            for line in stream:
+                try:
+                    entry = json.loads(line)
+                    if isinstance(entry, dict):
+                        yield entry
+                except ValueError:
+                    continue
+    except FileNotFoundError:
+        return
+
+
+def policy_day(policy, date=None):
+    name = (policy.get("budget") or {}).get("timezone") or policy.get("timezone")
+    tz = ZoneInfo(name) if name else None
+    now = dt.datetime.fromtimestamp(NOW(), tz).astimezone(tz)
+    day = dt.date.fromisoformat(date) if date else now.date()
+    start = dt.datetime.combine(day, dt.time(), tz).astimezone(tz)
+    end = dt.datetime.combine(day + dt.timedelta(days=1), dt.time(), tz).astimezone(tz)
+    return day.isoformat(), name or str(now.tzinfo), start.timestamp(), end.timestamp()
+
+
+def executor_seconds(entry):
+    attempts = entry.get("attempts") or []
+    if attempts:
+        return [(a.get("backend") or entry.get("backend") or "unknown", max(0, a.get("seconds") or 0))
+                for a in attempts]
+    return [(entry.get("backend") or "unknown", max(0, entry.get("seconds") or 0))]
+
+
+def budget_status(policy, date=None, entries=None):
+    day, timezone, start, end = policy_day(policy, date)
+    cfg = policy.get("budget") or {}
+    used = {}
+    for entry in entries if entries is not None else ledger_entries():
+        if start <= (to_epoch(entry.get("ts")) or 0) < end:
+            for backend, seconds in executor_seconds(entry):
+                used[backend] = used.get(backend, 0) + seconds / 60
+    caps = cfg.get("per_backend") or {}
+    backends = sorted(set(EXECUTORS) | set(used) | set(caps))
+    return {"date": day, "timezone": timezone, "used_minutes": sum(used.values()),
+            "cap_minutes": cfg.get("daily_executor_minutes"),
+            "per_run_max_minutes": cfg.get("per_run_max_minutes"),
+            "per_backend": {b: {"used_minutes": used.get(b, 0), "cap_minutes": caps.get(b)} for b in backends}}
+
+
+class BudgetExceeded(Exception):
+    def __init__(self, detail):
+        self.detail = {"ok": False, "error": "budget_exceeded_daily", **detail}
+
+
+def check_budget(policy, requests, exclude_id=None):
+    cfg = policy.get("budget") or {}
+    for backend, minutes in requests:
+        if not math.isfinite(minutes) or minutes < 0:
+            raise ValueError("budget-minutes must be finite and non-negative")
+        cap = cfg.get("per_run_max_minutes")
+        if cap is not None and minutes > cap:
+            raise BudgetExceeded({"scope": "per_run", "backend": backend, "requested_minutes": minutes, "cap_minutes": cap})
+    if cfg.get("daily_executor_minutes") is None and not cfg.get("per_backend"):
+        return
+    snapshot = budget_status(policy)
+    reserved = {}
+    completed = {e.get("id") for e in ledger_entries()}
+    for path in glob.glob(os.path.join(RUNS, "*", "status.json")):
+        s = jload(path, {}) or {}
+        if s.get("id") == exclude_id or s.get("id") in completed:
+            continue
+        if s.get("state") not in ("queued", "routing", "running", "finalizing", "verifying") or not pid_alive(s.get("runner_pid")):
+            continue
+        for b, minutes in s.get("budget_requests") or [(s.get("backend") or "unknown", s.get("budget_minutes") or 0)]:
+            reserved[b] = reserved.get(b, 0) + minutes
+    requested = {}
+    for backend, minutes in requests:
+        requested[backend] = requested.get(backend, 0) + minutes
+    cap = snapshot["cap_minutes"]
+    if cap is not None and snapshot["used_minutes"] + sum(reserved.values()) + sum(requested.values()) > cap:
+        raise BudgetExceeded({"scope": "daily", "used_minutes": snapshot["used_minutes"],
+                              "reserved_minutes": sum(reserved.values()), "requested_minutes": sum(requested.values()), "cap_minutes": cap})
+    for b, minutes in requested.items():
+        row = snapshot["per_backend"].get(b, {})
+        cap = row.get("cap_minutes")
+        if cap is not None and row["used_minutes"] + reserved.get(b, 0) + minutes > cap:
+            raise BudgetExceeded({"scope": "backend", "backend": b, "used_minutes": row["used_minutes"],
+                                  "reserved_minutes": reserved.get(b, 0), "requested_minutes": minutes, "cap_minutes": cap})
+
+
+def admit_budget(policy, backend, minutes, rdir, **status):
+    os.makedirs(DATA, exist_ok=True)
+    requests = status.pop("budget_requests", [(backend, minutes)])
+    with open(os.path.join(DATA, "budget.lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        check_budget(policy, requests, exclude_id=status["id"])
+        set_status(rdir, backend=backend, budget_minutes=minutes, budget_requests=requests, **status)
+
+
+def budget_error(error):
+    print(json.dumps(error.detail, ensure_ascii=False))
+    raise SystemExit(3)
+
+
+def cmd_budget(args, policy):
+    result = budget_status(policy)
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return
+    cap = lambda value: "unlimited" if value is None else str(value)
+    print(f"Budget {result['date']} ({result['timezone']}): {result['used_minutes']:.2f} / {cap(result['cap_minutes'])} minutes")
+    for backend, row in result["per_backend"].items():
+        print(f"  {backend}: {row['used_minutes']:.2f} / {cap(row['cap_minutes'])} minutes")
+
 def shift_effort(effort, delta, policy):
     order = policy["efforts"]
     i = order.index(effort) if effort in order else 2
@@ -917,6 +1034,151 @@ def kill_tree(pid, grace=3):
                 return
 
 
+ENFORCED_RISKS = ["push", "publish", "secret print", "rm outside worktree", "sudo"]
+
+
+def event_commands(event):
+    """Extract shell inputs, never assistant prose, from all supported event protocols."""
+    kind, text = summarize_event(event)
+    commands = [text] if kind == "cmd" and text else []
+    method = event.get("method") or ""
+    if method == "session/request_permission":
+        payload = (event.get("params") or {}).get("toolCall") or {}
+    elif method == "session/update":
+        payload = (event.get("params") or {}).get("update") or {}
+        if payload.get("sessionUpdate") not in ("tool_call", "tool_call_update"):
+            return commands
+    elif method in ("item/commandExecution/requestApproval", "execCommandApproval"):
+        payload = event.get("params") or {}
+    elif event.get("type") in ("tool_call", "tool_use"):
+        payload = event
+    elif event.get("type") == "assistant":
+        payload = [b for b in (event.get("message") or {}).get("content") or []
+                   if isinstance(b, dict) and b.get("type") in ("tool_use", "tool_call")]
+    else:
+        return commands
+
+    def visit(value):
+        if isinstance(value, list):
+            for item in value:
+                visit(item)
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                if key in ("command", "cmd"):
+                    if isinstance(item, str):
+                        commands.append(item)
+                    elif isinstance(item, list):
+                        commands.append(shlex.join(str(x) for x in item))
+                elif isinstance(item, (dict, list)):
+                    visit(item)
+                elif key in ("arguments", "rawInput", "input", "args") and isinstance(item, str):
+                    try:
+                        visit(json.loads(item))
+                    except ValueError:
+                        commands.append(item)
+            if value.get("title"):
+                commands.append(str(value["title"]))
+    visit(payload)
+    return list(dict.fromkeys(commands))
+
+
+def shell_invocations(command, cwd, depth=0):
+    """Identify command positions and shell -c bodies; quoted prose stays an operand."""
+    if depth > 16:
+        return
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()<>\n")
+        lexer.whitespace = " \t\r"
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return
+    segments, segment = [], []
+    for token in tokens + [";"]:
+        if token and all(c in ";&|()\n" for c in token):
+            if segment:
+                segments.append(segment)
+            segment = []
+        else:
+            segment.append(token)
+    for words in segments:
+        while words and (re.match(r"^[A-Za-z_]\w*=", words[0]) or words[0] in ("env", "command", "exec", "nohup", "!")):
+            words = words[1:]
+        if not words:
+            continue
+        op = os.path.basename(words[0])
+        yield words, cwd
+        if op == "cd":
+            dest = words[1] if len(words) > 1 else HOME
+            cwd = os.path.realpath(os.path.join(cwd, os.path.expandvars(os.path.expanduser(dest))))
+        if op in ("sh", "bash", "zsh", "dash", "ksh", "fish"):
+            for i, word in enumerate(words[1:], 1):
+                if (word == "--command" or re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", word)) and i + 1 < len(words):
+                    yield from shell_invocations(words[i + 1], cwd, depth + 1)
+                    break
+
+
+def rm_outside_worktree(command, worktree):
+    root = os.path.realpath(worktree)
+    for words, cwd in shell_invocations(command, root):
+        if os.path.basename(words[0]) != "rm":
+            continue
+        operands = iter(words[1:])
+        options = True
+        for target in operands:
+            if target in (">", ">>", "<", "<<", "2>", "2>>"):
+                next(operands, None)
+                continue
+            if target == "--" and options:
+                options = False
+                continue
+            if options and target.startswith("-"):
+                continue
+            target = os.path.expandvars(os.path.expanduser(target))
+            path = os.path.realpath(os.path.join(cwd, target))
+            if "$" in target or os.path.commonpath([root, path]) != root:
+                return True
+    return False
+
+
+def redact_command(command):
+    # Keep the operation recognizable without retaining arbitrary operands, URLs or literal secrets.
+    safe = {"git", "push", "npm", "pnpm", "yarn", "publish", "twine", "upload", "gh", "release", "pr", "merge",
+            "sudo", "rm", "cd", "echo", "printf", "printenv", "cat", "head", "tail", "bash", "sh",
+            "&&", "||", ";", "|", "-r", "-rf", "-fr", "-f", "--force", "--", "-c", "-lc"}
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return "[redacted command]"
+    return " ".join(token if token in safe else "[redacted]" for token in tokens)[:500]
+
+
+def enforced_risk(event, policy, worktree):
+    enforced = (policy.get("risk") or {}).get("enforce", ENFORCED_RISKS)
+    aliases = {"git destructive/push": "push", "publish/release": "publish",
+               "possible secret print": "secret print", "rm -r outside worktree": "rm outside worktree",
+               "system service / sudo": "sudo"}
+    enabled = {aliases.get(name, name).replace("_", " ") for name in enforced}
+    rules = [(r"\bgit\s+(?:(?:-C|-c|--git-dir|--work-tree)\s+\S+\s+|--[\w-]+=\S+\s+|--[\w-]+\s+)*push\b", "push"),
+             (r"\b(npm|pnpm|yarn)\b[^;&|\n]*\bpublish\b|\btwine\s+upload\b|\bgh\s+(release|pr\s+merge)\b", "publish"),
+             (DEFAULT_RISKS[3][0] + r"|\b(cat|less|more|head|tail|bat)\s+(?:[^|;&]*[/\s])?\.env(?:\.[\w.-]+)?(?:\s|$)", "secret print"),
+             (r"\bsudo\b", "sudo")]
+    rules += [(rx, name) for rx, name in DEFAULT_RISKS if name not in aliases]
+    operations = {"push": {"git"}, "publish": {"npm", "pnpm", "yarn", "twine", "gh"},
+                  "secret print": {"cat", "less", "more", "head", "tail", "bat", "printenv", "echo", "printf"},
+                  "sudo": {"sudo"}}
+    for command in event_commands(event):
+        for words, _ in shell_invocations(command, worktree):
+            op = os.path.basename(words[0])
+            shell_text = " ".join(words)
+            for regex, name in rules:
+                if name in enabled and (name not in operations or op in operations[name]) and re.search(regex, shell_text, re.I):
+                    return {"risk": name, "command": redact_command(command)}
+        if "rm outside worktree" in enabled and rm_outside_worktree(command, worktree):
+            return {"risk": "rm outside worktree", "command": redact_command(command)}
+    return None
+
+
 def run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
     """Run an executor. abort_re: pattern that, once seen in stderr, means the executor will only retry
     silently (e.g. opencode on a plan usage limit) — kill it early and return 75 so the caller can fall back."""
@@ -926,11 +1188,32 @@ def run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
                              start_new_session=True)
         set_status(rdir, executor_pid=p.pid, events=out_path, attempt_started=NOW())
         end = NOW() + timeout
+        policy = load_policy()
+        offset, pending = 0, ""
         while True:
-            try:
-                return p.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
+            done = p.poll() is not None
+            with open(out_path, errors="replace") as events:
+                events.seek(offset)
+                pending += events.read()
+                offset = events.tell()
+            lines = pending.split("\n")
+            pending = lines.pop()
+            if done and pending:
+                lines.append(pending)
+                pending = ""
+            for line in lines:
+                try:
+                    event = json.loads(line)
+                    block = enforced_risk(event, policy, cwd) if isinstance(event, dict) else None
+                except ValueError:
+                    continue
+                if block:
+                    set_status(rdir, risk_blocks=[block], stop_requested=True)
+                    kill_tree(p.pid, grace=0.1)
+                    p.wait()
+                    return 133
+            if done:
+                return p.returncode
             if NOW() >= end:
                 kill_tree(p.pid)
                 try:
@@ -951,6 +1234,7 @@ def run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
                             return 75
                 except OSError:
                     pass
+            time.sleep(0.05)
 
 
 def extract_json(text):
@@ -1155,7 +1439,9 @@ def exec_pi(d, st, prompt, wd, rdir, timeout, evp):
             f.write("pi not found\n")
         return 127, None, {"usage": {k: 0 for k in PI_USAGE_KEYS}}, "pi not found"
     cfg = load_policy().get("pi") or {}
-    cmd = [binary, "-p", "--mode", "json"]
+    sessions = os.path.abspath(os.path.join(rdir, "pi-sessions"))
+    os.makedirs(sessions, exist_ok=True)
+    cmd = [binary, "-p", "--mode", "json", "--session-dir", sessions]
     if cfg.get("provider"):
         cmd += ["--provider", cfg["provider"]]
     if d.get("model"):
@@ -1411,14 +1697,38 @@ def adjust_status_for_verify(status, verify):
 
 
 JUNK = ["__pycache__/**", "*.pyc", ".DS_Store", "node_modules/**", ".pytest_cache/**", ".venv/**", "*.egg-info/**"]
+NEVER_COMMIT = ["*_????????-????-????-????-????????????.jsonl", ".pi/", ".codex/", ".cursor/",
+                "pi-session*.jsonl", "codex-session*.jsonl", "cursor-session*.jsonl",
+                "pi*.log", "codex*.log", "cursor*.log"]
+
+
+def executor_artifact(path, patterns):
+    parts = path.split("/")
+    for pattern in patterns:
+        if pattern.endswith("/"):
+            directory = pattern.rstrip("/")
+            if any(fnmatch.fnmatchcase("/".join(parts[i:j]), directory)
+                   for i in range(len(parts)) for j in range(i + 1, len(parts))):
+                return True
+        elif fnmatch.fnmatchcase(path, pattern) or fnmatch.fnmatchcase(parts[-1], pattern):
+            return True
+    return False
 
 
 def finalize_workspace(ws, title, backend, rdir, keep):
     if ws["mode"] != "worktree":
         rc, diff, _ = git(["diff", "--stat"], ws["path"]) if ws.get("repo") else (1, "", "")
-        return {"diffstat": diff.strip()}
+        return {"diffstat": diff.strip(), "excluded_files": []}
     root = ws["root"]
+    patterns = (load_policy().get("workspace") or {}).get("never_commit", NEVER_COMMIT)
+    changed = git(["diff", "HEAD", "--name-only", "-z"], root)[1].split("\0")
+    untracked = git(["ls-files", "--others", "--exclude-standard", "-z"], root)[1].split("\0")
+    excluded = sorted({p for p in changed + untracked if p and executor_artifact(p, patterns)})
+    # Excluding a path from add is insufficient if the executor already staged it.
+    if excluded:
+        git(["reset", "-q", "HEAD", "--", *excluded], root)
     git(["add", "-A", "--", "."] + [f":(exclude,glob)**/{j}" for j in JUNK]
+        + [f":(exclude,literal){p}" for p in excluded]
         + [f":(exclude){p}" for p in ws.get("linked") or []], root)
     rc, stat, _ = git(["diff", "--cached", "--stat"], root)
     commit = None
@@ -1433,6 +1743,7 @@ def finalize_workspace(ws, title, backend, rdir, keep):
     if not keep:
         cleanup_worktree(ws, commit)
     return {"branch": ws["branch"] if commit else None, "commit": commit, "diffstat": stat.strip(),
+            "excluded_files": excluded,
             "patch": f"{rdir}/diff.patch" if commit else None,
             "worktree": root if keep else None,
             "merge_hint": f"git -C {ws['repo']} merge --no-ff {ws['branch']}  # or cherry-pick {commit[:10]}" if commit else None}
@@ -1490,7 +1801,26 @@ def cmd_run(args, policy):
             f.write(task)
     title = args.title or task.strip().splitlines()[0][:72]
     prof = profile_from_args(args)
-    budget_min = args.budget_minutes or round(policy["run"]["timeout_seconds"] / 60)
+    budget_min = args.budget_minutes if args.budget_minutes is not None else policy["run"]["timeout_seconds"] / 60
+    st = get_state(policy)
+    decision = route(prof, st, policy)
+    if not decision["ok"]:
+        out = {"id": rid, "status": "unroutable", "decision": decision}
+        set_status(rdir, state="unroutable")
+        append_ledger({"id": rid, "ts": NOW(), "title": title, "status": "unroutable", "decision": decision})
+        jsave(f"{rdir}/result.json", out)
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        sys.exit(2)
+    if args.dry_run:
+        set_status(rdir, state="dry-run")
+        print(json.dumps({"id": rid, "dry_run": True, "decision": decision}, indent=2, ensure_ascii=False))
+        return
+    try:
+        admit_budget(policy, decision["backend"], budget_min, rdir, id=rid, state="queued", title=title,
+                     profile=prof, started=NOW(), runner_pid=os.getpid(), cwd=os.path.abspath(args.cwd))
+    except BudgetExceeded as error:
+        set_status(rdir, state="budget_rejected")
+        budget_error(error)
     if args.detach and not args.run_id:
         set_status(rdir, id=rid, state="queued", title=title, profile=prof, started=NOW(),
                    budget_minutes=budget_min, cwd=os.path.abspath(args.cwd))
@@ -1518,19 +1848,6 @@ def cmd_run(args, policy):
         return
     set_status(rdir, id=rid, state="routing", title=title, profile=prof, started=NOW(),
                budget_minutes=budget_min, runner_pid=os.getpid(), cwd=os.path.abspath(args.cwd))
-    st = get_state(policy)
-    decision = route(prof, st, policy)
-    if not decision["ok"]:
-        out = {"id": rid, "status": "unroutable", "decision": decision}
-        set_status(rdir, state="unroutable")
-        append_ledger({"id": rid, "ts": NOW(), "title": title, "status": "unroutable", "decision": decision})
-        jsave(f"{rdir}/result.json", out)
-        print(json.dumps(out, indent=2, ensure_ascii=False))
-        sys.exit(2)
-    if args.dry_run:
-        set_status(rdir, state="dry-run")
-        print(json.dumps({"id": rid, "dry_run": True, "decision": decision}, indent=2, ensure_ascii=False))
-        return
     ws = prepare_workspace(os.path.abspath(args.cwd), rid, not args.no_worktree, getattr(args, "base", None))
     note = ws.get("workspace_note") or workspace_note(ws.get("repo") or ws["path"])
     if note:
@@ -1552,10 +1869,10 @@ def cmd_run(args, policy):
                    **fin, "attempts": [], "claude_review": decision.get("claude_review"),
                    "decision_reasons": decision.get("reasons"), "run_dir": rdir}
             jsave(f"{rdir}/result.json", out)
-            set_status(rdir, state="finished", status="failed", error_class="prepare_failed", finished=NOW())
             append_ledger({"id": rid, "ts": NOW(), "title": title, "profile": prof, "status": "failed",
                            "backend": decision["backend"], "model": decision["model"],
                            "error_class": "prepare_failed", "seconds": prepared["seconds"]})
+            set_status(rdir, state="finished", status="failed", error_class="prepare_failed", finished=NOW())
             print(json.dumps(out, indent=2, ensure_ascii=False))
             sys.exit(1)
     if args.verify and ws["mode"] == "worktree":
@@ -1571,6 +1888,7 @@ def cmd_run(args, policy):
                    f"`{args.verify}`. If your sandbox blocks running it (ports, network, missing deps), say so in "
                    f"`tests` instead of treating it as a code failure.\n")
     attempts, tried = [], []
+    budget_denial = None
     deadline = NOW() + budget_min * 60
     result = None
     while True:
@@ -1581,11 +1899,13 @@ def cmd_run(args, policy):
         evp = f"{rdir}/events.{len(attempts) + 1}.{b}.jsonl"
         set_status(rdir, state="running", backend=b, model=decision["model"], effort=decision.get("effort"),
                    workspace=ws["path"], attempt=len(attempts) + 1, deadline=deadline)
-        timeout = max(60, int(deadline - NOW()))
+        timeout = max(0, deadline - NOW())
         rc, final, meta, err_text = EXECUTORS[b](decision, st, prompt, ws["path"], rdir, timeout, evp)
         dur = round(NOW() - t0, 3)
         err_class = None
-        if rc == 124:
+        if rc == 133:
+            err_class = "risk_blocked"
+        elif rc == 124:
             err_class = "budget_exceeded"
         elif rc != 0 and MODEL_UNAVAILABLE_RE.search(err_text or ""):
             err_class = "model_unavailable"
@@ -1610,6 +1930,14 @@ def cmd_run(args, policy):
         if not nxt["ok"]:
             result = final
             break
+        # A fallback can change backends; retain the spent reservation and check the new cap.
+        requests = [(a["backend"], a["seconds"] / 60) for a in attempts]
+        requests.append((nxt["backend"], max(0, deadline - NOW()) / 60))
+        try:
+            admit_budget(policy, nxt["backend"], budget_min, rdir, id=rid, budget_requests=requests)
+        except BudgetExceeded as error:
+            budget_denial = error.detail
+            break
         if ws["mode"] == "worktree":  # discard partial edits from the failed attempt before retrying
             git(["reset", "-q", "--hard"], ws["root"])
             git(["clean", "-qfd"], ws["root"])
@@ -1622,7 +1950,7 @@ def cmd_run(args, policy):
     fin = finalize_workspace(ws, title, decision["backend"], rdir, keep=True)
     verify = None
     prepare_error = None
-    if args.verify and (result is not None or changed):  # a budget-killed executor may still have finished the edit
+    if args.verify and not budget_denial and attempts[-1]["error_class"] != "risk_blocked" and (result is not None or changed):
         if lockfiles_changed(ws):
             prepared = run_workspace_prepare(ws["repo"], ws["root"], "before_verify")
             if prepared:
@@ -1649,7 +1977,11 @@ def cmd_run(args, policy):
     stopped = bool((jload(f"{rdir}/status.json", {}) or {}).get("stop_requested"))
     status = (result or {}).get("status") or ("stopped" if stopped else
                                               "budget_exceeded" if attempts[-1]["error_class"] == "budget_exceeded" else "failed")
-    if prepare_error:
+    if budget_denial:
+        status, verify_note = "stopped", None
+    elif attempts[-1]["error_class"] == "risk_blocked":
+        status, verify_note = "stopped", None
+    elif prepare_error:
         status, verify_note = "failed", "workspace prepare failed before verify"
     elif verify and verify["rc"] == 0 and result is None and status == "budget_exceeded":
         status, verify_note = "partial", "executor hit the budget without a final report; host verify passed"
@@ -1658,25 +1990,28 @@ def cmd_run(args, policy):
     usage = (attempts[-1].get("meta") or {}).get("usage")
     wall_seconds = round(sum(a["seconds"] for a in attempts), 3)
     out = {
-        "id": rid, "status": status, "error_class": "prepare_failed" if prepare_error else attempts[-1]["error_class"],
+        "id": rid, "status": status, "error_class": "budget_exceeded_daily" if budget_denial else "prepare_failed" if prepare_error else attempts[-1]["error_class"],
+        **({"budget_error": budget_denial, "error": "budget_exceeded_daily"} if budget_denial else {}),
         "title": title, "prepare": prepare, "workspace_note": note, "verify": verify, "verify_note": verify_note,
         "backend": decision["backend"], "model": decision["model"], "effort": decision.get("effort"),
         "usage": usage, "seconds": wall_seconds,
+        "risk_blocks": (jload(f"{rdir}/status.json", {}) or {}).get("risk_blocks", []),
         "result": result, "workspace": {k: v for k, v in ws.items() if k in ("mode", "path", "repo", "base", "note")},
         **fin, "attempts": attempts, "claude_review": decision.get("claude_review"),
         "decision_reasons": decision.get("reasons"), "run_dir": rdir,
     }
     jsave(f"{rdir}/result.json", out)
-    set_status(rdir, state="finished", status=status, finished=NOW(), commit=fin.get("commit"))
     append_ledger({"id": rid, "ts": NOW(), "title": title, "profile": prof, "status": status,
                    "backend": decision["backend"], "model": decision["model"], "effort": decision.get("effort"),
                    "tier": decision.get("tier"), "attempts": [{k: a[k] for k in a if k != "error_tail"} for a in attempts],
-                   "error_class": "prepare_failed" if prepare_error else attempts[-1]["error_class"],
+                   "error_class": out["error_class"],
                    "seconds": wall_seconds, "usage": usage,
+                   "risk_blocks": out["risk_blocks"], "summary": (result or {}).get("summary"),
                    "commit": fin.get("commit"), "files": len((result or {}).get("files_changed") or []),
                    "reasons": decision.get("reasons")})
+    set_status(rdir, state="finished", status=status, finished=NOW(), commit=fin.get("commit"))
     print(json.dumps(out, indent=2, ensure_ascii=False))
-    sys.exit(0 if status == "done" else 1)
+    sys.exit(3 if budget_denial else 0 if status == "done" else 1)
 
 
 # ---------------------------------------------------------------- resident lanes
@@ -1915,7 +2250,9 @@ class LaneChild:
             binary = envvar("PI_RPC_BIN") or lane.get("binary") or pi_bin()
             if not binary:
                 raise RuntimeError("pi binary not found; set lane binary or install Pi")
-            cmd = [binary, "--mode", "rpc", "--no-session"]
+            sessions = os.path.abspath(os.path.join(lane_root(lane["name"]), "pi-sessions"))
+            os.makedirs(sessions, exist_ok=True)
+            cmd = [binary, "--mode", "rpc", "--session-dir", sessions]
             if lane.get("provider"):
                 cmd += ["--provider", lane["provider"]]
             cmd += ["--model", lane["model"]]
@@ -2059,7 +2396,12 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                         answer = {"ok": False, "error": "invalid run id"}
                     else:
                         rdir = os.path.join(RUNS, rid)
-                        os.makedirs(rdir, exist_ok=False)
+                        budget = req.get("budget_minutes")
+                        if budget is None:
+                            budget = load_policy()["run"]["timeout_seconds"] / 60
+                        admit_budget(load_policy(), lane["backend"], float(budget), rdir, id=rid,
+                                     state="queued", started=NOW(), runner_pid=os.getpid(), lane=lane["name"])
+                        os.makedirs(rdir, exist_ok=True)
                         task = str(req.get("task") or "")
                         with open(os.path.join(rdir, "task.md"), "w") as f:
                             f.write(task)
@@ -2116,6 +2458,8 @@ def lane_control_messages(server, lane, current, child, turn, pending):
             else:
                 answer = {"ok": False, "error": "unknown lane control operation"}
             conn.sendall((json.dumps(answer, ensure_ascii=False) + "\n").encode())
+        except BudgetExceeded as e:
+            conn.sendall((json.dumps(e.detail) + "\n").encode())
         except Exception as e:
             try:
                 conn.sendall((json.dumps({"ok": False, "error": short(e, 300)}) + "\n").encode())
@@ -2310,6 +2654,7 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
     final, usage, errors = None, {}, []
     ended = False
     budget_hit = NOW() >= deadline
+    risk_policy = load_policy()
     abort_deadline = None
     if budget_hit:
         lane_abort_child(lane, child, turn)
@@ -2335,14 +2680,27 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
         if spec.get("abort_requested") and not budget_hit and abort_deadline and now >= abort_deadline:
             lane_record_event(event_file, {"type": "error", "error": "executor did not stop within 30s after abort"})
             child.close()
-            return None, usage, "stopped", 130, event_file, "executor did not stop within 30s after abort"
+            return None, usage, "risk_blocked" if spec.get("risk_blocks") else "stopped", 130, event_file, "executor did not stop within 30s after abort"
         msg = child.next_event(0.15)
         if msg is False:
             if not child.alive():
-                return None, usage, "exec_error", 1, event_file, "resident executor process exited"
+                return None, usage, "risk_blocked" if spec.get("risk_blocks") else "exec_error", 1, event_file, "resident executor process exited"
             continue
         if msg is None:
-            return None, usage, "exec_error", 1, event_file, "resident executor stdout closed"
+            return None, usage, "risk_blocked" if spec.get("risk_blocks") else "exec_error", 1, event_file, "resident executor stdout closed"
+        block = enforced_risk(msg, risk_policy, ws["path"])
+        if block:
+            spec.setdefault("risk_blocks", []).append(block)
+            spec["abort_requested"] = True
+            set_status(rdir, risk_blocks=spec["risk_blocks"])
+            lane_record_event(event_file, {"type": "risk_blocked", **block})
+            if msg.get("method") == "session/request_permission" and "id" in msg:
+                child.send({"jsonrpc": "2.0", "id": msg["id"], "result": {"outcome": {"outcome": "cancelled"}}})
+            elif "id" in msg:
+                lane_approval_response(child, msg, event_file)
+            lane_abort_child(lane, child, turn)
+            abort_deadline = abort_deadline or NOW() + 30
+            continue
         if lane["backend"] == "codex":
             if "method" in msg and "id" in msg:
                 if lane_approval_response(child, msg, event_file):
@@ -2414,7 +2772,9 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
                     final = extract_json("".join(turn.get("cursor_text") or [])) or final
                     ended = True
         if not child.alive() and not ended:
-            return None, usage, "exec_error", 1, event_file, "resident executor process exited"
+            return None, usage, "risk_blocked" if spec.get("risk_blocks") else "exec_error", 1, event_file, "resident executor process exited"
+    if spec.get("risk_blocks"):
+        return final, usage, "risk_blocked", 133, event_file, None
     if spec.get("abort_requested"):
         return final, usage, "stopped", 130, event_file, None
     if budget_hit:
@@ -2443,7 +2803,7 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
     fin = finalize_workspace(ws, title, lane["backend"], rdir, keep=True)
     verify = None
     prepare_error = None
-    if spec.get("verify") and (final is not None or changed):
+    if spec.get("verify") and error_class != "risk_blocked" and (final is not None or changed):
         if lockfiles_changed(ws):
             prepared = run_workspace_prepare(ws["repo"], ws["root"], "before_verify")
             if prepared:
@@ -2464,7 +2824,9 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
                 verify["rc_raw"], verify["rc"] = verify["rc"], 0
         else:
             verify["baseline"] = {"error": base.get("error")}
-    if prepare_error or error_class == "prepare_failed":
+    if error_class == "risk_blocked":
+        status, verify_note = "stopped", None
+    elif prepare_error or error_class == "prepare_failed":
         status, verify_note = "failed", "workspace prepare failed" if error_class == "prepare_failed" else "workspace prepare failed before verify"
         error_class = "prepare_failed"
     elif stopped:
@@ -2490,17 +2852,19 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
            "prepare": ws.get("prepare", []), "workspace_note": ws.get("workspace_note"), "verify": verify,
            "verify_note": verify_note, "backend": lane["backend"], "model": model, "effort": lane.get("effort"),
            **({"resolved_model": model} if lane["backend"] == "cursor" else {}),
+           "risk_blocks": spec.get("risk_blocks", []),
            "usage": usage, "seconds": round(sum(attempt["seconds"] for attempt in attempts), 3), "result": final, "workspace":
            {k: v for k, v in ws.items() if k in ("mode", "path", "repo", "base", "note", "lane")},
            **fin, "attempts": attempts, "run_dir": rdir}
     jsave(os.path.join(rdir, "result.json"), out)
-    set_status(rdir, state="finished", status=status, finished=NOW(), commit=fin.get("commit"), lane=lane["name"])
     append_ledger({"id": rid, "ts": NOW(), "title": title, "status": status, "lane": lane["name"],
                    "backend": lane["backend"], "model": model, "effort": lane.get("effort"),
                    "attempts": attempts, "error_class": error_class,
                    "seconds": round(sum(attempt["seconds"] for attempt in attempts), 3),
                    "usage": usage, "commit": fin.get("commit"),
+                   "risk_blocks": out["risk_blocks"], "summary": (final or {}).get("summary"),
                    "files": len((final or {}).get("files_changed") or [])})
+    set_status(rdir, state="finished", status=status, finished=NOW(), commit=fin.get("commit"), lane=lane["name"])
     return out
 
 
@@ -2567,7 +2931,7 @@ def lane_do_run(lane, spec, child, server, current):
             if number == len(models) or spec.get("abort_requested"):
                 break
         out = lane_finalize_run(attempt_lane, spec, ws, final, usage, error_class, rc, evp,
-                                attempts=attempts if allow_fallback else None)
+                                attempts=attempts)
         return out
     except Exception as e:
         error_class = "exec_error"
@@ -2820,6 +3184,10 @@ def cmd_lane_assign(args):
     if not math.isfinite(budget) or budget < 0:
         print(json.dumps({"ok": False, "error": "budget-minutes must be non-negative"}))
         sys.exit(1)
+    try:
+        check_budget(load_policy(), [(lane["backend"], budget)])
+    except BudgetExceeded as error:
+        budget_error(error)
     response = lane_call(lane["name"], {"op": "assign", "run_id": rid, "task": task, "title": title,
                                          "verify": args.verify, "verify_baseline": args.verify_baseline,
                                          "budget_minutes": budget, "base": args.base})
@@ -2829,7 +3197,7 @@ def cmd_lane_assign(args):
         print(json.dumps(response, indent=2, ensure_ascii=False))
     else:
         print(json.dumps(response, indent=2, ensure_ascii=False))
-        sys.exit(1)
+        sys.exit(3 if response.get("error") == "budget_exceeded_daily" else 1)
 
 
 def cmd_lane_simple(args):
@@ -3285,6 +3653,15 @@ def cmd_batch(args, policy):
     paths = sorted(path for path in glob.glob(os.path.join(os.path.abspath(args.cards), "*")) if os.path.isfile(path))
     if not paths:
         raise ValueError("cards directory contains no files")
+    minutes = args.budget_minutes if args.budget_minutes is not None else policy["run"]["timeout_seconds"] / 60
+    backend = args.backend
+    if not backend and (policy.get("budget") or {}).get("per_backend"):
+        decision = route({"type": "impl", "difficulty": 3}, get_state(policy), policy)
+        backend = decision.get("backend")
+    try:
+        check_budget(policy, [(backend, minutes)] * len(paths))
+    except BudgetExceeded as error:
+        budget_error(error)
     bid = new_run_id()
     spec = {"id": bid, "repo": args.repo, "repo_path": repo, "base": base, "local": local, "hosts": chosen,
             "repos": {name: host_repo(host, args.repo, local=host["kind"] == "local") for name, host in chosen.items()},
@@ -3608,6 +3985,9 @@ def cmd_watch(args, policy):
                 o = json.loads(line)
             except Exception:
                 continue
+            if o.get("type") == "risk_blocked":
+                out(f"RISK[{o.get('risk')}]", short(o.get("command"), 220) + " (blocked)")
+                continue
             for kind, text in messages.feed(o):
                 if kind == "msg":
                     last_msg = text
@@ -3724,8 +4104,158 @@ def cmd_runs(args, policy):
               f"  {r['elapsed_min']}m/{r['budget_min']}m cmds={r['cmds']}{flag}\n    {r['title']}\n    last: {r['last_msg']}")
 
 
+def token_count(usage):
+    usage = usage or {}
+    for key in ("totalTokens", "total_tokens"):
+        if isinstance(usage.get(key), (int, float)):
+            return int(usage[key])
+    total = 0
+    for aliases in (("input", "input_tokens", "inputTokens"), ("output", "output_tokens", "outputTokens"),
+                    ("reasoning",), ("cache_read", "cacheRead", "cacheReadTokens"),
+                    ("cache_write", "cacheWrite", "cacheWriteTokens")):
+        total += next((v for key in aliases if isinstance((v := usage.get(key)), (int, float))), 0)
+    return int(total)
+
+
+def daily_report(policy, date=None):
+    day, timezone, start, end = policy_day(policy, date)
+    entries = [e for e in ledger_entries() if start <= (to_epoch(e.get("ts")) or 0) < end]
+
+    def empty():
+        return {"runs": 0, "counts": dict.fromkeys(("done", "partial", "failed", "stopped"), 0),
+                "executor_minutes": 0, "tokens": 0, "risk_blocks": 0}
+
+    def add_run(stats, entry):
+        stats["runs"] += 1
+        status = entry.get("status") or "unknown"
+        stats["counts"][status] = stats["counts"].get(status, 0) + 1
+
+    totals, per_backend, per_lane, risks, rows = empty(), {}, {}, {}, []
+    for entry in entries:
+        add_run(totals, entry)
+        lane = entry.get("lane") or "one-shot"
+        lane_stats = per_lane.setdefault(lane, empty())
+        add_run(lane_stats, entry)
+        attempts = entry.get("attempts") or [{"backend": entry.get("backend"), "seconds": entry.get("seconds", 0),
+                                             "meta": {"usage": entry.get("usage")}}]
+        seen = set()
+        seconds = 0
+        for attempt in attempts:
+            backend = attempt.get("backend") or entry.get("backend") or "unknown"
+            backend_stats = per_backend.setdefault(backend, empty())
+            if backend not in seen:
+                add_run(backend_stats, entry)
+                seen.add(backend)
+            duration = max(0, attempt.get("seconds") or 0)
+            usage = (attempt.get("meta") or {}).get("usage")
+            if usage is None and attempt is attempts[-1]:
+                usage = entry.get("usage")
+            tokens = token_count(usage)
+            seconds += duration
+            for stats in (totals, lane_stats, backend_stats):
+                stats["executor_minutes"] += duration / 60
+                stats["tokens"] += tokens
+        blocks = entry.get("risk_blocks") or []
+        if not blocks and entry.get("error_class") == "risk_blocked":
+            blocks = [{"risk": "unknown"}]
+        for block in blocks:
+            name = block.get("risk") or "unknown"
+            risks[name] = risks.get(name, 0) + 1
+        for stats in (totals, lane_stats, per_backend.get(entry.get("backend"), {})):
+            if "risk_blocks" in stats:
+                stats["risk_blocks"] += len(blocks)
+        summary = entry.get("summary") or (entry.get("result") or {}).get("summary")
+        rid = str(entry.get("id") or "")
+        if not summary and re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", rid):
+            saved = jload(os.path.join(RUNS, rid, "result.json"), {}) or {}
+            summary = (saved.get("result") or {}).get("summary") or saved.get("summary")
+        rows.append({"id": rid, "backend": entry.get("backend"), "lane": lane, "status": entry.get("status"),
+                     "executor_minutes": seconds / 60, "summary": short(summary or entry.get("title"), 220)})
+    return {"date": day, "timezone": timezone, "totals": totals, "per_backend": per_backend, "per_lane": per_lane,
+            "budget": budget_status(policy, day, entries), "risks": risks,
+            "slowest_runs": sorted(rows, key=lambda r: r["executor_minutes"], reverse=True)[:10],
+            "failed_runs": [r for r in rows if r["status"] in ("failed", "budget_exceeded", "unroutable")]}
+
+
+def daily_report_html(report):
+    esc = lambda value: html.escape(str(value if value is not None else "—"))
+
+    def table(headers, rows):
+        head = "".join(f"<th scope='col'>{esc(h)}</th>" for h in headers)
+        body = "".join("<tr>" + "".join(f"<td>{esc(cell)}</td>" for cell in row) + "</tr>" for row in rows)
+        if not body:
+            body = f"<tr><td colspan='{len(headers)}'>No runs</td></tr>"
+        return f"<div class='scroll'><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
+
+    def groups(title, stats):
+        rows = [[name, s["runs"], *(s["counts"][status] for status in ("done", "partial", "failed", "stopped")),
+                 f"{s['executor_minutes']:.2f}", s["tokens"], s["risk_blocks"]] for name, s in sorted(stats.items())]
+        return f"<section><h2>{title}</h2>" + table(
+            ["Name", "Runs", "Done", "Partial", "Failed", "Stopped", "Executor min", "Tokens", "Risk blocks"], rows) + "</section>"
+
+    def runs(title, rows):
+        return f"<section><h2>{title}</h2>" + table(["Run", "Backend", "Lane", "Status", "Executor min", "Summary"],
+               [[r["id"], r["backend"], r["lane"], r["status"], f"{r['executor_minutes']:.2f}", r["summary"]] for r in rows]) + "</section>"
+
+    budget = report["budget"]
+    cap = lambda value: "unlimited" if value is None else f"{value:g}"
+    budget_rows = [["All", f"{budget['used_minutes']:.2f}", cap(budget["cap_minutes"])]]
+    budget_rows += [[name, f"{row['used_minutes']:.2f}", cap(row["cap_minutes"])]
+                    for name, row in sorted(budget["per_backend"].items())]
+    totals = report["totals"]
+    cards = [("Runs", totals["runs"]), *totals["counts"].items(),
+             ("Executor minutes", f"{totals['executor_minutes']:.2f}"), ("Tokens", totals["tokens"]),
+             ("Risk blocks", totals["risk_blocks"])]
+    cards_html = "".join(f"<div class='card'><span>{esc(label)}</span><strong>{esc(value)}</strong></div>" for label, value in cards)
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>openswarm daily report — {esc(report['date'])}</title>
+<style>
+:root{{color-scheme:light dark;--bg:#f4f6f8;--panel:#fff;--text:#16212b;--muted:#526170;--line:#d8e0e7;--accent:#176c57}}
+@media(prefers-color-scheme:dark){{:root{{--bg:#10171d;--panel:#19232c;--text:#edf3f8;--muted:#a5b6c6;--line:#34434f;--accent:#78d7b8}}}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,sans-serif}}
+main{{max-width:1250px;margin:40px auto;padding:0 24px}}h1{{font-size:30px;margin:0}}h2{{font-size:20px;margin:0 0 16px}}
+p,.card span{{color:var(--muted)}}.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px}}
+.card,section{{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px}}section{{margin-top:24px}}
+.card span,.card strong{{display:block}}.card strong{{font-size:27px;color:var(--accent);margin-top:8px}}
+.scroll{{overflow:auto}}table{{width:100%;border-collapse:collapse;text-align:left}}th,td{{padding:10px;border-bottom:1px solid var(--line);vertical-align:top}}
+th{{white-space:nowrap;color:var(--muted);font-size:13px}}td:last-child{{min-width:80px;overflow-wrap:anywhere}}
+footer{{color:var(--muted);margin-top:24px;font-size:13px}}
+</style></head><body><main><h1>openswarm · Daily report</h1>
+<p>{esc(report['date'])} · {esc(report['timezone'])} · Local ledger</p><div class="cards">{cards_html}</div>
+{groups('Runs by backend', report['per_backend'])}{groups('Runs by lane', report['per_lane'])}
+<section><h2>Budget use</h2>{table(['Backend', 'Used min', 'Daily cap min'], budget_rows)}
+<p>Per-run maximum: {esc(cap(budget['per_run_max_minutes']))} minutes. Usage is actual executor time; admission also reserves live runs' requested budgets.</p></section>
+<section><h2>Risk blocks</h2>{table(['Risk', 'Blocks'], sorted(report['risks'].items()))}</section>
+{runs('Slowest runs', report['slowest_runs'])}{runs('Failed runs', report['failed_runs'])}
+<footer>Runs belong to the local day of their ledger timestamp. Backend rows count each contributing backend once per run; fallback runs can appear in multiple rows.
+Tokens use reported usage; absent usage counts as zero. Verification time is excluded from executor minutes.</footer>
+</main></body></html>"""
+
+
+def cmd_daily_report(args, policy):
+    report = daily_report(policy, getattr(args, "date", None))
+    if getattr(args, "html", None):
+        path = os.path.abspath(args.html)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write(daily_report_html(report))
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        total = report["totals"]
+        print(f"openswarm daily {report['date']} ({report['timezone']}): {total['runs']} runs, "
+              f"{total['executor_minutes']:.2f} executor minutes, {total['tokens']} tokens, {total['risk_blocks']} risk blocks")
+        print(json.dumps(total["counts"]))
+        if getattr(args, "html", None):
+            print(f"HTML: {os.path.abspath(args.html)}")
+
+
 def cmd_report(args, policy):
     """Compact check-in: quota headroom + active runs + runs finished since --since-minutes. For scheduled reports."""
+    if any(getattr(args, key, None) for key in ("daily", "date", "html", "json")):
+        cmd_daily_report(args, policy)
+        return
     st = get_state(policy)
     c, cx, oc, ds = st["claude"], st["codex"], st["ocgo"], st["deepseek"]
     cw = worst_window((cx["limits"].get("codex") or {}).get("windows"))
@@ -3793,8 +4323,11 @@ def cmd_stop(args, policy):
 
 def append_ledger(entry):
     os.makedirs(DATA, exist_ok=True)
-    with open(LEDGER, "a") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    # Serialize completion writes with admissions so their ledger/reservation snapshot is coherent.
+    with open(os.path.join(DATA, "budget.lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with open(LEDGER, "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 # ---------------------------------------------------------------- CLI
@@ -3902,7 +4435,7 @@ def main():
                                      "its exit code overrides a sandbox-limited partial/done")
     sp.add_argument("--keep-worktree", action="store_true")
     sp.add_argument("--no-fallback", action="store_true")
-    sp.add_argument("--budget-minutes", type=int, help="hard wall-clock budget; executor is killed when exceeded")
+    sp.add_argument("--budget-minutes", type=float, help="hard wall-clock budget; executor is killed when exceeded")
     sp.add_argument("--detach", action="store_true", help="run in background; monitor with `openswarm watch <id>`")
     sp.add_argument("--run-id", help=argparse.SUPPRESS)
     sp.add_argument("--dry-run", action="store_true")
@@ -3924,6 +4457,14 @@ def main():
 
     sp = sub.add_parser("report", help="compact check-in: quotas + active runs + recently finished")
     sp.add_argument("--since-minutes", type=float, default=60)
+    sp.add_argument("--daily", action="store_true", help="report one local ledger day without live probes")
+    sp.add_argument("--date", help="daily report date (YYYY-MM-DD; policy timezone)")
+    sp.add_argument("--html", help="write a self-contained daily HTML report")
+    sp.add_argument("--json", action="store_true", help="daily report as JSON")
+
+    sp = sub.add_parser("budget", help="daily executor budget usage")
+    bp = sp.add_subparsers(dest="budget_cmd", required=True)
+    bp.add_parser("status").add_argument("--json", action="store_true")
 
     sp = sub.add_parser("stop", help="terminate a running run")
     sp.add_argument("run_id")
@@ -4021,6 +4562,8 @@ def main():
         print(json.dumps(route(profile_from_args(a), st, policy), indent=2, ensure_ascii=False))
     elif a.cmd == "run":
         cmd_run(a, policy)
+    elif a.cmd == "budget":
+        cmd_budget(a, policy)
     elif a.cmd == "watch":
         cmd_watch(a, policy)
     elif a.cmd == "runs":

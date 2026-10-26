@@ -79,10 +79,11 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id,
               "update": {"sessionUpdate": "tool_call", "toolCallId": "tool-1", "title": "Edit lane file",
                          "kind": "edit", "status": "pending"}}})
-        if "LANE_TEST_PERMISSION" in prompt:
+        if "LANE_TEST_PERMISSION" in prompt or "LANE_TEST_RISK" in prompt:
             permission = {"jsonrpc": "2.0", "id": "permission-1", "method": "session/request_permission",
                           "params": {"sessionId": session_id,
-                                     "toolCall": {"toolCallId": "tool-1", "title": "Edit lane file", "kind": "edit"},
+                                     "toolCall": {"toolCallId": "tool-1", "title": "Edit lane file", "kind": "edit",
+                                                  **({"rawInput": {"command": "git push secret-value"}} if "LANE_TEST_RISK" in prompt else {})},
                                      "options": [{"optionId": "once", "name": "Allow once", "kind": "allow_once"},
                                                  {"optionId": "always", "name": "Allow always", "kind": "allow_always"}]}}
             send(permission)
@@ -92,7 +93,11 @@ for line in sys.stdin:
                     continue
                 if reply.get("id") == permission["id"]:
                     record({"permission_response": reply})
+                    denied = (reply.get("result") or {}).get("outcome", {}).get("outcome") == "cancelled"
                     break
+            if denied:
+                response(request, {"stopReason": "cancelled"})
+                continue
         if "LANE_TEST_WAIT" in prompt:
             while True:
                 message = read_message(0.2)

@@ -389,6 +389,35 @@ Prompts and diffs go to the executor's model provider. Each backend's data bound
 - If a worktree can't be created, the run fails. It never falls back to editing your checkout in place.
 - Codex `ultra` effort is never used, because it self-delegates and blows budgets.
 
+## Executor guardrails
+
+Executor sessions stay outside worktrees: Pi uses each run's `pi-sessions/` or
+`$OPENSWARM_HOME/lanes/<name>/pi-sessions/`. `workspace.never_commit` overrides the
+default executor session/log exclusions (Pi, Codex, Cursor); excluded changed files
+are listed in `result.json` as `excluded_files`, including files staged by an executor.
+
+Daily guardrails: set `budget.daily_executor_minutes`, optional `budget.per_backend`
+(backend → minutes), `budget.per_run_max_minutes`, and `budget.timezone` (IANA name;
+defaults to the local timezone) in policy. Caps are optional. `openswarm budget status --json`
+shows today's ledger usage. Admission reserves requested minutes for live runs; runs,
+lane assignments and batches refuse excess work with `budget_exceeded_daily` (exit 3).
+Budgets apply to the ledger on each host; remote runs also check that host's policy.
+
+`risk.enforce` defaults to `["push", "publish", "secret print", "rm outside worktree", "sudo"]`.
+The runner stops one-shot executors or aborts lane turns on matching command events,
+without requiring `watch`. Results include `status: stopped`, `error_class: risk_blocked`
+and `risk_blocks` with redacted commands. An empty list disables enforcement.
+This is event-based containment: backends that emit commands after execution cannot
+prevent the command's initial side effects. Executor sandbox restrictions still matter.
+
+`openswarm report --daily --date YYYY-MM-DD --html report.html --json` writes one
+self-contained HTML page with light/dark styling and emits the same day's JSON.
+Omit `--date` for today in the policy timezone. Reports read local ledger data without
+probing providers: backend/lane outcomes, executor minutes, reported tokens, budgets,
+risk blocks, slowest runs and failed-run summaries. Fallback usage is attributed to
+each backend; a run can therefore appear in more than one backend row. Missing token
+usage counts as zero; verification time is excluded from executor minutes.
+
 ## Status and limitations
 
 - Developed and used on macOS; Linux is covered by CI; Windows is untested.

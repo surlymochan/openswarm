@@ -144,6 +144,10 @@ The user gets updates, not a stream. Relay progress in one line per meaningful e
 
 ## 3. Scheduled reporting, never endless
 
+Use `openswarm report --daily [--date YYYY-MM-DD] --html report.html --json` for a
+local, self-contained daily report (policy timezone). It includes backend/lane outcomes,
+executor minutes/tokens, budget use, risk blocks, slowest runs and failed summaries.
+
 - Every run has a hard `--budget-minutes`. Every watch has `--max-minutes`. Nothing runs open-ended.
 - For multi-hour batches, check in on a schedule instead of polling. Use **ScheduleWakeup** (inside `/loop`) or a cron-style scheduled task that runs:
   ```bash
@@ -153,6 +157,15 @@ The user gets updates, not a stream. Relay progress in one line per meaningful e
 - `$XS runs [--active] [--json]` gives a per-run snapshot. `$XS ledger` shows history.
 
 ## 4. Results and integration
+
+Pi sessions are stored outside the worktree. Check `result.excluded_files` when reviewing;
+`workspace.never_commit` controls executor session/log exclusions for every backend.
+Check `openswarm budget status --json` before dispatch; policy `budget` sets daily,
+per-backend and per-run minute caps. An exit 3 / `budget_exceeded_daily` means defer
+or reduce the task budget. Timezone is `budget.timezone` (local by default).
+`risk.enforce` stops matching executor commands automatically (default: push, publish,
+secret print, rm outside worktree, sudo). Review redacted `risk_blocks` for stopped runs;
+post-execution command events cannot prevent initial side effects.
 
 A finished run gives you `status`, `result` (`summary`, `files_changed`, `tests`, `followups`), `branch` (`openswarm/<id>`), `commit`, `diffstat`, `patch`, and `attempts` (backend, model, effort, seconds, error class, quota before and after).
 - The executor worked in `~/.claude/openswarm/worktrees/...` based on `HEAD`. **Uncommitted changes in the main tree are not visible to it**, and `workspace.note` warns about this. Commit or stash before dispatching.

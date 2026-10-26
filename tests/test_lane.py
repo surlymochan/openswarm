@@ -134,6 +134,46 @@ class LaneTests(unittest.TestCase):
         self.assertEqual(result["branch"], f"openswarm/{run_id}")
         self.assertEqual(self.git("show", f"openswarm/{run_id}:lane_result.txt"), "completed")
 
+    def test_pi_session_leak_is_excluded_even_when_staged(self):
+        self.set_config("pi")
+        self.start_lane()
+        run_id = self.assign("LANE_TEST_SESSION_LEAK")
+        self.assertEqual(self.wait_run(run_id)["status"], "done")
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        artifact = "2026-10-26T10-17-04-024Z_12345678-1234-1234-1234-123456789abc.jsonl"
+        self.assertEqual(result["excluded_files"], [artifact])
+        self.assertNotIn(artifact, self.git("ls-tree", "-r", "--name-only", result["commit"]))
+        self.assertTrue((self.data / "lanes" / self.lane_name / "pi-sessions").is_dir())
+
+    def test_budget_refuses_lane_assignment(self):
+        self.set_config("pi")
+        (self.data / "policy.local.json").write_text(json.dumps({"budget": {"daily_executor_minutes": 0}}))
+        self.start_lane()
+        response = self.cli("lane", "assign", self.lane_name, "--prompt", "must not start", check=False)
+        self.assertEqual(response.returncode, 3, response.stderr)
+        self.assertEqual(json.loads(response.stdout)["error"], "budget_exceeded_daily")
+        self.assertEqual(self.lane_state()["state"], "idle")
+
+    def test_risk_aborts_lane_turns_without_watch(self):
+        for backend in ("pi", "codex", "cursor"):
+            with self.subTest(backend=backend):
+                self.set_config(backend)
+                self.start_lane()
+                run_id = self.assign("LANE_TEST_RISK LANE_TEST_WAIT", "--verify", "true")
+                self.assertEqual(self.wait_run(run_id)["status"], "stopped")
+                result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+                self.assertEqual(result["error_class"], "risk_blocked")
+                self.assertIsNone(result["verify"])
+                self.assertEqual(result["risk_blocks"][0]["risk"], "push")
+                self.assertIn("git push", result["risk_blocks"][0]["command"])
+                self.assertNotIn("secret-value", json.dumps(result))
+                if backend == "cursor":
+                    log = [json.loads(line) for line in (self.root / "fake-cursor-acp.jsonl").read_text().splitlines()]
+                    reply = next(row["permission_response"] for row in log if "permission_response" in row)
+                    self.assertEqual(reply["result"]["outcome"]["outcome"], "cancelled")
+                    self.assertTrue(any(row.get("method") == "session/cancel" for row in log))
+                self.cli("lane", "down", self.lane_name)
+
     def test_codex_retries_model_unavailable_turn_with_lane_fallback(self):
         self.set_config(model="fake-model", fallback_models=["gpt-6-luna"])
         self.env["FAKE_APP_SERVER_OVERLOAD_MODEL"] = "fake-model"

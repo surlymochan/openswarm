@@ -19,6 +19,10 @@ if log:
 if mode == "sleep":
     time.sleep(30)
     sys.exit(0)
+if mode in ("risk", "quick-risk"):
+    print(json.dumps({"type": "tool_execution_start", "toolName": "bash", "args": {"command": "git push secret-value"}}), flush=True)
+    if mode == "risk":
+        time.sleep(30)
 def end(text, usage, **extra):
     msg = {"role": "assistant", "content": [{"type": "text", "text": text}], "usage": usage}
     msg.update(extra)
@@ -125,6 +129,9 @@ class PiBackend(unittest.TestCase):
         self.assertEqual(argv[argv.index("--mode") + 1], "json")
         self.assertEqual(argv[argv.index("--tools") + 1], "read,bash,edit,write,grep,find,ls")
         self.assertIn("-p", argv)
+        sessions = argv[argv.index("--session-dir") + 1]
+        self.assertTrue(os.path.isdir(sessions))
+        self.assertFalse(os.path.commonpath([sessions, self.cwd]) == self.cwd)
         self.assertNotIn("--model", argv)
 
     def test_error_event_fails_the_attempt(self):
@@ -145,6 +152,18 @@ class PiBackend(unittest.TestCase):
         self.assertEqual(rc, 124)
         self.assertIsNone(final)
         self.assertEqual(meta["usage"], {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0})
+
+    def test_risk_stops_runner_even_if_executor_reports_done(self):
+        for mode in ("risk", "quick-risk"):
+            with self.subTest(mode=mode):
+                os.environ["FAKE_PI_MODE"] = mode
+                self.assertEqual(self.dispatch(verify="true"), 1)
+                entry, result = self.last_result()
+                self.assertEqual(result["status"], "stopped")
+                self.assertEqual(entry["error_class"], "risk_blocked")
+                self.assertIsNone(result["verify"])
+                self.assertEqual(result["risk_blocks"][0]["risk"], "push")
+                self.assertNotIn("secret-value", json.dumps(result))
 
 
 if __name__ == "__main__":

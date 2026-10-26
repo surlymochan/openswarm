@@ -45,6 +45,19 @@ class WorkspaceTest(unittest.TestCase):
                                capture_output=True, text=True).stdout.split()
         self.assertEqual(files, ["pkg/b.txt"])
 
+    def test_executor_directories_and_logs_are_never_committed(self):
+        ws = xs.prepare_workspace(self.repo, "artifacts", True)
+        excluded = [".pi/session.jsonl", ".codex/session.jsonl", "pkg/.cursor/log.jsonl", "codex-run.log"]
+        for path in excluded:
+            write(os.path.join(ws["root"], path), "private executor data")
+        write(os.path.join(ws["root"], "pkg", "real.txt"), "real change")
+        sh("git", "add", "-A", cwd=ws["root"])
+        fin = xs.finalize_workspace(ws, "artifacts", "codex", self.rdir, keep=False)
+        self.assertEqual(fin["excluded_files"], sorted(excluded))
+        files = subprocess.check_output(["git", "show", "--name-only", "--format=", fin["commit"]],
+                                        cwd=self.repo, text=True).split()
+        self.assertEqual(files, ["pkg/real.txt"])
+
     def test_workspace_prepare_runs_in_worktree_and_replaces_dependency_link(self):
         home = os.path.join(self.tmp, "home")
         write(os.path.join(home, "policy.local.json"), json.dumps({"workspace": {
