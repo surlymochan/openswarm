@@ -150,9 +150,16 @@ For longer work, detach and watch:
 ```bash
 openswarm run --detach --cwd ~/code/myrepo --verify 'pytest -q' --task-file /tmp/task.md   # prints {"id": ...}
 openswarm watch <id1> <id2>          # one line per actionable event; exits on DONE or after 28 min
+openswarm watch <id1> <id2> --quiet  # alerts, heartbeats and terminal events only
 openswarm report --since-minutes 60  # one-screen digest for scheduled check-ins
 openswarm stop <id>                  # kill the executor; partial work is still committed to its branch
 ```
+
+Pi messages appear once at `message_end`; Cursor chunks are merged until a prompt turn ends or a tool call starts.
+Codex events keep their existing behavior. `--quiet` keeps only `DONE`, `EXITED`, `RISK`, `STALL`, `ERROR`,
+`BUDGET`, `ATTEMPT`, and `HEARTBEAT`. Heartbeats include elapsed time, command count, the worktree's git diff
+summary (including lane worktrees), and the last completed message truncated to 200 characters. The watch window
+still expires with `--quiet`; re-arm with `--from-end` if needed.
 
 ## Resident lanes
 
@@ -185,13 +192,85 @@ Lane runs use the normal `runs/<id>` files, `openswarm/<id>` commit branch, host
 `runs`, and `report` paths. `--base REV` selects the commit used to reset a lane worktree for one assignment.
 An optional lane `binary` absolute path overrides the detected executable, which is useful for wrappers and offline
 protocol testing. Cursor defaults to model `composer-2.5`; its binary is `cursor-agent` on `PATH`, then
-`~/.local/bin/cursor-agent`. Codex app-server approval prompts receive a decline response. Cursor permission requests
+`~/.local/bin/cursor-agent`. ACP model selection first tries the exact configured value, then matches the part before
+`[` (for example `composer-2.5` resolves to `composer-2.5[fast=true]`). A unique base-name match is accepted;
+multiple matches fail with the candidate list. Lane state and the run result record the resolved value as `model`
+and `resolved_model`. Codex app-server approval prompts receive a decline response. Cursor permission requests
 receive the offered `allow_always` choice, falling back to `allow_once`. Cursor `lane steer` cancels the active prompt,
 waits for its response, then continues in the same ACP session with the steer text as a correction.
 
 On small Linux lane hosts, omit `--verify` so test suites and their dependencies do not compete with the agent for
 memory and CPU. The planner can run acceptance checks on its host. `lane systemd-unit` prints a system service with
 `MemoryMax=900M`, `CPUQuota=150%`, and `Nice=10`; review and install it separately if needed.
+
+## Fleet and batch dispatch
+
+Put named executor hosts in `$OPENSWARM_HOME/fleet.json`. Install the same openswarm version, Python 3.9+, git,
+and an authenticated executor on each host. `repos` maps the same logical repo name to each host's checkout:
+
+```json
+{"hosts":[
+  {"name":"local","kind":"local","repos":{"project":"~/code/project"}},
+  {"name":"worker","kind":"ssh","ssh":"worker-alias","openswarm":"~/.local/bin/openswarm",
+   "repos":{"project":"~/work/project"}},
+  {"name":"sandbox","kind":"instabox","box":"task-box","openswarm":"~/.local/bin/openswarm",
+   "repos":{"project":"~/work/project"}}
+]}
+```
+
+Local hosts use subprocesses; remote commands use `ssh <alias> --` or `instabox ssh <box> --`, with timeouts.
+Without a local repo mapping, the planner uses its current checkout. A missing fleet config defaults to local only.
+
+```bash
+openswarm fleet status                   # reachability, paused hosts, lanes and active runs
+openswarm fleet status --json
+openswarm fleet exec worker -- lane status
+openswarm fleet exec --timeout 120 worker -- runs --active --json
+```
+
+Status uses `instabox ls` and never connects to a paused box. Unknown box states also remain uncontacted.
+`fleet exec` forwards stdout, stderr and the exit code; it does not issue a separate wake command.
+
+Write one self-contained task per regular file in a cards directory, then dispatch:
+
+```bash
+openswarm batch --repo project --cards ./cards --hosts worker,sandbox --per-host 1 \
+  --backend pi --model cheap-model --verify 'python3 -m unittest discover -s tests' \
+  --budget-minutes 20 --detach
+openswarm batch status <batch-id>
+```
+
+The batch wakes each selected instabox once, checks openswarm and the checkout, and makes `--base REV` available
+on every host (default: the planner checkout's `HEAD`). Sorted cards are assigned round-robin; `--per-host`
+defaults to 1, with remaining cards queued until slots free. Backend, model and effort flags are optional and pass
+through to each `run --detach`. One line is printed per state change; detached output goes to
+`$OPENSWARM_HOME/batches/<id>/batch.out`. Polling works without Monitor.
+
+Base synchronization and result collection use git bundles through the transport: no git remotes or pushes.
+Each completed run's `openswarm/<run-id>` branch is fetched into the planner checkout, then removed on the
+executor host after its commit is confirmed locally. Local runs in the planner checkout retain their branches.
+Failed runs with commits are collected too. The batch exits nonzero if any card is not `done`.
+`summary.json` and `summary.md` under `$OPENSWARM_HOME/batches/<id>/` list card, host, status, verify exit code,
+branch, commit, seconds and a one-line summary. Review branches before integrating; run a combined test suite
+after integration. One-shot `run --base REV` is also supported.
+
+## Verify a remote run elsewhere
+
+```bash
+openswarm verify-remote --from worker --run <run-id> --on local --verify 'pytest -q'
+openswarm verify-remote --from worker --run <run-id> --on sandbox --verify 'npm test'
+```
+
+The source host's `repos` mapping identifies the logical repo for another executor; `--on local` uses the matching
+local mapping or the current checkout. Bundles carry the recorded run commit into the target repo. A temporary
+worktree checks out that commit, links dependency directories like ordinary runs, executes the verify command,
+then removes its worktree and temporary ref. Existing checkouts stay on their current commits. Verification
+assumes the target is available; arrange its wake-up if needed. The default verify timeout is 600 seconds (`--timeout`).
+
+The planner saves a copy of the original result at `$OPENSWARM_HOME/remote-results/<run-id>.json`, adding
+`verify_remote: {host, rc, failing, seconds}`. Verify output is not printed or included in that record.
+A failed verify returns a nonzero CLI exit code. The recorded commit can still be verified after batch collection
+has removed the source branch, as long as the source host retains the run and its git objects.
 
 You can try routing with no backend installed:
 
@@ -242,13 +321,13 @@ Cursor CLI is a fourth executor, opt-in only (`--backend cursor`).
 
 | Path | What |
 | --- | --- |
-| `bin/openswarm` | The CLI: `probe`, `status`, `route`, `run`, `lane`, `watch`, `runs`, `report`, `stop`, `ingest-claude`, `ledger` |
+| `bin/openswarm` | The CLI: `probe`, `status`, `route`, `run`, `lane`, `fleet`, `batch`, `verify-remote`, `watch`, `runs`, `report`, `stop`, `ingest-claude`, `ledger` |
 | `SKILL.md` | Claude Code skill: the planner's operating manual |
 | `policy.json` | Defaults: thresholds, difficulty map, model caps, local data sources |
 | `backends/*.json` | One manifest per executor: invocation, quota source, data boundary |
 | `templates/openswarm-workflow.js` | Parallel fan-out template for Claude Code workflows |
 | `examples/demo-state.json` | Synthetic state for offline demos |
-| `~/.claude/openswarm/` (`$OPENSWARM_HOME`) | Runtime data: `state.json`, `ledger.jsonl`, `breakers.json`, `lanes.json`, `lanes/<name>/`, `runs/<id>/` |
+| `~/.claude/openswarm/` (`$OPENSWARM_HOME`) | Runtime data: `state.json`, `ledger.jsonl`, `breakers.json`, `lanes.json`, `lanes/<name>/`, `fleet.json`, `batches/<id>/`, `remote-results/<id>.json`, `runs/<id>/` |
 
 ## Configuration
 

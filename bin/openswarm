@@ -10,6 +10,9 @@ Subcommands:
   route            pick backend/model/effort for a task profile (JSON out)
   run              route + execute in an isolated git worktree, record ledger (JSON out)
   lane             manage long-lived Codex app-server / Cursor ACP / Pi RPC executor lanes
+  fleet            inspect hosts and forward openswarm commands over local / SSH / instabox transports
+  batch            queue task cards across fleet hosts and collect their branches
+  verify-remote    verify a fleet run on another host in a temporary worktree
   watch            stream actionable events (progress, risk, stalls) for one or more runs
   runs / report    snapshot of recent runs / compact scheduled check-in
   stop             terminate a run (partial work is still committed to its branch)
@@ -28,12 +31,14 @@ import math
 import os
 import re
 import select
+import shlex
 import shutil
 import signal
 import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -1177,13 +1182,15 @@ def git(args, cwd, timeout=60):
     return sh(["git", *args], cwd=cwd, timeout=timeout)
 
 
-def prepare_workspace(cwd, rid, use_worktree):
+def prepare_workspace(cwd, rid, use_worktree, base_rev=None):
     rc, top, _ = git(["rev-parse", "--show-toplevel"], cwd)
     if rc != 0 or not use_worktree:
         return {"mode": "in-place", "path": cwd, "repo": top.strip() if rc == 0 else None}
     top = top.strip()
-    rc, head, _ = git(["rev-parse", "HEAD"], top)
+    rc, head, _ = git(["rev-parse", "--verify", "--end-of-options", f"{base_rev or 'HEAD'}^{{commit}}"], top)
     if rc != 0:
+        if base_rev:
+            raise SystemExit("openswarm: requested base commit is unavailable")
         return {"mode": "in-place", "path": cwd, "repo": top, "note": "repo has no commits; ran in place"}
     _, dirty, _ = git(["status", "--porcelain"], top)
     branch = f"openswarm/{rid}"
@@ -1194,7 +1201,7 @@ def prepare_workspace(cwd, rid, use_worktree):
     else:
         wt = f"{WORKTREES}/{os.path.basename(top)}-{rid}"
         os.makedirs(WORKTREES, exist_ok=True)
-    rc, _, err = git(["worktree", "add", "-q", "-b", branch, wt, "HEAD"], top, timeout=300)
+    rc, _, err = git(["worktree", "add", "-q", "-b", branch, wt, head.strip()], top, timeout=300)
     if rc != 0:
         # Never silently fall back to editing the shared checkout: concurrent runs and the
         # user's own uncommitted work live there. Fail the run instead.
@@ -1202,22 +1209,29 @@ def prepare_workspace(cwd, rid, use_worktree):
     rel = os.path.relpath(os.path.realpath(cwd), os.path.realpath(top))
     path = os.path.join(wt, rel) if rel != "." else wt
     linked = link_dependency_dirs(top, wt)
-    if linked:  # `node_modules/` in .gitignore matches directories only, not the symlinks we just created
-        rc, ex, _ = git(["rev-parse", "--git-path", "info/exclude"], wt)
-        if rc == 0:
-            ex = ex.strip() if os.path.isabs(ex.strip()) else os.path.join(wt, ex.strip())
-            os.makedirs(os.path.dirname(ex), exist_ok=True)
-            have = []
-            if os.path.exists(ex):
-                with open(ex) as fh:
-                    have = fh.read().splitlines()
-            with open(ex, "a") as f:
-                for rel in linked:
-                    if "/" + rel not in have:
-                        f.write("/" + rel + "\n")
+    exclude_dependency_links(wt, linked)
     return {"mode": "worktree", "path": path, "root": wt, "repo": top, "branch": branch, "base": head.strip(),
             "base_dirty": bool(dirty.strip()), "linked": linked,
             "note": "base had uncommitted changes that are NOT in the worktree" if dirty.strip() else None}
+
+
+def exclude_dependency_links(wt, linked):
+    # Directory-only .gitignore patterns do not cover the dependency symlinks.
+    if not linked:
+        return
+    rc, path, _ = git(["rev-parse", "--git-path", "info/exclude"], wt)
+    if rc:
+        return
+    path = path.strip() if os.path.isabs(path.strip()) else os.path.join(wt, path.strip())
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    have = []
+    if os.path.exists(path):
+        with open(path) as stream:
+            have = stream.read().splitlines()
+    with open(path, "a") as stream:
+        for rel in linked:
+            if "/" + rel not in have:
+                stream.write("/" + rel + "\n")
 
 
 def link_dependency_dirs(base, wt):
@@ -1423,6 +1437,8 @@ def cmd_run(args, policy):
                 child += [f"--{flag.replace('_', '-')}", str(v)]
         if getattr(args, "verify", None):
             child += ["--verify", args.verify]
+        if getattr(args, "base", None):
+            child += ["--base", args.base]
         if getattr(args, "verify_baseline", False):
             child.append("--verify-baseline")
         for flag in ("no_worktree", "keep_worktree", "no_fallback"):
@@ -1450,7 +1466,7 @@ def cmd_run(args, policy):
         set_status(rdir, state="dry-run")
         print(json.dumps({"id": rid, "dry_run": True, "decision": decision}, indent=2, ensure_ascii=False))
         return
-    ws = prepare_workspace(os.path.abspath(args.cwd), rid, not args.no_worktree)
+    ws = prepare_workspace(os.path.abspath(args.cwd), rid, not args.no_worktree, getattr(args, "base", None))
     if args.verify and ws["mode"] == "worktree":
         # A verify command that names files by their base-repo absolute path would test the base checkout,
         # not the executor's worktree. Rewrite those paths into the worktree and say so.
@@ -2068,20 +2084,30 @@ def lane_begin_turn(lane, child, prompt, worktree, event_file, turn):
             raise RuntimeError("cursor-agent ACP session/new response did not contain sessionId")
         options = result.get("configOptions") or []
         selects = [option for option in options if isinstance(option, dict) and option.get("type") == "select"]
-        matching = [option for option in selects if lane["model"] in lane_cursor_option_values(option)]
+        model_options = [option for option in selects if option.get("category") == "model"] or selects
+        choices = [(option, value) for option in model_options for value in lane_cursor_option_values(option)]
+        matching = [(option, value) for option, value in choices if value == lane["model"]]
         if not matching:
-            model_options = [option for option in selects if option.get("category") == "model"] or selects
-            available = sorted({value for option in model_options for value in lane_cursor_option_values(option)})
+            matching = [(option, value) for option, value in choices if value.split("[", 1)[0] == lane["model"]]
+        values = sorted({value for _, value in matching})
+        if len(values) > 1:
+            raise RuntimeError(f"cursor-agent ACP model {lane['model']!r} is ambiguous; matching values: "
+                               + ", ".join(values))
+        if not values:
+            available = sorted({value for _, value in choices})
             raise RuntimeError(f"cursor-agent ACP model {lane['model']!r} is unavailable; available values: "
                                f"{', '.join(available) if available else '(none reported)'}")
-        option = matching[0]
+        option, resolved = matching[0]
         req_id = "model-" + uuid.uuid4().hex
         child.send({"jsonrpc": "2.0", "id": req_id, "method": "session/set_config_option",
                     "params": {"sessionId": turn["session_id"], "configId": option.get("id"),
-                               "value": lane["model"]}})
+                               "value": resolved}})
         selected = child.wait_response(req_id, 60, event_file)
         if selected.get("error"):
             raise RuntimeError(f"cursor-agent ACP model selection failed: {short(selected['error'], 300)}")
+        lane["resolved_model"] = resolved
+        lane_write_state(lane["name"], model=resolved, resolved_model=resolved)
+        set_status(os.path.dirname(event_file), model=resolved, resolved_model=resolved)
         lane_cursor_start_prompt(child, turn, prompt)
     if turn.get("abort_pending"):
         lane_abort_child(lane, child, turn)
@@ -2296,7 +2322,8 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file)
     title = spec.get("title") or spec["task"].strip().splitlines()[0][:72]
     stopped = bool(spec.get("stop_requested"))
     budget_hit = error_class == "budget_exceeded"
-    attempts = [{"backend": lane["backend"], "model": lane["model"], "effort": lane.get("effort"), "rc": rc,
+    model = lane.get("resolved_model", lane["model"])
+    attempts = [{"backend": lane["backend"], "model": model, "effort": lane.get("effort"), "rc": rc,
                  "seconds": round(NOW() - spec["started"], 3), "error_class": error_class,
                  "meta": {"usage": usage}, "events": event_file, "error_tail": None}]
     set_status(rdir, state="finalizing")
@@ -2337,14 +2364,15 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file)
         detach_at = fin.get("commit") or ws["base"]
         lane_git(["checkout", "--detach", detach_at], ws["root"])
     out = {"id": rid, "status": status, "title": title, "lane": lane["name"], "verify": verify,
-           "verify_note": verify_note, "backend": lane["backend"], "model": lane["model"], "effort": lane.get("effort"),
+           "verify_note": verify_note, "backend": lane["backend"], "model": model, "effort": lane.get("effort"),
+           **({"resolved_model": model} if lane["backend"] == "cursor" else {}),
            "usage": usage, "seconds": attempts[0]["seconds"], "result": final, "workspace":
            {k: v for k, v in ws.items() if k in ("mode", "path", "repo", "base", "note", "lane")},
            **fin, "attempts": attempts, "run_dir": rdir}
     jsave(os.path.join(rdir, "result.json"), out)
     set_status(rdir, state="finished", status=status, finished=NOW(), commit=fin.get("commit"), lane=lane["name"])
     append_ledger({"id": rid, "ts": NOW(), "title": title, "status": status, "lane": lane["name"],
-                   "backend": lane["backend"], "model": lane["model"], "effort": lane.get("effort"),
+                   "backend": lane["backend"], "model": model, "effort": lane.get("effort"),
                    "attempts": attempts, "error_class": error_class, "seconds": attempts[0]["seconds"],
                    "usage": usage, "commit": fin.get("commit"),
                    "files": len((final or {}).get("files_changed") or [])})
@@ -2353,6 +2381,9 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file)
 
 def lane_do_run(lane, spec, child, server, current):
     rid, rdir = spec["run_id"], os.path.join(RUNS, spec["run_id"])
+    lane.pop("resolved_model", None)
+    if lane["backend"] == "cursor":
+        lane_write_state(lane["name"], model=lane["model"], resolved_model=None)
     ws = None
     turn, pending = {}, []
     try:
@@ -2400,7 +2431,7 @@ def cmd_lane_serve(lane, policy):
     started, backoff, next_start = NOW(), 1, 0
     lane_write_state(name, name=name, backend=lane["backend"], model=lane["model"], effort=lane.get("effort"),
                      state="starting", supervisor_pid=os.getpid(), child_pid=None, current_run=None,
-                     started=started, last_error=None)
+                     started=started, last_error=None, resolved_model=None)
     try:
         wt = os.path.join(lane_root(name), "wt")
         # Create the fixed worktree before launching a cwd-bound Pi child.
@@ -2588,7 +2619,7 @@ def cmd_lane_down(args):
     print(json.dumps({"lanes": results}, indent=2, ensure_ascii=False))
 
 
-def cmd_lane_status():
+def lane_status_rows():
     rows = []
     for lane in lane_config():
         state = jload(lane_state_path(lane["name"]), {}) or {}
@@ -2599,11 +2630,15 @@ def cmd_lane_status():
         elif not pid_alive(pid):
             lane_state = "crashed"
         rows.append({"name": lane["name"], "state": lane_state, "backend": lane["backend"],
-                     "model": lane["model"], "pid": state.get("child_pid"), "supervisor_pid": pid,
+                     "model": state.get("resolved_model") or lane["model"], "pid": state.get("child_pid"), "supervisor_pid": pid,
                      "current_run": state.get("current_run"),
                      "uptime_seconds": round(NOW() - state["started"], 1) if state.get("started") else None,
                      "last_error": state.get("last_error")})
-    print(json.dumps(rows, indent=2, ensure_ascii=False))
+    return rows
+
+
+def cmd_lane_status():
+    print(json.dumps(lane_status_rows(), indent=2, ensure_ascii=False))
 
 
 def cmd_lane_assign(args):
@@ -2679,6 +2714,496 @@ def cmd_lane_systemd(args):
         lines.append(f"Environment={systemd_quote('OPENSWARM_LANES_FILE=' + lanes_file)}")
     lines.extend(["", "[Install]", "WantedBy=multi-user.target", ""])
     print("\n".join(lines))
+
+
+# ---------------------------------------------------------------- fleet
+
+def fleet_config():
+    path = os.path.join(DATA, "fleet.json")
+    cfg = jload(path, {"hosts": [{"name": "local", "kind": "local"}]} if not os.path.exists(path) else None)
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("hosts"), list):
+        raise ValueError("invalid fleet.json: expected {\"hosts\":[...]}")
+    hosts = {}
+    for host in cfg["hosts"]:
+        if not isinstance(host, dict) or not isinstance(host.get("name"), str) or not LANE_NAME_RE.fullmatch(host["name"]):
+            raise ValueError("invalid fleet host name")
+        name, kind = host["name"], host.get("kind")
+        if name in hosts or kind not in ("local", "ssh", "instabox"):
+            raise ValueError(f"invalid or duplicate fleet host: {name}")
+        field = {"ssh": "ssh", "instabox": "box"}.get(kind)
+        if field and (not isinstance(host.get(field), str) or not host[field] or host[field].startswith("-")):
+            raise ValueError(f"fleet host {name} requires {field}")
+        repos = host.get("repos", {})
+        if not isinstance(repos, dict) or any(not isinstance(p, str) or not p for p in repos.values()):
+            raise ValueError(f"invalid repos for fleet host {name}")
+        if "openswarm" in host and (not isinstance(host["openswarm"], str) or not host["openswarm"]):
+            raise ValueError(f"invalid openswarm path for fleet host {name}")
+        hosts[name] = host
+    return hosts
+
+
+def fleet_host(name, hosts=None):
+    hosts = fleet_config() if hosts is None else hosts
+    if name == "local" and name not in hosts:
+        return {"name": "local", "kind": "local"}
+    if name not in hosts:
+        raise ValueError(f"unknown fleet host: {name}")
+    return hosts[name]
+
+
+def shell_path(path):
+    """Quote on the destination shell while allowing only the ~/ home shorthand."""
+    return '"$HOME"/' + shlex.quote(path[2:]) if path.startswith("~/") else shlex.quote(path)
+
+
+def host_run(host, command, timeout=60, input=None):
+    """Binary-safe transport, including stdin for cards and git bundles. Never logs commands or env."""
+    if host["kind"] == "local":
+        argv = ["sh", "-c", command]
+    elif host["kind"] == "ssh":
+        argv = ["ssh", host["ssh"], "--", command]
+    else:
+        argv = ["instabox", "ssh", host["box"], "--", command]
+    try:
+        proc = subprocess.run(argv, input=input, capture_output=True, timeout=timeout)
+        return proc.returncode, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired:
+        return 124, b"", b"transport timed out"
+    except OSError:
+        return 127, b"", b"transport executable unavailable"
+
+
+def host_openswarm(host, args):
+    binary = host.get("openswarm") or (os.path.realpath(__file__) if host["kind"] == "local"
+                                       else "~/.local/bin/openswarm")
+    return shell_path(binary) + " " + shlex.join([str(arg) for arg in args])
+
+
+def host_json(host, args, timeout=60):
+    rc, out, _ = host_run(host, host_openswarm(host, args), timeout=timeout)
+    if rc:
+        raise RuntimeError(f"{host['name']}: openswarm command failed (rc={rc})")
+    try:
+        value = json.loads(out)
+        if not isinstance(value, dict):
+            raise ValueError("expected an object")
+        return value
+    except (ValueError, UnicodeError):
+        raise RuntimeError(f"{host['name']}: invalid openswarm JSON response") from None
+
+
+def host_python(host, source, args=(), timeout=60, input=None):
+    return host_run(host, shlex.join(["python3", "-c", source, *map(str, args)]), timeout=timeout, input=input)
+
+
+def host_require(host, response, operation):
+    rc, out, _ = response
+    if rc:
+        raise RuntimeError(f"{host['name']}: {operation} failed (rc={rc})")
+    return out
+
+
+def host_git(host, repo, args, timeout=60):
+    return host_run(host, "git -C " + shell_path(repo) + " " + shlex.join(args), timeout=timeout)
+
+
+def host_repo(host, name, local=False):
+    path = (host.get("repos") or {}).get(name)
+    if path:
+        return path
+    if local and host["kind"] == "local":
+        return os.getcwd()
+    raise ValueError(f"{host['name']}: no repository mapping for {name}")
+
+
+BUNDLE_EXPORT = """
+import os, subprocess, sys
+repo, rev, ref = os.path.expanduser(sys.argv[1]), sys.argv[2], sys.argv[3]
+def git(*args, **kw):
+    return subprocess.run(['git', '-C', repo, *args], check=True, **kw)
+sha = git('rev-parse', '--verify', '--end-of-options', rev + '^{commit}', capture_output=True).stdout.strip()
+git('update-ref', ref, sha.decode())
+try:
+    git('bundle', 'create', '-', ref, stdout=sys.stdout.buffer)
+finally:
+    git('update-ref', '-d', ref)
+"""
+
+BUNDLE_IMPORT = """
+import os, subprocess, sys, tempfile
+repo, ref, dest = os.path.expanduser(sys.argv[1]), sys.argv[2], sys.argv[3]
+with tempfile.NamedTemporaryFile(prefix='openswarm-bundle-') as bundle:
+    bundle.write(sys.stdin.buffer.read())
+    bundle.flush()
+    subprocess.run(['git', '-C', repo, 'fetch', '--no-tags', bundle.name, ref + (':' + dest if dest else '')],
+                   check=True, stdout=subprocess.DEVNULL)
+sha = subprocess.check_output(['git', '-C', repo, 'rev-parse', dest or 'FETCH_HEAD']).decode().strip()
+print(sha)
+"""
+
+
+def transfer_ref(source, source_repo, rev, target, target_repo, destination=""):
+    ref = "refs/openswarm-transfer/" + uuid.uuid4().hex
+    bundle = host_require(source, host_python(source, BUNDLE_EXPORT, [source_repo, rev, ref], timeout=300),
+                          "bundle export")
+    return host_require(target, host_python(target, BUNDLE_IMPORT, [target_repo, ref, destination],
+                                           timeout=300, input=bundle), "bundle import").decode().strip()
+
+
+def instabox_states(hosts):
+    boxes = [host["box"] for host in hosts if host["kind"] == "instabox"]
+    if not boxes:
+        return {}
+    rc, out, _ = sh(["instabox", "ls"], timeout=20)
+    if rc:
+        return {}
+    try:
+        rows = json.loads(out)
+        if isinstance(rows, dict):
+            rows = rows.get("boxes", rows.get("instances", []))
+        return {str(row.get("name") or row.get("id")): str(row.get("status") or row.get("state") or "")
+                for row in rows if isinstance(row, dict)}
+    except (ValueError, TypeError):
+        states = {}
+        for box in boxes:
+            for line in out.splitlines():
+                if re.search(r"(?<![\w.-])" + re.escape(box) + r"(?![\w.-])", line):
+                    match = re.search(r"\b(Paused|Running|Ready|Active|Stopped|Starting)\b", line, re.I)
+                    if match:
+                        states[box] = match.group(1)
+        return states
+
+
+def fleet_snapshot():
+    lanes = lane_status_rows() if os.path.exists(envvar("LANES_FILE", os.path.join(DATA, "lanes.json"))) else []
+    runs = []
+    for path in sorted(glob.glob(os.path.join(RUNS, "*", "status.json"))):
+        row = run_digest(os.path.basename(os.path.dirname(path)))
+        if row["state"] not in ("finished", "unroutable", "dry-run", "dead"):
+            runs.append(row)
+    return {"lanes": lanes, "active_runs": runs}
+
+
+def cmd_fleet(args):
+    if args.fleet_cmd == "_snapshot":
+        print(json.dumps(fleet_snapshot(), ensure_ascii=False))
+        return
+    if args.fleet_cmd == "_run-info":
+        rid = safe_id(args.run_id)
+        if not os.path.exists(os.path.join(RUNS, rid, "status.json")):
+            raise ValueError(f"no such run: {rid}")
+        row = run_digest(rid)
+        row["result"] = jload(os.path.join(RUNS, rid, "result.json"))
+        print(json.dumps(row, ensure_ascii=False))
+        return
+    if args.fleet_cmd == "_verify":
+        print(json.dumps(verify_in_worktree(args.repo, args.rev, args.verify, args.timeout), ensure_ascii=False))
+        return
+    if args.fleet_cmd == "exec":
+        host = fleet_host(args.host)
+        command = args.args[1:] if args.args[:1] == ["--"] else args.args
+        if not command:
+            raise ValueError("fleet exec requires openswarm arguments after --")
+        rc, out, err = host_run(host, host_openswarm(host, command), timeout=args.timeout)
+        sys.stdout.buffer.write(out)
+        sys.stderr.buffer.write(err)
+        raise SystemExit(rc)
+    hosts = list(fleet_config().values())
+    states = instabox_states(hosts)
+    rows = []
+    for host in hosts:
+        row = {"name": host["name"], "reachable": False, "paused": False, "lanes": [], "active_runs": []}
+        state = states.get(host.get("box"), "").lower()
+        if host["kind"] == "instabox" and state not in ("running", "ready", "active"):
+            row.update(paused=state == "paused", state=state or "unknown")
+        else:
+            try:
+                row.update(host_json(host, ["fleet", "_snapshot"], timeout=20), reachable=True)
+            except RuntimeError as e:
+                row["error"] = str(e)
+        rows.append(row)
+    if args.json:
+        print(json.dumps({"hosts": rows}, indent=2, ensure_ascii=False))
+    else:
+        for row in rows:
+            state = "paused" if row["paused"] else ("reachable" if row["reachable"] else "unreachable")
+            print(f"{row['name']}  {state}  lanes={len(row['lanes'])} active={len(row['active_runs'])}")
+            for lane in row["lanes"]:
+                print(f"  {lane['name']} {lane['state']} {lane.get('model') or '-'} run={lane.get('current_run') or '-'}")
+            for run in row["active_runs"]:
+                print(f"  run {run['id']} {run['state']}")
+
+
+def safe_id(value):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value):
+        raise ValueError("invalid run or batch id")
+    return value
+
+
+def batch_save(summary):
+    directory = os.path.join(DATA, "batches", summary["id"])
+    jsave(os.path.join(directory, "summary.json"), summary)
+    def cell(value):
+        return short(value, 240).replace("|", "\\|")
+    lines = [f"# Batch {summary['id']}", "", f"State: {summary['state']}", "",
+             "| Card | Host | Status | Verify rc | Branch | Commit | Seconds | Summary |",
+             "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+    for row in summary["cards"]:
+        lines.append("| " + " | ".join(cell(row.get(key) if row.get(key) is not None else "-") for key in
+                                      ("card", "host", "status", "verify_rc", "branch", "commit", "seconds", "summary")) + " |")
+    with open(os.path.join(directory, "summary.md"), "w") as stream:
+        stream.write("\n".join(lines) + "\n")
+
+
+def batch_change(batch_summary, row, state, **fields):
+    old = (row.get("state"), row.get("status"))
+    row.update(state=state, **fields)
+    if old != (row.get("state"), row.get("status")):
+        print(f"{row['card']} @{row['host']}: {state} ({row['status']})", flush=True)
+    batch_save(batch_summary)
+
+
+def batch_collect(spec, row, result):
+    host = spec["hosts"][row["host"]]
+    local = spec["local"]
+    branch = result.get("branch")
+    commit = result.get("commit")
+    if branch or commit:
+        if branch != "openswarm/" + row["run_id"] or not commit:
+            raise RuntimeError(f"{host['name']}: invalid result branch or commit")
+        same = host["kind"] == "local" and os.path.realpath(spec["repos"][row["host"]]) == os.path.realpath(spec["repo_path"])
+        if not same:
+            fetched = transfer_ref(host, spec["repos"][row["host"]], branch, local, spec["repo_path"],
+                                   "refs/heads/" + branch)
+            if fetched != commit:
+                raise RuntimeError(f"{host['name']}: fetched commit differs from run result")
+            host_require(host, host_git(host, spec["repos"][row["host"]], ["branch", "-D", branch]),
+                         "remote branch cleanup")
+    return {"status": result.get("status") or "failed", "verify_rc": (result.get("verify") or {}).get("rc"),
+            "branch": branch, "commit": commit, "seconds": result.get("seconds"),
+            "summary": short((result.get("result") or {}).get("summary") or result.get("summary"), 200)}
+
+
+def batch_launch(spec, row):
+    host = spec["hosts"][row["host"]]
+    with open(row["path"], "rb") as stream:
+        card = stream.read()
+    source = ("import os, sys, tempfile; fd, path = tempfile.mkstemp(prefix='openswarm-card-', suffix='.md'); "
+              "stream = os.fdopen(fd, 'wb'); stream.write(sys.stdin.buffer.read()); stream.close(); print(path)")
+    path = host_require(host, host_python(host, source, input=card), "card copy").decode().strip()
+    try:
+        args = ["run", "--detach", "--cwd", spec["repos"][row["host"]], "--task-file", path, "--base", spec["base"]]
+        for key in ("backend", "model", "effort", "verify", "budget_minutes"):
+            if spec.get(key) is not None:
+                args += ["--" + key.replace("_", "-"), str(spec[key])]
+        reply = host_json(host, args)
+        return safe_id(reply["id"])
+    finally:
+        host_python(host, "import os, sys; os.unlink(sys.argv[1])", [path])
+
+
+def execute_batch(spec, summary):
+    summary.update(state="running", runner_pid=os.getpid())
+    blocked_hosts = set()
+    batch_save(summary)
+    try:
+        # Preflight every host before dispatching any card. A chosen instabox is woken only here.
+        for name, host in spec["hosts"].items():
+            if host["kind"] == "instabox":
+                rc, _, _ = sh(["instabox", "wake", host["box"]], timeout=120)
+                if rc:
+                    raise RuntimeError(f"{name}: wake failed (rc={rc})")
+            host_json(host, ["fleet", "_snapshot"], timeout=30)
+            repo = spec["repos"][name]
+            repo = host_require(host, host_git(host, repo, ["rev-parse", "--show-toplevel"]), "repository check").decode().strip()
+            spec["repos"][name] = repo
+            rc, _, _ = host_git(host, repo, ["cat-file", "-e", spec["base"] + "^{commit}"])
+            if rc:
+                fetched = transfer_ref(spec["local"], spec["repo_path"], spec["base"], host, repo,
+                                       "refs/openswarm-bases/" + spec["id"])
+                if fetched != spec["base"]:
+                    raise RuntimeError(f"{name}: base transfer mismatch")
+        while any(row["state"] != "finished" for row in summary["cards"]):
+            for name, host in spec["hosts"].items():
+                active = [row for row in summary["cards"] if row["host"] == name and row.get("run_id")
+                          and row["state"] != "finished"]
+                for row in active:
+                    try:
+                        info = host_json(host, ["fleet", "_run-info", row["run_id"]], timeout=20)
+                        state = info["state"]
+                        if state in ("finished", "unroutable", "dead", "dry-run"):
+                            row["terminal_seen"] = True
+                            fields = batch_collect(spec, row, info.get("result") or {"status": "failed"})
+                            batch_change(summary, row, "finished", **fields)
+                        elif NOW() - row["started"] > spec["budget_minutes"] * 60 + 180:
+                            raise RuntimeError(f"{name}: run exceeded its reporting deadline")
+                        else:
+                            batch_change(summary, row, state, status="running")
+                        row["poll_errors"] = 0
+                    except (ValueError, RuntimeError, KeyError) as e:
+                        row["poll_errors"] = row.get("poll_errors", 0) + 1
+                        if row["poll_errors"] >= 3:
+                            batch_change(summary, row, "finished", status="failed", summary=str(e))
+                            if not row.get("terminal_seen"):
+                                # Unknown remote state cannot safely release a concurrency slot.
+                                blocked_hosts.add(name)
+                if name in blocked_hosts:
+                    for row in summary["cards"]:
+                        if row["host"] == name and row["state"] == "queued" and not row.get("run_id"):
+                            batch_change(summary, row, "finished", status="failed",
+                                         summary="host run state unavailable; queued card was not started")
+                    continue
+                count = sum(row["host"] == name and bool(row.get("run_id")) and row["state"] != "finished"
+                            for row in summary["cards"])
+                for row in summary["cards"]:
+                    if count >= spec["per_host"]:
+                        break
+                    if row["host"] != name or row["state"] != "queued" or row.get("run_id"):
+                        continue
+                    try:
+                        row["run_id"] = batch_launch(spec, row)
+                        row["started"] = NOW()
+                        batch_change(summary, row, "started", status="running")
+                        count += 1
+                    except (OSError, ValueError, RuntimeError, KeyError) as e:
+                        batch_change(summary, row, "finished", status="failed", summary=str(e))
+                        # A lost start reply may hide a live run; do not dispatch another card here.
+                        blocked_hosts.add(name)
+                        break
+            if any(row["state"] != "finished" for row in summary["cards"]):
+                time.sleep(spec["poll_seconds"])
+        summary["state"] = "finished"
+    except (OSError, ValueError, RuntimeError) as e:
+        summary.update(state="failed", error=str(e))
+        for row in summary["cards"]:
+            if row["state"] != "finished":
+                batch_change(summary, row, "finished", status="failed", summary=str(e))
+    summary["finished"] = NOW()
+    batch_save(summary)
+    return 0 if all(row["status"] == "done" for row in summary["cards"]) else 1
+
+
+def cmd_batch(args, policy):
+    if args.batch_action == "status":
+        if not args.id:
+            raise ValueError("batch status requires an id")
+        summary = jload(os.path.join(DATA, "batches", safe_id(args.id), "summary.json"))
+        if not summary:
+            raise ValueError("no such batch")
+        if summary["state"] in ("queued", "running") and summary.get("runner_pid") and not pid_alive(summary["runner_pid"]):
+            summary["state"] = "dead"
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return
+    if args.batch_id:
+        directory = os.path.join(DATA, "batches", safe_id(args.batch_id))
+        spec, summary = jload(os.path.join(directory, "spec.json")), jload(os.path.join(directory, "summary.json"))
+        if not spec or not summary:
+            raise ValueError("no such batch")
+        raise SystemExit(execute_batch(spec, summary))
+    if not args.repo or not args.cards or not args.hosts:
+        raise ValueError("batch requires --repo, --cards and --hosts")
+    if args.per_host < 1 or args.poll_seconds <= 0 or (args.budget_minutes is not None and args.budget_minutes <= 0):
+        raise ValueError("batch concurrency, budget and poll interval must be positive")
+    hosts = fleet_config()
+    names = args.hosts.split(",")
+    if len(set(names)) != len(names):
+        raise ValueError("duplicate batch hosts")
+    chosen = {name: fleet_host(name, hosts) for name in names}
+    local = fleet_host("local", hosts)
+    if local["kind"] != "local":
+        raise ValueError("fleet host 'local' must have kind local")
+    repo = os.path.realpath(os.path.expanduser(host_repo(local, args.repo, local=True)))
+    base = host_require(local, host_git(local, repo, ["rev-parse", "--verify", "--end-of-options",
+                                                    (args.base or "HEAD") + "^{commit}"]), "base resolution").decode().strip()
+    paths = sorted(path for path in glob.glob(os.path.join(os.path.abspath(args.cards), "*")) if os.path.isfile(path))
+    if not paths:
+        raise ValueError("cards directory contains no files")
+    bid = new_run_id()
+    spec = {"id": bid, "repo": args.repo, "repo_path": repo, "base": base, "local": local, "hosts": chosen,
+            "repos": {name: host_repo(host, args.repo, local=host["kind"] == "local") for name, host in chosen.items()},
+            "per_host": args.per_host, "backend": args.backend, "model": args.model, "effort": args.effort,
+            "verify": args.verify, "budget_minutes": args.budget_minutes or round(policy["run"]["timeout_seconds"] / 60),
+            "poll_seconds": args.poll_seconds}
+    summary = {"id": bid, "repo": args.repo, "base": base, "state": "queued", "started": NOW(), "cards": [
+        {"card": os.path.basename(path), "path": path, "host": names[i % len(names)], "state": "queued", "status": "queued",
+         "verify_rc": None, "branch": None, "commit": None, "seconds": None, "summary": ""} for i, path in enumerate(paths)]}
+    directory = os.path.join(DATA, "batches", bid)
+    jsave(os.path.join(directory, "spec.json"), spec)
+    batch_save(summary)
+    if args.detach:
+        with open(os.path.join(directory, "batch.out"), "w") as log:
+            proc = subprocess.Popen([sys.executable, os.path.realpath(__file__), "batch", "--batch-id", bid],
+                                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        summary["runner_pid"] = proc.pid
+        # The child owns summary.json once spawned; avoid overwriting its first state change.
+        print(json.dumps({"id": bid, "runner_pid": proc.pid}))
+        return
+    raise SystemExit(execute_batch(spec, summary))
+
+
+def verify_in_worktree(repo, rev, command, timeout):
+    repo = os.path.realpath(os.path.expanduser(repo))
+    started = NOW()
+    with tempfile.TemporaryDirectory(prefix=".openswarm-verify-", dir=os.path.dirname(repo)) as path:
+        rc, _, _ = git(["worktree", "add", "-q", "--detach", path, rev], repo, timeout=300)
+        if rc:
+            raise RuntimeError("verification worktree creation failed")
+        try:
+            exclude_dependency_links(path, link_dependency_dirs(repo, path))
+            result = run_verify(rewrite_verify_paths(command, repo, path), path, timeout)
+        finally:
+            rc, _, _ = git(["worktree", "remove", "--force", path], repo, timeout=60)
+            if rc:
+                raise RuntimeError("verification worktree cleanup failed")
+    return {"rc": result["rc"], "failing": result["failing"], "seconds": round(NOW() - started, 3)}
+
+
+def cmd_verify_remote(args):
+    rid = safe_id(args.run_id)
+    if args.timeout <= 0:
+        raise ValueError("verification timeout must be positive")
+    hosts = fleet_config()
+    source, target = fleet_host(args.from_host, hosts), fleet_host(args.on_host, hosts)
+    info = host_json(source, ["fleet", "_run-info", rid])
+    result = info.get("result") or {}
+    branch, commit = result.get("branch"), result.get("commit")
+    repo = (result.get("workspace") or {}).get("repo")
+    if branch != "openswarm/" + rid or not commit or not repo:
+        raise ValueError("run has no completed branch to verify")
+    repo = host_require(source, host_git(source, repo, ["rev-parse", "--show-toplevel"]),
+                        "source repository check").decode().strip()
+    logical = None
+    for name, path in (source.get("repos") or {}).items():
+        top = host_require(source, host_git(source, path, ["rev-parse", "--show-toplevel"]),
+                           "source repository resolution").decode().strip()
+        if top == repo:
+            logical = name
+            break
+    if target["kind"] == "local":
+        target_repo = host_repo(target, logical, local=True)
+    elif logical:
+        target_repo = host_repo(target, logical)
+    else:
+        raise ValueError("cannot identify the run's repository in source host repos")
+    target_repo = host_require(target, host_git(target, target_repo, ["rev-parse", "--show-toplevel"]),
+                               "verification repository check").decode().strip()
+    ref = "refs/openswarm-verify/" + uuid.uuid4().hex
+    try:
+        rc, _, _ = host_git(source, repo, ["show-ref", "--verify", "--quiet", "refs/heads/" + branch])
+        # Batch collection removes the source branch after confirming the planner's copy.
+        fetched = transfer_ref(source, repo, commit if rc else branch, target, target_repo, ref)
+        if fetched != commit:
+            raise RuntimeError("fetched commit differs from run result")
+        outcome = host_json(target, ["fleet", "_verify", "--repo", target_repo, "--rev", fetched,
+                                     "--verify", args.verify, "--timeout", str(args.timeout)], timeout=args.timeout + 60)
+    finally:
+        host_require(target, host_git(target, target_repo, ["update-ref", "-d", ref]), "verification ref cleanup")
+    outcome = {"host": target["name"], "rc": outcome["rc"], "failing": outcome["failing"], "seconds": outcome["seconds"]}
+    result["verify_remote"] = outcome
+    path = os.path.join(DATA, "remote-results", rid + ".json")
+    jsave(path, result)
+    print(json.dumps({"id": rid, "verify_remote": outcome, "result": path}, indent=2, ensure_ascii=False))
+    raise SystemExit(0 if outcome["rc"] == 0 else 1)
 
 
 # ---------------------------------------------------------------- monitoring
@@ -2772,10 +3297,11 @@ def summarize_event(o):
         if part.get("tool") == "bash":
             return "cmd", inp.get("command", "")
         return "tool", f"{part.get('tool')} {short(inp.get('filePath') or inp.get('path') or '', 120)}"
-    if t == "message_update":
-        delta = o.get("assistantMessageEvent") or {}
-        if delta.get("type") == "text_delta":
-            return "msg", delta.get("delta", "")
+    if t == "message_end":
+        message = o.get("message") or {}
+        if message.get("role") == "assistant":
+            return "msg", "".join(b.get("text", "") for b in message.get("content") or []
+                                   if isinstance(b, dict) and b.get("type") == "text")
     if t == "tool_execution_start":
         args = o.get("args") or {}
         return "cmd", args.get("command") or f"{o.get('toolName', 'tool')}"
@@ -2784,6 +3310,70 @@ def summarize_event(o):
     if t in ("extension_error", "auto_retry_end") and o.get("success") is False:
         return "error", short(o.get("error") or o.get("finalError"), 400)
     return None, None
+
+
+class WatchMessages:
+    """Buffer Cursor chunks until a tool boundary or the prompt's JSON-RPC response."""
+    def __init__(self):
+        self.chunks = []
+        self.prompt_id = None
+        self.tools = set()
+
+    def flush(self):
+        text = "".join(self.chunks)
+        self.chunks = []
+        return [("msg", text)] if text else []
+
+    def feed(self, event):
+        method = event.get("method")
+        update = (event.get("params") or {}).get("update") or {}
+        kind = update.get("sessionUpdate")
+        if method == "session/prompt":
+            self.prompt_id = event.get("id")
+        if method == "session/update" and kind == "agent_message_chunk":
+            content = update.get("content") or {}
+            if content.get("type") == "text":
+                self.chunks.append(content.get("text") or "")
+            return []
+        if not method and ("result" in event or "error" in event) and "id" in event:
+            # Lane logs contain incoming replies, including session/new and model selection.
+            if event["id"] == self.prompt_id or str(event["id"]).startswith("prompt-"):
+                return self.flush()
+        # Cursor's one-shot stream-json protocol uses assistant messages and tool_call/result events.
+        if event.get("type") == "assistant":
+            message = event.get("message") or {}
+            self.chunks.extend(b.get("text", "") for b in message.get("content") or []
+                               if isinstance(b, dict) and b.get("type") == "text")
+            return []
+        if event.get("type") == "stream_event":
+            delta = (event.get("event") or {}).get("delta") or {}
+            if delta.get("type") == "text_delta":
+                self.chunks.append(delta.get("text") or "")
+            return []
+        boundary = (method == "session/update" and kind in ("tool_call", "tool_call_update"))
+        boundary = boundary or event.get("type") in ("tool_call", "result")
+        rows = self.flush() if boundary else []
+        if method == "session/update" and kind in ("tool_call", "tool_call_update"):
+            tool_id = update.get("toolCallId")
+            if tool_id and tool_id in self.tools:
+                return rows
+            if tool_id:
+                self.tools.add(tool_id)
+        if event.get("type") == "tool_call":
+            return rows + [("cmd", event.get("command") or event.get("tool_call", {}).get("command")
+                            or event.get("subtype") or "tool")]
+        kind, text = summarize_event(event)
+        return rows + ([(kind, text)] if kind else [])
+
+
+def watch_diffstat(state):
+    path = state.get("workspace")
+    if not path and state.get("lane"):
+        path = os.path.join(lane_root(state["lane"]), "wt")
+    if not path:
+        return "0 files changed"
+    rc, text, _ = git(["diff", "--stat", "HEAD"], path)
+    return text.strip().splitlines()[-1].strip() if rc == 0 and text.strip() else "0 files changed"
 
 
 def cmd_watch(args, policy):
@@ -2796,6 +3386,8 @@ def cmd_watch(args, policy):
             child = [sys.executable, os.path.realpath(__file__), "watch", rid, "--label", short(title, 28),
                      "--stall-minutes", str(args.stall_minutes), "--heartbeat-minutes", str(args.heartbeat_minutes),
                      "--max-minutes", str(args.max_minutes)] + (["--from-end"] if args.from_end else [])
+            if getattr(args, "quiet", False):
+                child.append("--quiet")
             for rx in args.risk or []:
                 child += ["--risk", rx]
             procs.append(subprocess.Popen(child))
@@ -2811,15 +3403,21 @@ def cmd_watch(args, policy):
     last_evt = last_beat = NOW()
     cur_path, fh = None, None
     cmds, last_cmd, last_msg, seen = 0, "", "", set()
+    messages = WatchMessages()
 
     def out(kind, msg):
+        if getattr(args, "quiet", False) and kind.split("[", 1)[0] not in (
+                "DONE", "EXITED", "RISK", "STALL", "ERROR", "BUDGET", "ATTEMPT", "HEARTBEAT"):
+            return
         print(f"[{label} {time.strftime('%H:%M')}] {kind}: {msg}", flush=True)
 
     while True:
         st = jload(f"{rdir}/status.json", {}) or {}
         if st.get("events") and st["events"] != cur_path and os.path.exists(st["events"]):
             if fh:
+                fh.close()
                 out("ATTEMPT", f"switched to {st.get('backend')}/{st.get('model')} (attempt {st.get('attempt')})")
+            messages = WatchMessages()
             cur_path = st["events"]
             fh = open(cur_path, errors="ignore")
             if args.from_end:
@@ -2831,37 +3429,45 @@ def cmd_watch(args, policy):
                 o = json.loads(line)
             except Exception:
                 continue
-            kind, text = summarize_event(o)
-            if kind == "msg":
-                last_msg = text
-                out("MSG", short(text, 400))
-            elif kind == "cmd":
-                cmds += 1
-                last_cmd = text
-                if st.get("backend") == "cursor":
-                    out("CMD", short(text, 400))
-                for rx, name in risks:
-                    if rx.search(text) and (name, text[:80]) not in seen:
-                        seen.add((name, text[:80]))
-                        out(f"RISK[{name}]", short(text, 220))
-            elif kind == "tool":
-                cmds += 1
-                last_cmd = text
-            elif kind == "error":
-                out("ERROR", short(text, 300))
+            for kind, text in messages.feed(o):
+                if kind == "msg":
+                    last_msg = text
+                    out("MSG", short(text, 400))
+                elif kind == "cmd":
+                    cmds += 1
+                    last_cmd = text
+                    if st.get("backend") == "cursor":
+                        out("CMD", short(text, 400))
+                    for rx, name in risks:
+                        if rx.search(text) and (name, text[:80]) not in seen:
+                            seen.add((name, text[:80]))
+                            out(f"RISK[{name}]", short(text, 220))
+                elif kind == "tool":
+                    cmds += 1
+                    last_cmd = text
+                elif kind == "error":
+                    out("ERROR", short(text, 300))
             continue
         now = NOW()
         if st.get("state") == "finished":
+            for _, text in messages.flush():
+                out("MSG", short(text, 400))
+            if fh:
+                fh.close()
             r = jload(f"{rdir}/result.json", {}) or {}
             out("DONE", f"status={r.get('status')} backend={r.get('backend')}/{r.get('model')} "
                         f"commit={(r.get('commit') or '-')[:10]} files={len((r.get('result') or {}).get('files_changed') or [])} "
                         f"summary={short((r.get('result') or {}).get('summary'), 240)}")
             return
         if st.get("state") == "unroutable":
+            if fh:
+                fh.close()
             out("DONE", "status=unroutable (no backend had headroom)")
             return
         runner = st.get("runner_pid")
         if runner and not pid_alive(runner) and st.get("state") != "finished":
+            if fh:
+                fh.close()
             out("EXITED", f"runner process gone in state={st.get('state')} (cmds={cmds}); check {rdir}/run.out")
             return
         if st.get("deadline") and now > st["deadline"] + 90:
@@ -2872,9 +3478,11 @@ def cmd_watch(args, policy):
         if now - last_beat > args.heartbeat_minutes * 60:
             el = int((now - st.get("started", now)) / 60)
             out("HEARTBEAT", f"{st.get('state')} {st.get('backend')}/{st.get('model')} {el}m/{st.get('budget_minutes')}m "
-                             f"cmds={cmds} last: {short(last_msg or last_cmd, 160)}")
+                             f"cmds={cmds} files={watch_diffstat(st)} last: {short(last_msg, 200)}")
             last_beat = now
         if args.max_minutes and now - t_start > args.max_minutes * 60:
+            if fh:
+                fh.close()
             out("WATCH-EXPIRED", f"watch window {args.max_minutes}m ended; run still {st.get('state')} — re-arm: openswarm watch {args.run_id} --from-end")
             return
         time.sleep(2)
@@ -2889,16 +3497,18 @@ def run_digest(rid):
     if state not in ("finished", "unroutable", "dry-run") and st.get("runner_pid") and not pid_alive(st["runner_pid"]):
         state = "dead"
     cmds, last = 0, ""
+    messages = WatchMessages()
     if st.get("events") and os.path.exists(st["events"]):
         for line in open(st["events"], errors="ignore"):
             try:
-                kind, text = summarize_event(json.loads(line))
+                rows = messages.feed(json.loads(line))
             except Exception:
                 continue
-            if kind in ("cmd", "tool"):
-                cmds += 1
-            if kind == "msg":
-                last = text
+            for kind, text in rows:
+                if kind in ("cmd", "tool"):
+                    cmds += 1
+                if kind == "msg":
+                    last = text
     end = st.get("finished") or now
     out = {"id": rid, "state": state, "status": st.get("status") or r.get("status"), "title": st.get("title"),
            "backend": st.get("backend"), "model": st.get("model"), "effort": st.get("effort"),
@@ -3105,6 +3715,7 @@ def main():
     sp.add_argument("--task-file")
     sp.add_argument("--title")
     sp.add_argument("--cwd", default=os.getcwd())
+    sp.add_argument("--base", help="base commit for an isolated worktree; defaults to HEAD")
     sp.add_argument("--no-worktree", action="store_true")
     sp.add_argument("--verify-baseline", action="store_true",
                     help="when verify fails, rerun it on the base commit and pass if no failures are new")
@@ -3121,6 +3732,7 @@ def main():
     sp.add_argument("run_id", nargs="+", help="one or more run ids; several ids are watched together")
     sp.add_argument("--label")
     sp.add_argument("--from-end", action="store_true", help="skip events already written (use when re-arming)")
+    sp.add_argument("--quiet", action="store_true", help="only terminal, risk, stall, error, budget, attempt and heartbeat events")
     sp.add_argument("--stall-minutes", type=float, default=10)
     sp.add_argument("--heartbeat-minutes", type=float, default=15)
     sp.add_argument("--max-minutes", type=float, default=28, help="watch window; exits so the caller re-arms")
@@ -3136,6 +3748,47 @@ def main():
 
     sp = sub.add_parser("stop", help="terminate a running run")
     sp.add_argument("run_id")
+
+    sp = sub.add_parser("fleet", help="status and execution across configured hosts")
+    fleet_sub = sp.add_subparsers(dest="fleet_cmd", required=True)
+    fp = fleet_sub.add_parser("status")
+    fp.add_argument("--json", action="store_true")
+    fp = fleet_sub.add_parser("exec")
+    fp.add_argument("--timeout", type=float, default=300)
+    fp.add_argument("host")
+    fp.add_argument("args", nargs=argparse.REMAINDER)
+    fleet_sub.add_parser("_snapshot", help=argparse.SUPPRESS)
+    fp = fleet_sub.add_parser("_run-info", help=argparse.SUPPRESS)
+    fp.add_argument("run_id")
+    fp = fleet_sub.add_parser("_verify", help=argparse.SUPPRESS)
+    fp.add_argument("--repo", required=True)
+    fp.add_argument("--rev", required=True)
+    fp.add_argument("--verify", required=True)
+    fp.add_argument("--timeout", type=float, default=600)
+
+    sp = sub.add_parser("batch", help="queue task cards across fleet hosts and collect branches")
+    sp.add_argument("batch_action", nargs="?", choices=["status"])
+    sp.add_argument("id", nargs="?")
+    sp.add_argument("--repo")
+    sp.add_argument("--cards")
+    sp.add_argument("--hosts")
+    sp.add_argument("--per-host", type=int, default=1)
+    sp.add_argument("--backend", choices=list(PLANNERS))
+    sp.add_argument("--model")
+    sp.add_argument("--effort")
+    sp.add_argument("--verify")
+    sp.add_argument("--budget-minutes", type=int)
+    sp.add_argument("--base")
+    sp.add_argument("--detach", action="store_true")
+    sp.add_argument("--batch-id", help=argparse.SUPPRESS)
+    sp.add_argument("--poll-seconds", type=float, default=2, help=argparse.SUPPRESS)
+
+    sp = sub.add_parser("verify-remote", help="verify a fleet run in a temporary worktree on another host")
+    sp.add_argument("--from", dest="from_host", required=True)
+    sp.add_argument("--run", dest="run_id", required=True)
+    sp.add_argument("--on", dest="on_host", required=True)
+    sp.add_argument("--verify", required=True)
+    sp.add_argument("--timeout", type=float, default=600)
 
     sp = sub.add_parser("lane", help="manage resident executor lanes")
     lane_sub = sp.add_subparsers(dest="lane_cmd", required=True)
@@ -3197,6 +3850,17 @@ def main():
         cmd_report(a, policy)
     elif a.cmd == "stop":
         cmd_stop(a, policy)
+    elif a.cmd in ("fleet", "batch", "verify-remote"):
+        try:
+            if a.cmd == "fleet":
+                cmd_fleet(a)
+            elif a.cmd == "batch":
+                cmd_batch(a, policy)
+            else:
+                cmd_verify_remote(a)
+        except (ValueError, RuntimeError) as e:
+            print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False), file=sys.stderr)
+            sys.exit(2)
     elif a.cmd == "lane":
         try:
             if a.lane_cmd == "up":

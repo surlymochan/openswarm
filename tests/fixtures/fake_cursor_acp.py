@@ -48,6 +48,9 @@ config_options = [{"id": "model", "name": "Model", "category": "model", "type": 
                    "currentValue": "other-model", "options": [
                        {"value": "composer-2.5", "name": "Composer 2.5"},
                        {"value": "other-model", "name": "Other model"}]}]
+if os.environ.get("FAKE_CURSOR_ACP_MODELS"):
+    config_options[0]["options"] = [{"value": value, "name": value}
+                                    for value in json.loads(os.environ["FAKE_CURSOR_ACP_MODELS"])]
 for line in sys.stdin:
     try:
         request = json.loads(line)

@@ -67,6 +67,20 @@ class WorkspaceTest(unittest.TestCase):
         xs.cleanup_worktree(ws, fin["commit"])
         self.assertFalse(os.path.exists(ws["root"]))
 
+    def test_explicit_base_is_used_without_changing_checkout(self):
+        def current_head():
+            return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        base = current_head()
+        write(os.path.join(self.repo, "later.txt"), "later")
+        sh("git", "add", "later.txt", cwd=self.repo)
+        sh("git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "later", cwd=self.repo)
+        head = current_head()
+        ws = xs.prepare_workspace(self.repo, "explicit-base", True, base)
+        self.assertEqual(ws["base"], base)
+        self.assertFalse(os.path.exists(os.path.join(ws["root"], "later.txt")))
+        self.assertEqual(current_head(), head)
+        xs.cleanup_worktree(ws, None)
+
     def test_watch_accepts_several_runs(self):
         home = os.path.join(self.tmp, "home")
         runs = os.path.join(home, "runs")

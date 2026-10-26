@@ -68,6 +68,10 @@ Monitor(command: "~/.claude/skills/openswarm/bin/openswarm watch <id> --label <s
 `watch` prints one line per actionable event:
 `MSG` (executor progress) · `RISK[...]` (dangerous shell command: push, rm outside the worktree, secret prints, sudo or services, publish; add patterns with `--risk '<regex>'`) · `STALL` (no events for 10 minutes) · `HEARTBEAT` (every 15 minutes) · `BUDGET` · `ERROR` · `ATTEMPT` (fallback switched backend) · `DONE` / `EXITED` (terminal).
 It exits by itself with `WATCH-EXPIRED` after 28 minutes. **Re-arm** it with `--from-end` only if the run is still worth watching.
+Prefer `watch <ids...> --quiet` for routine monitoring: only terminal events, risks, stalls, errors, budgets,
+attempts and heartbeats. Pi messages merge at `message_end`; Cursor chunks merge at turn/tool boundaries.
+Heartbeats show elapsed time, commands, the worktree git diff summary (lanes too), and the last message (≤200 chars).
+Quiet watches still expire after their watch window, without printing `WATCH-EXPIRED`.
 
 How to react:
 - `MSG`: check it against the task scope. If the executor is drifting, `$XS stop <id>`, tighten the prompt, and re-dispatch.
@@ -103,18 +107,32 @@ systemd unit uses `Restart=always`, `MemoryMax=900M`, `CPUQuota=150%`, and `Nice
 automatically. On small Linux lane hosts, omit `--verify` to keep verification load off the agent host; the planner
 can verify elsewhere.
 
-Cursor ACP lists model values with their parameters (for example `composer-2.5[fast=true]`). Set `model` to a value
-exactly as `cursor-agent acp` lists it; a bare name that is not in the list fails the assignment with the list.
+Cursor ACP selects an exact model value first; otherwise a base name such as `composer-2.5` resolves to a unique
+parameterized value (`composer-2.5[fast=true]`). Ambiguity fails with the matches. State and results record the resolved value.
 
-### Executor hosts over SSH
+### Fleet, batch, and remote verification
 
-Lanes and runs do not have to be on the planner's machine. Install openswarm on the executor host, keep a clone of the
-repo there, and drive it with `ssh <host> openswarm ...` (`lane assign`, `run --detach`, `watch`, `runs`, `stop`).
-Point Monitor at `ssh <host> openswarm watch <id>`. Move code with git, not files: push the base to the host's
-repo (or a bare mirror) before assigning, then fetch `openswarm/<id>` back, review, and commit on the planner side.
-Executor commits use `--no-verify`, so re-commit on the planner side where the repository's hooks run.
-For hosts that pause when idle (cloud sandboxes), send a large batch at once and let them pause after it; do not
-trickle single tasks to them.
+Configure `$OPENSWARM_HOME/fleet.json` with `hosts`: each has `name`, `kind` (`local`, `ssh`, `instabox`),
+`ssh` alias or `box` when remote, optional `openswarm` executable, and `repos: {"project":"~/work/project"}`.
+Use the same logical repo name on all hosts; local defaults to the current checkout. Install the same CLI version
+and authenticated executors on the hosts. Full config example: [README](README.md#fleet-and-batch-dispatch).
+
+```bash
+$XS fleet status --json                  # never wakes paused instaboxes
+$XS fleet exec worker -- lane status     # arbitrary openswarm arguments, stdout/rc forwarded
+$XS batch --repo project --cards ./cards --hosts worker,sandbox --per-host 1 \
+  --backend pi --model cheap-model --budget-minutes 20 --detach
+$XS batch status <batch-id>
+$XS verify-remote --from worker --run <run-id> --on local --verify 'pytest -q'
+```
+
+Batch wakes each chosen instabox once, checks repos, syncs `--base` (default local HEAD), queues sorted cards
+round-robin, polls without Monitor, and fetches each result branch before deleting it on the executor host.
+Bundles travel over the transport; no pushes or git remotes. Optional backend/model/effort/verify flags pass to runs.
+Read `batches/<id>/summary.json` or `summary.md`; detached progress is in `batch.out`. Failed runs with commits
+are collected too. `run --base REV` also works. Verify remotely before integrating: `--on` accepts any configured
+host or `local`, uses a temporary worktree with linked dependencies, and writes `verify_remote` (host, rc, failing,
+seconds) into the original result's planner-side copy at `remote-results/<run-id>.json`. The target must be available.
 
 The user gets updates, not a stream. Relay progress in one line per meaningful event. Send a push notification only when the user needs to decide something, something really fails, or a phase finishes.
 
@@ -193,6 +211,6 @@ Override anything in `~/.claude/openswarm/policy.local.json`, deep-merged over `
 
 ## Files
 
-- `bin/openswarm`: CLI (probe, status, route, run, lane, watch, runs, report, stop, ingest-claude, ledger)
+- `bin/openswarm`: CLI (probe, status, route, run, lane, fleet, batch, verify-remote, watch, runs, report, stop, ingest-claude, ledger)
 - `policy.json`: defaults · `backends/*.json`: harness manifests (x-agents style) · `templates/openswarm-workflow.js`: Workflow template · `tests/test_route.py`: routing scenarios
-- `~/.claude/openswarm/`: `state.json`, `quota-claude.json`, `ledger.jsonl`, `breakers.json`, `lanes.json`, `lanes/<name>/` (state, socket, fixed worktree), `runs/<id>/` (task, events, result, patch), `worktrees/`
+- `$OPENSWARM_HOME/`: state, quota, ledger, breakers; `lanes.json`, `lanes/<name>/`; `fleet.json`, `batches/<id>/`, `remote-results/<id>.json`; `runs/<id>/` (task, events, result, patch), `worktrees/`

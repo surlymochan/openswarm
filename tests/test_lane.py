@@ -201,6 +201,42 @@ class LaneTests(unittest.TestCase):
         self.assertIn("other-model", events)
         self.assertNotIn("session/prompt", [entry.get("method") for entry in self.cursor_log()])
 
+    def test_cursor_base_model_resolves_parameterized_value(self):
+        self.set_config("cursor")
+        resolved = "composer-2.5[fast=true]"
+        self.env["FAKE_CURSOR_ACP_MODELS"] = json.dumps([resolved, "other-model"])
+        self.start_lane()
+        run_id = self.assign("resolve the base model")
+        self.assertEqual(self.wait_run(run_id)["status"], "done")
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual(result["model"], resolved)
+        self.assertEqual(result["resolved_model"], resolved)
+        self.assertEqual(self.lane_state()["model"], resolved)
+        choice = next(entry for entry in self.cursor_log() if entry.get("method") == "session/set_config_option")
+        self.assertEqual(choice["params"]["value"], resolved)
+
+    def test_cursor_exact_model_wins_over_base_matches(self):
+        self.set_config("cursor")
+        self.env["FAKE_CURSOR_ACP_MODELS"] = json.dumps(["composer-2.5[fast=true]", "composer-2.5"])
+        self.start_lane()
+        run_id = self.assign("prefer the exact model")
+        self.assertEqual(self.wait_run(run_id)["status"], "done")
+        choice = next(entry for entry in self.cursor_log() if entry.get("method") == "session/set_config_option")
+        self.assertEqual(choice["params"]["value"], "composer-2.5")
+
+    def test_cursor_ambiguous_base_model_fails_with_matches(self):
+        self.set_config("cursor")
+        values = ["composer-2.5[fast=true]", "composer-2.5[fast=false]"]
+        self.env["FAKE_CURSOR_ACP_MODELS"] = json.dumps(values)
+        self.start_lane()
+        run_id = self.assign("reject ambiguous model")
+        self.assertEqual(self.wait_run(run_id)["status"], "failed")
+        events = (self.data / "runs" / run_id / "events.1.cursor.jsonl").read_text()
+        self.assertIn("ambiguous", events)
+        for value in values:
+            self.assertIn(value, events)
+        self.assertNotIn("session/prompt", [entry.get("method") for entry in self.cursor_log()])
+
     def test_cursor_permission_is_allowed_and_logged(self):
         self.set_config("cursor")
         self.start_lane()
