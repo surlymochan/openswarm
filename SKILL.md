@@ -106,8 +106,12 @@ For long-lived Codex, Cursor Agent ACP, or Pi executors, configure `$OPENSWARM_H
 $XS lane up C1 K1 M1                      # omit names to start all configured lanes
 $XS lane status
 $XS lane assign C1 --task-file /tmp/task.md --title "..." --verify 'pytest -q' --budget-minutes 30
+$XS lane queue add codex --task-file /tmp/task.md --title "..." --verify 'pytest -q'
+$XS lane queue ls
+$XS lane queue rm <queue-item-id>
 $XS fleet exec worker -- lane assign C1 --task-file /tmp/task.md --title "..." --verify 'pytest -q' --budget-minutes 30
 $XS watch <run-id>
+$XS resume                                # active runs, lanes and watch commands after planner restart
 $XS lane steer C1 --text "..."             # delivered to the active turn
 $XS lane abort C1                          # or $XS stop <run-id>
 $XS lane down C1 K1 M1
@@ -120,6 +124,10 @@ $XS lane systemd-unit K1                   # print a system unit only; install i
 `fleet exec <host> -- lane assign <lane> --task-file <path>` for an explicit remote lane; it observes that
 host's local cap. Check `fleet status` for current runs, and use `batch` for planner-coordinated provider and
 total caps across hosts sharing an account.
+Idle supervisors also consume `lane queue` cards oldest-first. Queue targets may name a lane or a backend/provider
+pool such as `codex`, `minimax`, or `any`; `fleet status` includes pending queue depth per host. For sandboxed one-shot
+runs, `run --verify-cmds FILE` runs one host-side check per line after execution and stores each rc in
+`result.verify.commands`; `--verify CMD` remains supported.
 Review the run through `watch`,
 `runs`, `report`, and `runs/<id>/result.json` as usual. Each lane has a persistent `$OPENSWARM_HOME/lanes/<name>/wt`;
 assignments reset it to the requested `--base` (default: repo `HEAD`) and commit edits on `openswarm/<run-id>`.

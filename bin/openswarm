@@ -2024,10 +2024,16 @@ def new_run_id():
 
 
 def cmd_run(args, policy):
+    verify_commands = []
+    verify_cmds_file = getattr(args, "verify_cmds", None)
     if args.run_id:  # detached child: task already stored
         rid = args.run_id
         rdir = f"{RUNS}/{rid}"
         task = open(f"{rdir}/task.md").read()
+        if verify_cmds_file:
+            with open(verify_cmds_file) as stream:
+                verify_commands = [line.strip() for line in stream
+                                   if line.strip() and not line.lstrip().startswith("#")]
     else:
         task = args.prompt or (open(args.task_file).read() if args.task_file else sys.stdin.read())
         if not task.strip():
@@ -2037,6 +2043,15 @@ def cmd_run(args, policy):
         os.makedirs(rdir, exist_ok=True)
         with open(f"{rdir}/task.md", "w") as f:
             f.write(task)
+        if verify_cmds_file:
+            with open(verify_cmds_file) as stream:
+                verify_commands = [line.strip() for line in stream
+                                   if line.strip() and not line.lstrip().startswith("#")]
+            if not verify_commands:
+                raise ValueError("--verify-cmds file contains no commands")
+            verify_cmds_file = os.path.join(rdir, "verify-cmds.txt")
+            with open(verify_cmds_file, "w") as stream:
+                stream.write("\n".join(verify_commands) + "\n")
     title = args.title or task.strip().splitlines()[0][:72]
     prof = profile_from_args(args)
     budget_min = args.budget_minutes if args.budget_minutes is not None else policy["run"]["timeout_seconds"] / 60
@@ -2092,6 +2107,8 @@ def cmd_run(args, policy):
                 child += [f"--{flag.replace('_', '-')}", str(v)]
         if getattr(args, "verify", None):
             child += ["--verify", args.verify]
+        if verify_cmds_file:
+            child += ["--verify-cmds", verify_cmds_file]
         if getattr(args, "base", None):
             child += ["--base", args.base]
         if getattr(args, "verify_baseline", False):
@@ -2147,6 +2164,11 @@ def cmd_run(args, policy):
         prompt += (f"\nAfter you finish, the planner runs this acceptance command on the host, outside your sandbox: "
                    f"`{args.verify}`. If your sandbox blocks running it (ports, network, missing deps), say so in "
                    f"`tests` instead of treating it as a code failure.\n")
+    if verify_commands:
+        prompt += ("\nAfter you finish, the planner runs these acceptance commands on the host, outside your sandbox. "
+                   "If your sandbox blocks running them (ports, network, missing deps), report that in `tests` "
+                   "instead of treating it as a code failure:\n" +
+                   "\n".join(f"- `{command}`" for command in verify_commands) + "\n")
     attempts, tried = [], []
     budget_denial = None
     deadline = NOW() + budget_min * 60
@@ -2192,7 +2214,7 @@ def cmd_run(args, policy):
     fin = finalize_workspace(ws, title, decision["backend"], rdir, keep=True)
     verify = None
     prepare_error = None
-    if args.verify and not budget_denial and attempts[-1]["error_class"] not in ("risk_blocked", "rate_limit") and (result is not None or changed):
+    if (args.verify or verify_commands) and not budget_denial and attempts[-1]["error_class"] not in ("risk_blocked", "rate_limit") and (result is not None or changed):
         if lockfiles_changed(ws):
             prepared = run_workspace_prepare(ws["repo"], ws["root"], "before_verify")
             if prepared:
@@ -2201,8 +2223,25 @@ def cmd_run(args, policy):
                     prepare_error = prepared
         if not prepare_error:
             set_status(rdir, state="verifying")
-            verify = run_verify(args.verify, ws["path"], max(60, min(600, int(deadline - NOW()) + 300)))
-    if verify and verify["rc"] not in (0, 124) and getattr(args, "verify_baseline", False) and ws["mode"] == "worktree":
+            timeout = max(60, min(600, int(deadline - NOW()) + 300))
+            verify_rows = []
+            if args.verify:
+                command = rewrite_verify_paths(args.verify, ws.get("repo") or ws["path"],
+                                               ws.get("root") or ws["path"])
+                verify_rows.append(run_verify(command, ws["path"], timeout))
+            for command in verify_commands:
+                command = rewrite_verify_paths(command, ws.get("repo") or ws["path"],
+                                               ws.get("root") or ws["path"])
+                verify_rows.append(run_verify(command, ws["path"], timeout))
+            if len(verify_rows) == 1 and not verify_commands:
+                verify = verify_rows[0]
+            elif verify_rows:
+                command_rows = [{**row, "command": row["cmd"]} for row in verify_rows]
+                verify = {"rc": next((row["rc"] for row in verify_rows if row["rc"]), 0),
+                          "commands": command_rows,
+                          "tail": "\n".join(row.get("tail", "") for row in verify_rows)[-1500:],
+                          "failing": sorted({item for row in verify_rows for item in row.get("failing", [])})}
+    if verify and args.verify and verify["rc"] not in (0, 124) and getattr(args, "verify_baseline", False) and ws["mode"] == "worktree":
         # Repos often carry known failures; judge the run by failures it introduced, not by the suite's exit code.
         base = verify_against_baseline(args.verify, ws, max(60, min(600, int(deadline - NOW()) + 300)))
         if base.get("rc") is not None:
@@ -2602,6 +2641,9 @@ def bus_finish_run(rid, rdir, title, root, remote, issue, result, executor, stat
     error = None
     if result and result.get("branch") and result.get("commit"):
         try:
+            worker_run_id = result.get("worker_run_id")
+            if worker_run_id and worker_run_id != rid + "-w":
+                raise BusError("worker run id does not map to this planner run")
             commit = bus_fetch_branch(root, remote, rid, result["branch"], result["commit"])
             branch = f"openswarm/{rid}"
             _, diffstat, _ = git(["diff", "--stat", task.get("base", f"{commit}^"), commit], root)
@@ -2615,6 +2657,8 @@ def bus_finish_run(rid, rdir, title, root, remote, issue, result, executor, stat
             status = "failed"
     bus_info = {"issue_url": (issue or {}).get("html_url"), "executor": executor,
                 "pr_url": (result or {}).get("pr_url")}
+    if (result or {}).get("worker_run_id"):
+        bus_info["worker_run_id"] = result["worker_run_id"]
     output = {
         "id": rid, "status": status, "error_class": "bus_error" if error else None, "title": title,
         "backend": "github-issue", "model": None, "effort": None, "usage": None,
@@ -2878,21 +2922,22 @@ def bus_worker_run(issue, cfg, args, policy):
     winner = bus_winning_claim(bus_comments(cfg["repo"], issue["number"]), cfg["allowed_executors"])
     if not winner or str(winner.get("id")) != str(own_claim.get("id")):
         return False
-    base_dir = os.path.join(DATA, "bus-worker", task["run_id"])
+    worker_run_id = task["run_id"] + "-w"
+    base_dir = os.path.join(DATA, "bus-worker", worker_run_id)
     repo_path = os.path.join(base_dir, "repo")
     os.makedirs(base_dir, exist_ok=True)
     if os.path.exists(repo_path):
         shutil.rmtree(repo_path)
     try:
         bus_worker_clone(task, repo_path, allowed_repos)
-        rdir = os.path.join(RUNS, task["run_id"])
+        rdir = os.path.join(RUNS, worker_run_id)
         os.makedirs(rdir, exist_ok=True)
         with open(os.path.join(rdir, "task.md"), "w") as stream:
             stream.write(task_card)
         worker_budget = min(float(task["budget_minutes"]), float(args.budget_minutes))
         if worker_budget <= 0:
             raise BusError("worker budget must be greater than zero")
-        command = [sys.executable, os.path.realpath(__file__), "run", "--run-id", task["run_id"],
+        command = [sys.executable, os.path.realpath(__file__), "run", "--run-id", worker_run_id,
                    "--cwd", repo_path, "--base", task["base"], "--title", issue.get("title", "openswarm task"),
                    "--budget-minutes", str(worker_budget),
                    "--backend", args.backend]
@@ -2922,14 +2967,15 @@ def bus_worker_run(issue, cfg, args, policy):
             return False
         local = jload(os.path.join(rdir, "result.json"), {}) or {}
         nested = local.get("result") or {}
-        branch, commit = f"openswarm/{task['run_id']}", local.get("commit")
+        worker_branch, branch = f"openswarm/{worker_run_id}", f"openswarm/{task['run_id']}"
+        commit = local.get("commit")
         report_status = nested.get("status") or local.get("status") or "failed"
         summary = nested.get("summary") or local.get("error") or f"worker run ended with {report_status}"
         pr_url = None
         if labels["cancelled"] in issue_label_names(gh_transport(f"repos/{cfg['repo']}/issues/{issue['number']}")):
             return False
         if branch and commit:
-            code, _, push_error = sh(["git", "push", "origin", f"{branch}:{branch}"], cwd=repo_path, timeout=300)
+            code, _, push_error = sh(["git", "push", "origin", f"{worker_branch}:{branch}"], cwd=repo_path, timeout=300)
             if code:
                 report_status = "failed"
                 summary += f"; push failed: {bus_redact(push_error.strip())[:180]}"
@@ -2943,7 +2989,8 @@ def bus_worker_run(issue, cfg, args, policy):
         report = bus_sanitize({"status": report_status if report_status in ("done", "partial", "failed") else "failed",
                   "summary": summary, "files_changed": nested.get("files_changed") or [],
                   "tests": nested.get("tests") or "not run: executor did not return a test report",
-                  "followups": followups, "branch": branch, "commit": commit, "pr_url": pr_url})
+                  "followups": followups, "branch": branch, "commit": commit, "pr_url": pr_url,
+                  "worker_run_id": worker_run_id})
         terminal = "failed" if report["status"] == "failed" else "done"
         body = "```openswarm-result\n" + json.dumps(report, ensure_ascii=False, indent=2) + "\n```"
         bus_comment(cfg["repo"], issue["number"], body)
@@ -2956,7 +3003,7 @@ def bus_worker_run(issue, cfg, args, policy):
             return False
         report = {"status": "failed", "summary": bus_redact(str(error))[:500], "files_changed": [],
                   "tests": "not run: worker failed before verification", "followups": [], "branch": None,
-                  "commit": None, "pr_url": None}
+                  "commit": None, "pr_url": None, "worker_run_id": worker_run_id}
         bus_comment(cfg["repo"], issue["number"], "```openswarm-result\n" + json.dumps(report, indent=2) + "\n```")
         bus_set_issue_labels(cfg["repo"], issue["number"], cfg, add=[labels["failed"]],
                              remove=[labels["queued"], labels["claimed"]])
@@ -3055,8 +3102,6 @@ def lane_config():
         if lane.get("binary") and not os.access(lane["binary"], os.X_OK):
             raise ValueError(f"invalid lane config {where}: binary override is not executable")
         out.append(dict(lane))
-    if not out:
-        raise ValueError(f"invalid lane config {path}: lanes must not be empty")
     return out
 
 
@@ -3077,6 +3122,140 @@ def lane_write_state(lane_name, **changes):
     state["updated"] = NOW()
     jsave(lane_state_path(lane_name), state)
     return state
+
+
+def lane_queue_dir():
+    return os.path.join(DATA, "queue")
+
+
+def lane_queue_lock():
+    os.makedirs(lane_queue_dir(), exist_ok=True)
+    return open(os.path.join(lane_queue_dir(), "queue.lock"), "a")
+
+
+def lane_queue_rows():
+    rows = []
+    for path in glob.glob(os.path.join(lane_queue_dir(), "*.json")):
+        row = jload(path)
+        if isinstance(row, dict):
+            rows.append(row)
+    return sorted(rows, key=lambda row: (row.get("created", 0), row.get("id", "")))
+
+
+def lane_queue_depth():
+    with lane_queue_lock() as lock:
+        fcntl.flock(lock, fcntl.LOCK_SH)
+        return sum(row.get("state") == "queued" for row in lane_queue_rows())
+
+
+def lane_queue_matches(item, lane, policy):
+    target = item.get("target", "")
+    if item.get("target_type") == "lane":
+        return target == lane["name"]
+    if target == "any":
+        return True
+    backend = lane.get("backend", "").casefold()
+    provider = str(execution_provider(lane["backend"], policy=policy, lane=lane) or "").casefold()
+    target = target.casefold()
+    return target == backend or target == provider or bool(provider and provider.startswith(target + "-"))
+
+
+def lane_queue_has_provider_slot(lane, policy):
+    provider = execution_provider(lane["backend"], policy=policy, lane=lane)
+    keys = concurrency_keys(lane["backend"], provider)
+    limits = provider_concurrency_limits(policy, keys)
+    if not limits:
+        return True
+    lock_path = os.path.join(DATA, "provider-concurrency.lock")
+    os.makedirs(DATA, exist_ok=True)
+    with open(lock_path, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        active = {}
+        for path in glob.glob(os.path.join(RUNS, "*", "status.json")):
+            row = jload(path, {}) or {}
+            if row.get("state") != "running":
+                continue
+            pid = row.get("runner_pid")
+            if pid and not pid_alive(pid):
+                continue
+            active[row.get("id") or os.path.basename(os.path.dirname(path))] = row
+        for path in glob.glob(os.path.join(DATA, "lanes", "*", "state.json")):
+            row = jload(path, {}) or {}
+            rid = row.get("current_run")
+            if row.get("turn_state") != "running" or not rid or rid in active:
+                continue
+            pid = row.get("supervisor_pid")
+            if pid and not pid_alive(pid):
+                continue
+            active[rid] = {"backend": row.get("backend"), "provider": row.get("provider"),
+                           "concurrency_keys": row.get("concurrency_keys") or []}
+        counts = {key: 0 for key in limits}
+        for row in active.values():
+            row_keys = row.get("concurrency_keys") or concurrency_keys(row.get("backend"), row.get("provider"))
+            for key in counts:
+                if key in row_keys:
+                    counts[key] += 1
+        return all(counts[key] < cap for key, cap in limits.items())
+
+
+def lane_queue_add(args):
+    task = open(args.task_file).read()
+    if not task.strip():
+        raise ValueError("empty task")
+    if not args.title.strip():
+        raise ValueError("queue title must not be empty")
+    if not LANE_NAME_RE.fullmatch(args.target):
+        raise ValueError("queue target must be a lane or simple pool name")
+    budget = args.budget_minutes if args.budget_minutes is not None else load_policy()["run"]["timeout_seconds"] / 60
+    if not math.isfinite(budget) or budget < 0:
+        raise ValueError("budget-minutes must be non-negative")
+    try:
+        lane_names = {lane["name"] for lane in lane_config()}
+    except ValueError:
+        lane_names = set()
+    target_type = "lane" if args.target in lane_names else "pool"
+    item_id = "q-" + new_run_id()
+    item = {"id": item_id, "created": NOW(), "state": "queued", "target": args.target,
+            "target_type": target_type, "task": task, "title": args.title,
+            "verify": args.verify, "base": args.base, "budget_minutes": budget}
+    with lane_queue_lock() as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        jsave(os.path.join(lane_queue_dir(), item_id + ".json"), item)
+    print(json.dumps(item, ensure_ascii=False, indent=2))
+
+
+def lane_queue_list():
+    with lane_queue_lock() as lock:
+        fcntl.flock(lock, fcntl.LOCK_SH)
+        rows = lane_queue_rows()
+    public = [{key: value for key, value in row.items() if key != "task"} for row in rows]
+    print(json.dumps(public, ensure_ascii=False, indent=2))
+
+
+def lane_queue_remove(item_id):
+    safe_id(item_id)
+    path = os.path.join(lane_queue_dir(), item_id + ".json")
+    with lane_queue_lock() as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        row = jload(path)
+        if not row:
+            raise ValueError(f"no such queue item: {item_id}")
+        if row.get("state") == "claimed":
+            raise ValueError("queue item is already claimed by a lane")
+        os.unlink(path)
+    print(json.dumps({"removed": item_id}))
+
+
+def lane_queue_finish(item_id):
+    if not item_id:
+        return
+    path = os.path.join(lane_queue_dir(), item_id + ".json")
+    with lane_queue_lock() as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
 
 
 def lane_call(name, request, timeout=8):
@@ -3324,6 +3503,71 @@ def lane_record_event(path, event):
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
+def lane_accept_assignment(lane, current, req):
+    name = lane["name"]
+    state = jload(lane_state_path(name), {}) or {}
+    if state.get("state") != "idle" or current.get("run_id"):
+        return {"ok": False, "error": f"lane {name} is busy ({state.get('state')})"}
+    rid = req.get("run_id")
+    if not rid or not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", rid):
+        return {"ok": False, "error": "invalid run id"}
+    rdir = os.path.join(RUNS, rid)
+    budget = req.get("budget_minutes")
+    if budget is None:
+        budget = load_policy()["run"]["timeout_seconds"] / 60
+    admit_budget(load_policy(), lane["backend"], float(budget), rdir, id=rid,
+                 state="queued", started=NOW(), runner_pid=os.getpid(), lane=name)
+    os.makedirs(rdir, exist_ok=True)
+    task = str(req.get("task") or "")
+    with open(os.path.join(rdir, "task.md"), "w") as f:
+        f.write(task)
+    spec = {k: req.get(k) for k in ("title", "verify", "verify_baseline", "budget_minutes", "base",
+                                    "queue_item_id")}
+    provider = execution_provider(lane["backend"], policy=load_policy(), lane=lane)
+    spec.update({"run_id": rid, "task": task, "started": NOW(), "provider": provider})
+    spec["_event_file"] = os.path.join(rdir, f"events.1.{lane['backend']}.jsonl")
+    open(spec["_event_file"], "w").close()
+    current.update(spec)
+    lane_write_state(name, state="busy", current_run=rid, turn_state="queued",
+                     concurrency_keys=[], last_error=None)
+    set_status(rdir, id=rid, state="queued", title=spec.get("title") or task.strip().splitlines()[0][:72],
+               backend=lane["backend"], model=lane["model"], effort=lane.get("effort"), lane=name,
+               provider=provider, concurrency_keys=concurrency_keys(lane["backend"], provider),
+               started=spec["started"], budget_minutes=spec.get("budget_minutes"),
+               cwd=lane["repo"], runner_pid=os.getpid(), events=spec["_event_file"],
+               **({"queue_item_id": spec["queue_item_id"]} if spec.get("queue_item_id") else {}))
+    return {"ok": True, "id": rid, "state": "queued"}
+
+
+def lane_queue_dispatch(lane, current, policy):
+    with lane_queue_lock() as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        for item in lane_queue_rows():
+            if item.get("state") != "queued" or not lane_queue_matches(item, lane, policy):
+                continue
+            if not lane_queue_has_provider_slot(lane, policy):
+                return False
+            rid = new_run_id()
+            item.update(state="claimed", lane=lane["name"], run_id=rid, claimed=NOW())
+            item_path = os.path.join(lane_queue_dir(), item["id"] + ".json")
+            jsave(item_path, item)
+            try:
+                answer = lane_accept_assignment(lane, current, {
+                    "run_id": rid, "task": item["task"], "title": item["title"],
+                    "verify": item.get("verify"), "base": item.get("base"),
+                    "budget_minutes": item.get("budget_minutes"), "queue_item_id": item["id"]})
+            except BudgetExceeded as error:
+                item.update(state="blocked", error=error.detail.get("error", "budget exceeded"))
+                jsave(item_path, item)
+                return False
+            if answer.get("ok"):
+                return True
+            item.update(state="queued", lane=None, run_id=None, claimed=None, last_error=answer.get("error"))
+            jsave(item_path, item)
+            return False
+    return False
+
+
 def lane_control_messages(server, lane, current, child, turn, pending):
     """Handle currently queued local control-socket requests; return whether shutdown was requested."""
     down = False
@@ -3347,38 +3591,7 @@ def lane_control_messages(server, lane, current, child, turn, pending):
             if op == "ping":
                 answer["state"] = jload(lane_state_path(lane["name"]), {})
             elif op == "assign":
-                state = jload(lane_state_path(lane["name"]), {}) or {}
-                if state.get("state") != "idle" or current.get("run_id"):
-                    answer = {"ok": False, "error": f"lane {lane['name']} is busy ({state.get('state')})"}
-                else:
-                    rid = req.get("run_id")
-                    if not rid or not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", rid):
-                        answer = {"ok": False, "error": "invalid run id"}
-                    else:
-                        rdir = os.path.join(RUNS, rid)
-                        budget = req.get("budget_minutes")
-                        if budget is None:
-                            budget = load_policy()["run"]["timeout_seconds"] / 60
-                        admit_budget(load_policy(), lane["backend"], float(budget), rdir, id=rid,
-                                     state="queued", started=NOW(), runner_pid=os.getpid(), lane=lane["name"])
-                        os.makedirs(rdir, exist_ok=True)
-                        task = str(req.get("task") or "")
-                        with open(os.path.join(rdir, "task.md"), "w") as f:
-                            f.write(task)
-                        spec = {k: req.get(k) for k in ("title", "verify", "verify_baseline", "budget_minutes", "base")}
-                        provider = execution_provider(lane["backend"], policy=load_policy(), lane=lane)
-                        spec.update({"run_id": rid, "task": task, "started": NOW(), "provider": provider})
-                        spec["_event_file"] = os.path.join(rdir, f"events.1.{lane['backend']}.jsonl")
-                        open(spec["_event_file"], "w").close()
-                        current.update(spec)
-                        lane_write_state(lane["name"], state="busy", current_run=rid, turn_state="queued",
-                                         concurrency_keys=[], last_error=None)
-                        set_status(rdir, id=rid, state="queued", title=spec.get("title") or task.strip().splitlines()[0][:72],
-                                   backend=lane["backend"], model=lane["model"], effort=lane.get("effort"), lane=lane["name"],
-                                   provider=provider, concurrency_keys=concurrency_keys(lane["backend"], provider),
-                                   started=spec["started"], budget_minutes=spec.get("budget_minutes"),
-                                   cwd=lane["repo"], runner_pid=os.getpid(), events=spec["_event_file"])
-                        answer = {"ok": True, "id": rid, "state": "queued"}
+                answer = lane_accept_assignment(lane, current, req)
             elif op in ("steer", "abort", "down"):
                 active = bool(current.get("run_id"))
                 if op == "steer":
@@ -3861,6 +4074,8 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
            "usage": usage, "seconds": round(sum(attempt["seconds"] for attempt in attempts), 3), "result": final, "workspace":
            {k: v for k, v in ws.items() if k in ("mode", "path", "repo", "base", "note", "lane")},
            **fin, "attempts": attempts, "run_dir": rdir}
+    if spec.get("queue_item_id"):
+        out["queue_item_id"] = spec["queue_item_id"]
     jsave(os.path.join(rdir, "result.json"), out)
     append_ledger({"id": rid, "ts": NOW(), "title": title, "status": status, "lane": lane["name"],
                    "backend": lane["backend"], "model": model, "effort": lane.get("effort"),
@@ -3869,7 +4084,8 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
                    "usage": usage, "commit": fin.get("commit"),
                    "risk_blocks": out["risk_blocks"], "summary": (final or {}).get("summary"),
                    "files": len((final or {}).get("files_changed") or [])})
-    set_status(rdir, state="finished", status=status, finished=NOW(), commit=fin.get("commit"), lane=lane["name"])
+    set_status(rdir, state="finished", status=status, finished=NOW(), commit=fin.get("commit"), lane=lane["name"],
+               **({"queue_item_id": spec["queue_item_id"]} if spec.get("queue_item_id") else {}))
     return out
 
 
@@ -4052,6 +4268,7 @@ def cmd_lane_serve(lane, policy):
                 lane_finalize_run(lane, spec, lane_prepare_workspace(lane, spec["run_id"], spec.get("base")),
                                   None, {}, "exec_error", 1,
                                   os.path.join(RUNS, spec["run_id"], f"events.1.{lane['backend']}.jsonl"))
+                lane_queue_finish(spec.get("queue_item_id"))
                 current.clear()
             try:
                 child.close()
@@ -4086,6 +4303,7 @@ def cmd_lane_serve(lane, policy):
             try:
                 lane_do_run(lane, spec, child, server, current)
             finally:
+                lane_queue_finish(spec.get("queue_item_id"))
                 down_after = bool(spec.get("down_requested"))
                 current.clear()
             if child and child.alive():
@@ -4099,6 +4317,8 @@ def cmd_lane_serve(lane, policy):
         if child:
                 lane_write_state(name, state="idle", child_pid=child.proc.pid, current_run=None,
                                  turn_state=None, concurrency_keys=[])
+                if lane_queue_dispatch(lane, current, policy):
+                    continue
         timeout = max(0, min(0.5, next_start - NOW())) if child is None else 0.5
         try:
             ready, _, _ = select.select([server], [], [], timeout)
@@ -4470,7 +4690,11 @@ def instabox_states(hosts):
 
 
 def fleet_snapshot():
-    lanes = lane_status_rows() if os.path.exists(envvar("LANES_FILE", os.path.join(DATA, "lanes.json"))) else []
+    lane_config_error = None
+    try:
+        lanes = lane_status_rows() if os.path.exists(envvar("LANES_FILE", os.path.join(DATA, "lanes.json"))) else []
+    except ValueError as error:
+        lanes, lane_config_error = [], str(error)
     runs = []
     for path in sorted(glob.glob(os.path.join(RUNS, "*", "status.json"))):
         row = run_digest(os.path.basename(os.path.dirname(path)))
@@ -4479,7 +4703,9 @@ def fleet_snapshot():
     policy = load_policy()
     providers = {backend: execution_provider(backend, policy=policy)
                  for backend in ("codex", "cursor", "pi", "ocgo", "deepseek")}
-    return {"lanes": lanes, "active_runs": runs, "providers": providers}
+    return {"lanes": lanes, "active_runs": runs, "providers": providers,
+            "queue_depth": lane_queue_depth(), "lane_config_valid": lane_config_error is None,
+            "lane_config_error": lane_config_error}
 
 
 def cmd_fleet(args):
@@ -4510,7 +4736,8 @@ def cmd_fleet(args):
     states = instabox_states(hosts)
     rows = []
     for host in hosts:
-        row = {"name": host["name"], "reachable": False, "paused": False, "lanes": [], "active_runs": []}
+        row = {"name": host["name"], "reachable": False, "paused": False, "lanes": [], "active_runs": [],
+               "queue_depth": None}
         state = states.get(host.get("box"), "").lower()
         if host["kind"] == "instabox" and state not in ("running", "ready", "active"):
             row.update(paused=state == "paused", state=state or "unknown")
@@ -4524,8 +4751,12 @@ def cmd_fleet(args):
         print(json.dumps({"hosts": rows}, indent=2, ensure_ascii=False))
     else:
         for row in rows:
-            state = "paused" if row["paused"] else ("reachable" if row["reachable"] else "unreachable")
-            print(f"{row['name']}  {state}  lanes={len(row['lanes'])} active={len(row['active_runs'])}")
+            state = ("paused" if row["paused"] else
+                     "unreachable" if not row["reachable"] else
+                     "config invalid" if row.get("lane_config_valid") is False else "reachable")
+            queue_depth = row["queue_depth"] if row["reachable"] else "?"
+            print(f"{row['name']}  {state}  lanes={len(row['lanes'])} active={len(row['active_runs'])} "
+                  f"queue={queue_depth}")
             for lane in row["lanes"]:
                 print(f"  {lane['name']} {lane['state']} {lane.get('model') or '-'} run={lane.get('current_run') or '-'}")
             for run in row["active_runs"]:
@@ -5239,6 +5470,41 @@ def cmd_runs(args, policy):
               f"  {r['elapsed_min']}m/{r['budget_min']}m cmds={r['cmds']}{flag}\n    {r['title']}\n    last: {r['last_msg']}")
 
 
+def cmd_resume(args):
+    active_states = ("queued", "routing", "running", "finalizing", "verifying", "dead")
+    rows = []
+    if os.path.isdir(RUNS):
+        for rid in sorted(os.listdir(RUNS), reverse=True):
+            row = run_digest(rid)
+            if row["state"] in active_states:
+                row["watch"] = f"openswarm watch {rid}"
+                rows.append(row)
+    try:
+        lanes = lane_status_rows()
+        config_error = None
+    except ValueError as error:
+        lanes, config_error = [], str(error)
+    for lane in lanes:
+        lane["watch"] = f"openswarm watch {lane['current_run']}" if lane.get("current_run") else None
+    snapshot = {"active_runs": rows, "lanes": lanes, "lane_config_error": config_error}
+    if args.json:
+        print(json.dumps(snapshot, indent=2, ensure_ascii=False))
+        return
+    print("Active runs:")
+    if not rows:
+        print("  none")
+    for row in rows:
+        print(f"  {row['id']} {row['state']} {row.get('title') or '-'} — {row['watch']}")
+    print("Lanes:")
+    if config_error:
+        print(f"  config invalid: {config_error}")
+    elif not lanes:
+        print("  none configured")
+    for lane in lanes:
+        run = f" run={lane['current_run']} ({lane['watch']})" if lane.get("current_run") else ""
+        print(f"  {lane['name']} {lane['state']}{run}")
+
+
 def token_count(usage):
     usage = usage or {}
     for key in ("totalTokens", "total_tokens"):
@@ -5575,8 +5841,10 @@ def main():
     sp.add_argument("--no-worktree", action="store_true")
     sp.add_argument("--verify-baseline", action="store_true",
                     help="when verify fails, rerun it on the base commit and pass if no failures are new")
-    sp.add_argument("--verify", help="acceptance command run on the host in the worktree after the executor finishes; "
-                                     "its exit code overrides a sandbox-limited partial/done")
+    verify_group = sp.add_mutually_exclusive_group()
+    verify_group.add_argument("--verify", help="acceptance command run on the host in the worktree after the executor finishes; "
+                                                "its exit code overrides a sandbox-limited partial/done")
+    verify_group.add_argument("--verify-cmds", help="file with one host-side acceptance command per line")
     sp.add_argument("--keep-worktree", action="store_true")
     sp.add_argument("--no-fallback", action="store_true")
     sp.add_argument("--budget-minutes", type=float, help="hard wall-clock budget; executor is killed when exceeded")
@@ -5598,6 +5866,9 @@ def main():
     sp = sub.add_parser("runs", help="report recent/active runs (for scheduled check-ins)")
     sp.add_argument("-n", type=int, default=10)
     sp.add_argument("--active", action="store_true")
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser("resume", help="list active runs and lane watch commands after planner restart")
     sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser("report", help="compact check-in: quotas + active runs + recently finished")
@@ -5680,6 +5951,18 @@ def main():
     lp = lane_sub.add_parser("down", help="stop lane turns, children, and supervisors")
     lp.add_argument("names", nargs="*", help="lane names; default stops all configured lanes")
     lane_sub.add_parser("status", help="show configured lane state")
+    lp = lane_sub.add_parser("queue", help="manage cards waiting for an idle lane")
+    queue_sub = lp.add_subparsers(dest="queue_cmd", required=True)
+    qp = queue_sub.add_parser("add", help="add a card for one lane or backend/provider pool")
+    qp.add_argument("target", help="lane name or pool such as codex, minimax, or any")
+    qp.add_argument("--task-file", required=True)
+    qp.add_argument("--title", required=True)
+    qp.add_argument("--verify")
+    qp.add_argument("--base")
+    qp.add_argument("--budget-minutes", type=float)
+    queue_sub.add_parser("ls", help="list queued lane cards")
+    qp = queue_sub.add_parser("rm", help="remove a queued card")
+    qp.add_argument("id")
     lp = lane_sub.add_parser("assign", help="assign one task to an idle lane")
     lp.add_argument("name")
     task_group = lp.add_mutually_exclusive_group(required=True)
@@ -5731,6 +6014,8 @@ def main():
         cmd_watch(a, policy)
     elif a.cmd == "runs":
         cmd_runs(a, policy)
+    elif a.cmd == "resume":
+        cmd_resume(a)
     elif a.cmd == "report":
         cmd_report(a, policy)
     elif a.cmd == "stop":
@@ -5769,6 +6054,13 @@ def main():
                 cmd_lane_down(a)
             elif a.lane_cmd == "status":
                 cmd_lane_status()
+            elif a.lane_cmd == "queue":
+                if a.queue_cmd == "add":
+                    lane_queue_add(a)
+                elif a.queue_cmd == "ls":
+                    lane_queue_list()
+                else:
+                    lane_queue_remove(a.id)
             elif a.lane_cmd == "assign":
                 cmd_lane_assign(a)
             elif a.lane_cmd in ("steer", "abort"):

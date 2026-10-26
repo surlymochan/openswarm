@@ -184,7 +184,11 @@ Each lane keeps a fixed worktree under `$OPENSWARM_HOME/lanes/<name>/wt`. Start 
 openswarm lane up C1 K1 M1               # no names starts every configured lane; safe to repeat
 openswarm lane status
 openswarm lane assign C1 --task-file /tmp/task.md --title "Parser fix" --verify 'pytest -q' --budget-minutes 30
+openswarm lane queue add codex --task-file /tmp/task.md --title "Next parser fix" --verify 'pytest -q'
+openswarm lane queue ls
+openswarm lane queue rm <queue-item-id>
 openswarm watch <run-id>
+openswarm resume                       # active runs, lanes, and watch commands after planner restart
 openswarm lane steer C1 --text "Add a regression test before finishing"
 openswarm lane abort C1                  # openswarm stop <run-id> also aborts a lane turn
 openswarm lane down C1 K1 M1
@@ -194,6 +198,9 @@ openswarm lane systemd-unit K1             # prints a system systemd unit; does 
 
 Lane runs use the normal `runs/<id>` files, `openswarm/<id>` commit branch, host verification, ledger, `watch`,
 `runs`, and `report` paths. `--base REV` selects the commit used to reset a lane worktree for one assignment.
+Queue cards are stored in `$OPENSWARM_HOME/queue/` and picked up by idle supervisors. Targets can be a lane name or
+a backend/provider pool such as `codex`, `minimax`, or `any`; matching cards are started oldest-first when local
+`policy.local.json` concurrency caps allow it. `fleet status` reports each host's pending queue depth.
 An optional lane `binary` absolute path overrides the detected executable, which is useful for wrappers and offline
 protocol testing. Cursor defaults to model `composer-2.5`; its binary is `cursor-agent` on `PATH`, then
 `~/.local/bin/cursor-agent`. ACP model selection first tries the exact configured value, then matches the part before
@@ -206,6 +213,10 @@ waits for its response, then continues in the same ACP session with the steer te
 On small Linux lane hosts, omit `--verify` so test suites and their dependencies do not compete with the agent for
 memory and CPU. The planner can run acceptance checks on its host. `lane systemd-unit` prints a system service with
 `MemoryMax=900M`, `CPUQuota=150%`, and `Nice=10`; review and install it separately if needed.
+
+For one-shot sandboxed runs that need several host-side checks, pass `--verify-cmds FILE` with one command per line.
+Commands run on the host after the executor exits; each exit code is recorded in `result.verify.commands`. The existing
+`--verify CMD` option remains available for a single command.
 
 ## Fleet and batch dispatch
 

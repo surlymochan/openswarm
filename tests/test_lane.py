@@ -125,6 +125,55 @@ class LaneTests(unittest.TestCase):
         self.assertEqual(self.git("status", "--porcelain"), "")
         self.assertEqual(self.git("-C", str(self.data / "lanes" / self.lane_name / "wt"), "branch", "--show-current"), "")
 
+    def test_queue_pool_dispatches_to_idle_lane_and_records_item_id(self):
+        self.start_lane()
+        task_file = self.root / "queued-task.md"
+        task_file.write_text("complete the queued card")
+        queued = json.loads(self.cli("lane", "queue", "add", "codex", "--task-file", task_file,
+                                     "--title", "queued card").stdout)
+        self.assertEqual(queued["target_type"], "pool")
+        self.assertEqual(json.loads(self.cli("lane", "queue", "ls").stdout)[0]["id"], queued["id"])
+        run = self.wait_for(lambda: self.lane_state().get("current_run"), description="queued card dispatch")
+        run_id = run
+        state = self.wait_run(run_id)
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual(state["status"], "done")
+        self.assertEqual(result["queue_item_id"], queued["id"])
+        self.assertEqual((self.data / "queue" / f"{queued['id']}.json").exists(), False)
+
+    def test_empty_lane_config_is_valid(self):
+        (self.data / "lanes.json").write_text(json.dumps({"lanes": []}))
+        self.assertEqual(self.cli("lane", "status").stdout.strip(), "[]")
+
+    def test_queue_rm_removes_pending_item(self):
+        task_file = self.root / "rm-task.md"
+        task_file.write_text("pending card")
+        queued = json.loads(self.cli("lane", "queue", "add", "any", "--task-file", task_file,
+                                     "--title", "remove me").stdout)
+        removed = json.loads(self.cli("lane", "queue", "rm", queued["id"]).stdout)
+        self.assertEqual(removed["removed"], queued["id"])
+        self.assertEqual(json.loads(self.cli("lane", "queue", "ls").stdout), [])
+
+    def test_queue_waits_for_provider_concurrency_slot(self):
+        (self.data / "policy.local.json").write_text(json.dumps({"concurrency": {"total": 1}}))
+        self.start_lane()
+        held = self.data / "runs" / "cap-hold"
+        held.mkdir(parents=True)
+        (held / "status.json").write_text(json.dumps({"id": "cap-hold", "state": "running",
+                                                       "backend": "codex", "concurrency_keys": ["codex", "total"],
+                                                       "runner_pid": os.getpid()}))
+        task_file = self.root / "cap-task.md"
+        task_file.write_text("wait for provider slot")
+        queued = json.loads(self.cli("lane", "queue", "add", "codex", "--task-file", task_file,
+                                     "--title", "capped card").stdout)
+        time.sleep(0.8)
+        self.assertIsNone(self.lane_state().get("current_run"))
+        self.assertEqual(json.loads((self.data / "queue" / f"{queued['id']}.json").read_text())["state"], "queued")
+        (held / "status.json").write_text(json.dumps({"id": "cap-hold", "state": "finished",
+                                                       "backend": "codex", "runner_pid": os.getpid()}))
+        run_id = self.wait_for(lambda: self.lane_state().get("current_run"), description="provider slot release")
+        self.assertEqual(self.wait_run(run_id)["status"], "done")
+
     def test_pi_rate_limit_retries_in_session_and_watch_shows_alert(self):
         self.set_config("pi")
         (self.data / "policy.local.json").write_text(json.dumps({"rate_limit": {

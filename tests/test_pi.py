@@ -50,7 +50,7 @@ end(json.dumps(body), {"input": 20, "output": 25, "cacheRead": 3, "cacheWrite": 
 def ns(**kw):
     base = dict(type="impl", difficulty=3, context_tokens=0, backend="pi", model=None, effort=None,
                 prompt="add a function add(a, b)", task_file=None, title="pi test", cwd=".",
-                no_worktree=True, verify=None, verify_baseline=False, keep_worktree=False, no_fallback=False,
+                no_worktree=True, verify=None, verify_cmds=None, verify_baseline=False, keep_worktree=False, no_fallback=False,
                 budget_minutes=5, detach=False, run_id=None, dry_run=False)
     base.update(kw)
     return argparse.Namespace(**base)
@@ -139,6 +139,16 @@ class PiBackend(unittest.TestCase):
         self.assertTrue(os.path.isdir(sessions))
         self.assertFalse(os.path.commonpath([sessions, self.cwd]) == self.cwd)
         self.assertNotIn("--model", argv)
+
+    def test_verify_commands_run_on_host_and_record_each_exit_code(self):
+        commands = os.path.join(self.tmp, "verify.txt")
+        with open(commands, "w") as stream:
+            stream.write("touch host-verified.txt\nexit 7\n")
+        self.assertEqual(self.dispatch(verify_cmds=commands), 1)
+        _entry, result = self.last_result()
+        self.assertEqual([row["rc"] for row in result["verify"]["commands"]], [0, 7])
+        self.assertEqual(result["verify"]["rc"], 7)
+        self.assertTrue(os.path.exists(os.path.join(self.cwd, "host-verified.txt")))
 
     def test_error_event_fails_the_attempt(self):
         os.environ["FAKE_PI_MODE"] = "rate"

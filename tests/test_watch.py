@@ -19,6 +19,24 @@ def update(kind, **fields):
 
 
 class WatchTests(unittest.TestCase):
+    def test_resume_lists_active_runs_with_watch_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            runs = root / "runs"
+            run = runs / "run-1"
+            run.mkdir(parents=True)
+            (run / "status.json").write_text(json.dumps({"id": "run-1", "state": "queued",
+                                                          "started": xs.NOW(), "title": "active"}))
+            (root / "lanes.json").write_text('{"lanes": []}')
+            output = io.StringIO()
+            with mock.patch.object(xs, "DATA", tmp), mock.patch.object(xs, "RUNS", str(runs)), \
+                    contextlib.redirect_stdout(output):
+                xs.cmd_resume(argparse.Namespace(json=True))
+            snapshot = json.loads(output.getvalue())
+            self.assertEqual(snapshot["active_runs"][0]["watch"], "openswarm watch run-1")
+            self.assertEqual(snapshot["lanes"], [])
+            self.assertIsNone(snapshot["lane_config_error"])
+
     def test_pi_only_emits_completed_assistant_messages(self):
         messages = xs.WatchMessages()
         self.assertEqual(messages.feed({"type": "message_update", "assistantMessageEvent": {

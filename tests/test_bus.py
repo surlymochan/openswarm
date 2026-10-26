@@ -147,9 +147,10 @@ class BusTests(unittest.TestCase):
         return self.git(clone, "rev-parse", "HEAD")
 
     @staticmethod
-    def report(status, branch=None, commit=None):
+    def report(status, branch=None, commit=None, worker_run_id=None):
         return {"status": status, "summary": "external work", "files_changed": ["worker.txt"],
-                "tests": "fake verify", "followups": [], "branch": branch, "commit": commit, "pr_url": None}
+                "tests": "fake verify", "followups": [], "branch": branch, "commit": commit, "pr_url": None,
+                **({"worker_run_id": worker_run_id} if worker_run_id else {})}
 
     def send_result(self, number, report, label="done", login="executor"):
         self.add_comment(number, "```openswarm-result\n" + json.dumps(report) + "\n```", login=login)
@@ -171,7 +172,8 @@ class BusTests(unittest.TestCase):
         self.add_comment(issue["number"], "/claim external-agent")
         self.set_labels(issue["number"], ["claimed"], ["queued"])
         commit = self.push_result_branch(run_id)
-        self.send_result(issue["number"], self.report("done", f"openswarm/{run_id}", commit))
+        self.send_result(issue["number"], self.report("done", f"openswarm/{run_id}", commit,
+                                                       worker_run_id=run_id + "-w"))
         saved_issue = self.issue()
         self.assertEqual(xs.bus_label_names(self.cfg)["done"], xs.issue_label_names(saved_issue).intersection(
             {xs.bus_label_names(self.cfg)["done"]}).pop())
@@ -185,6 +187,7 @@ class BusTests(unittest.TestCase):
         self.assertEqual(result["branch"], f"openswarm/{run_id}")
         self.assertEqual(result["commit"], commit)
         self.assertEqual(result["bus"]["executor"], "external-agent")
+        self.assertEqual(result["bus"]["worker_run_id"], run_id + "-w")
         self.assertEqual(self.git(self.repo, "rev-parse", f"openswarm/{run_id}"), commit)
         ledger = [json.loads(line) for line in Path(xs.LEDGER).read_text().splitlines()]
         self.assertEqual(ledger[-1]["status"], "done")
@@ -347,6 +350,9 @@ print(json.dumps({'type':'message_end','message':message}), flush=True)
         issue = xs.bus_create_issue("org/bus", self.cfg, "worker e2e", "write worker.txt", metadata)
         worker_args = argparse.Namespace(bus="org/bus", name="external-agent", backend="pi", model=None,
                                          budget_minutes=1, once=True, repos="org/target", verify=None)
+        planner_run_dir = Path(xs.RUNS) / run_id
+        planner_run_dir.mkdir(parents=True)
+        (planner_run_dir / "result.json").write_text('{"planner_result":"preserved"}')
         os.environ["OPENSWARM_FAKE_GH_LOGIN"] = "executor"
         xs.cmd_bus_worker(worker_args, self.policy)
         current = self.issue(issue["number"])
@@ -356,6 +362,11 @@ print(json.dumps({'type':'message_end','message':message}), flush=True)
         report = next(report for report in result_comments if report)
         self.assertEqual(report["status"], "done")
         self.assertEqual(report["branch"], f"openswarm/{run_id}")
+        self.assertEqual(report["worker_run_id"], f"{run_id}-w")
+        worker_result = json.loads((Path(xs.RUNS) / f"{run_id}-w" / "result.json").read_text())
+        self.assertEqual(worker_result["id"], f"{run_id}-w")
+        self.assertEqual(json.loads((planner_run_dir / "result.json").read_text()),
+                         {"planner_result": "preserved"})
         self.assertFalse((self.root / "untrusted-verify-ran").exists())
         self.assertTrue(any("Ignored task verify" in note for note in report["followups"]))
         self.assertTrue(report["commit"])
