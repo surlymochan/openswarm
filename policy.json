@@ -232,5 +232,12 @@
   "run": {
     "timeout_seconds": 2400,
     "fallback": true
+  },
+  "workspace": {
+    "_doc": "prepare maps a repo absolute path or basename to a command run in its worktree. When configured, prepare_replaces_links are installed locally instead of symlinked from the base checkout.",
+    "prepare": {},
+    "prepare_replaces_links": [
+      "node_modules"
+    ]
   }
 }

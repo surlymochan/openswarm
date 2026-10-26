@@ -45,6 +45,55 @@ class WorkspaceTest(unittest.TestCase):
                                capture_output=True, text=True).stdout.split()
         self.assertEqual(files, ["pkg/b.txt"])
 
+    def test_workspace_prepare_runs_in_worktree_and_replaces_dependency_link(self):
+        home = os.path.join(self.tmp, "home")
+        write(os.path.join(home, "policy.local.json"), json.dumps({"workspace": {
+            "prepare": {"repo": "touch prepared.marker"}, "prepare_replaces_links": ["node_modules"]}}))
+        old_data, xs.DATA = xs.DATA, home
+        self.addCleanup(setattr, xs, "DATA", old_data)
+        os.makedirs(os.path.join(self.repo, "node_modules", "leftpad"))
+        write(os.path.join(self.repo, "node_modules", "leftpad", "index.js"), "base")
+        ws = xs.prepare_workspace(self.repo, "prepare", True)
+        self.assertNotIn("node_modules", ws["linked"])
+        prepared = xs.run_workspace_prepare(ws["repo"], ws["root"], "before_executor")
+        self.assertEqual(prepared["rc"], 0)
+        self.assertGreaterEqual(prepared["seconds"], 0)
+        self.assertTrue(os.path.exists(os.path.join(ws["root"], "prepared.marker")))
+        self.assertFalse(os.path.exists(os.path.join(ws["root"], "node_modules", "leftpad", "index.js")))
+        xs.cleanup_worktree(ws, None)
+
+    def test_bun_workspace_without_prepare_gets_warning_only(self):
+        write(os.path.join(self.repo, "package.json"), json.dumps({"workspaces": ["packages/*"]}))
+        write(os.path.join(self.repo, "bun.lock"), "lock")
+        sh("git", "add", "package.json", "bun.lock", cwd=self.repo)
+        sh("git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "bun", cwd=self.repo)
+        ws = xs.prepare_workspace(self.repo, "bun", True)
+        self.assertIn("Bun workspace detected", ws["workspace_note"])
+        self.assertIn(os.path.join("pkg", "node_modules"), ws["linked"])
+        xs.cleanup_worktree(ws, None)
+
+    def test_lockfile_change_requests_second_prepare(self):
+        ws = xs.prepare_workspace(self.repo, "lock", True)
+        write(os.path.join(ws["root"], "bun.lock"), "lock")
+        fin = xs.finalize_workspace(ws, "t", "codex", self.rdir, keep=True)
+        self.assertTrue(xs.lockfiles_changed(ws))
+        xs.cleanup_worktree(ws, fin["commit"])
+
+    def test_remote_verify_runs_workspace_prepare(self):
+        home = os.path.join(self.tmp, "home")
+        write(os.path.join(home, "policy.local.json"), json.dumps({"workspace": {
+            "prepare": {os.path.realpath(self.repo): "touch prepared.marker"},
+            "prepare_replaces_links": ["node_modules"]}}))
+        old_data, xs.DATA = xs.DATA, home
+        self.addCleanup(setattr, xs, "DATA", old_data)
+        rev = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        result = xs.verify_in_worktree(self.repo, rev, "test -f prepared.marker", 30)
+        self.assertEqual(result["rc"], 0)
+        self.assertEqual(len(result["prepare"]), 1)
+        self.assertEqual(result["prepare"][0]["phase"], "before_verify")
+        self.assertEqual(result["prepare"][0]["rc"], 0)
+        self.assertGreaterEqual(result["prepare"][0]["seconds"], 0)
+
     def test_tracked_relative_link_to_sibling_repo_resolves(self):
         sibling = os.path.join(self.tmp, "sdkrepo", "sdk")
         os.makedirs(sibling)

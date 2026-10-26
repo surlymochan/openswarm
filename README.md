@@ -104,6 +104,8 @@ Routing decisions use live quota data, not guesses.
   - Quota that is about to expire unused gets spent at higher effort.
 - **Isolated execution.** Each run gets its own `git worktree` and `openswarm/<id>` branch.
   - Dependency dirs (`node_modules`, `.venv`) are symlinked in and never committed.
+  - For a workspace that must install dependencies inside each worktree, set `workspace.prepare`; it runs before
+    execution and again before verification when a lockfile changed, and replaces configured dependency links.
   - Nothing is pushed.
 - **Hard budgets.** `--budget-minutes` kills the executor's whole process tree. Watchers expire too, and you re-arm them on purpose.
 - **Host-side verification.** `--verify '<cmd>'` runs your test command on the committed worktree.
@@ -339,9 +341,19 @@ Override any key in `$OPENSWARM_HOME/policy.local.json`. It is deep-merged over 
   "claude": {"plan": "pro"},
   "thresholds": {"window_soft": 0.8},
   "deepseek": {"keychain_items": ["openswarm-deepseek-api-key"]},
-  "workspace": {"sibling_worktrees": false, "link_dirs": ["node_modules", ".venv"]}
+  "workspace": {
+    "sibling_worktrees": false,
+    "link_dirs": ["node_modules", ".venv"],
+    "prepare": {"my-bun-monorepo": "bun install --frozen-lockfile"},
+    "prepare_replaces_links": ["node_modules"]
+  }
 }
 ```
+
+`workspace.prepare` keys may be an absolute repository path or its basename. This is particularly useful for Bun
+workspaces: linked `node_modules` can otherwise resolve workspace packages back to the base checkout. Without a policy,
+openswarm only emits `workspace_note` when it detects `package.json` workspaces plus `bun.lock`; it preserves existing
+link behavior.
 
 | Environment variable | Purpose |
 | --- | --- |

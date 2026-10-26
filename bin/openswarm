@@ -1182,6 +1182,70 @@ def git(args, cwd, timeout=60):
     return sh(["git", *args], cwd=cwd, timeout=timeout)
 
 
+LOCKFILES = {"bun.lock", "bun.lockb", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml",
+             "yarn.lock", "poetry.lock", "Pipfile.lock", "uv.lock"}
+
+
+def workspace_prepare_command(repo):
+    """Return the configured prepare command for a repo path or its basename."""
+    commands = (load_policy().get("workspace") or {}).get("prepare") or {}
+    if not isinstance(commands, dict):
+        return None
+    repo = os.path.realpath(repo)
+    for key in (repo, os.path.basename(repo)):
+        command = commands.get(key)
+        if isinstance(command, str) and command.strip():
+            return command
+    # Permit an absolute path written with ~ in policy.local.json.
+    for key, command in commands.items():
+        if (isinstance(key, str) and os.path.isabs(os.path.expanduser(key))
+                and os.path.realpath(os.path.expanduser(key)) == repo
+                and isinstance(command, str) and command.strip()):
+            return command
+    return None
+
+
+def workspace_link_dirs(repo):
+    workspace = load_policy().get("workspace", {})
+    names = set(workspace.get("link_dirs", ["node_modules", ".venv", "venv"]))
+    if workspace_prepare_command(repo):
+        names -= set(workspace.get("prepare_replaces_links", []))
+    return names
+
+
+def workspace_note(repo):
+    """Warn only: Bun workspaces need an explicit prepare policy to avoid stale package links."""
+    if workspace_prepare_command(repo):
+        return None
+    package = jload(os.path.join(repo, "package.json"), {})
+    if isinstance(package, dict) and "workspaces" in package and os.path.exists(os.path.join(repo, "bun.lock")):
+        return ("Bun workspace detected: symlinked node_modules may resolve workspace packages to the base checkout; "
+                "configure workspace.prepare for this repo (for example bun install --frozen-lockfile).")
+    return None
+
+
+def run_workspace_prepare(repo, wd, phase):
+    """Run a configured dependency prepare command, retaining only safe timing/exit metadata."""
+    command = workspace_prepare_command(repo)
+    if not command:
+        return None
+    started = NOW()
+    try:
+        proc = subprocess.run(command, shell=True, cwd=wd, capture_output=True, text=True)
+        rc = proc.returncode
+    except Exception:
+        rc = 127
+    return {"phase": phase, "rc": rc, "seconds": round(NOW() - started, 3)}
+
+
+def lockfiles_changed(ws):
+    """Whether executor changes include a common dependency lockfile after finalization."""
+    if ws.get("mode") != "worktree":
+        return False
+    rc, names, _ = git(["diff", "--name-only", ws["base"], "HEAD"], ws["root"])
+    return rc == 0 and any(os.path.basename(name) in LOCKFILES for name in names.splitlines())
+
+
 def prepare_workspace(cwd, rid, use_worktree, base_rev=None):
     rc, top, _ = git(["rev-parse", "--show-toplevel"], cwd)
     if rc != 0 or not use_worktree:
@@ -1212,7 +1276,8 @@ def prepare_workspace(cwd, rid, use_worktree, base_rev=None):
     exclude_dependency_links(wt, linked)
     return {"mode": "worktree", "path": path, "root": wt, "repo": top, "branch": branch, "base": head.strip(),
             "base_dirty": bool(dirty.strip()), "linked": linked,
-            "note": "base had uncommitted changes that are NOT in the worktree" if dirty.strip() else None}
+            "note": "base had uncommitted changes that are NOT in the worktree" if dirty.strip() else None,
+            "workspace_note": workspace_note(top)}
 
 
 def exclude_dependency_links(wt, linked):
@@ -1238,7 +1303,7 @@ def link_dependency_dirs(base, wt):
     """Gitignored dependency dirs (node_modules, .venv) never reach a fresh worktree, so tests cannot
     import anything. Symlink the base repo's copies in (absolute targets keep their internal relative
     links resolving). Returns repo-relative paths so finalize_workspace never commits the links."""
-    names = set(load_policy().get("workspace", {}).get("link_dirs", ["node_modules", ".venv", "venv"]))
+    names = workspace_link_dirs(base)
     linked = []
     for dirpath, dirnames, _ in os.walk(base):
         rel = os.path.relpath(dirpath, base)
@@ -1467,6 +1532,32 @@ def cmd_run(args, policy):
         print(json.dumps({"id": rid, "dry_run": True, "decision": decision}, indent=2, ensure_ascii=False))
         return
     ws = prepare_workspace(os.path.abspath(args.cwd), rid, not args.no_worktree, getattr(args, "base", None))
+    note = ws.get("workspace_note") or workspace_note(ws.get("repo") or ws["path"])
+    if note:
+        set_status(rdir, workspace_note=note)
+    prepare = []
+    prepared = run_workspace_prepare(ws.get("repo") or ws["path"], ws.get("root") or ws["path"], "before_executor")
+    if prepared:
+        prepare.append(prepared)
+        if prepared["rc"] != 0:
+            fin = {"branch": None, "commit": None, "diffstat": "", "patch": None,
+                   "worktree": ws.get("root") if args.keep_worktree else None, "merge_hint": None}
+            if not args.keep_worktree:
+                cleanup_worktree(ws, None)
+            out = {"id": rid, "status": "failed", "error_class": "prepare_failed", "title": title,
+                   "prepare": prepare, "workspace_note": note, "backend": decision["backend"],
+                   "model": decision["model"], "effort": decision.get("effort"), "usage": None,
+                   "seconds": prepared["seconds"], "result": None,
+                   "workspace": {k: v for k, v in ws.items() if k in ("mode", "path", "repo", "base", "note")},
+                   **fin, "attempts": [], "claude_review": decision.get("claude_review"),
+                   "decision_reasons": decision.get("reasons"), "run_dir": rdir}
+            jsave(f"{rdir}/result.json", out)
+            set_status(rdir, state="finished", status="failed", error_class="prepare_failed", finished=NOW())
+            append_ledger({"id": rid, "ts": NOW(), "title": title, "profile": prof, "status": "failed",
+                           "backend": decision["backend"], "model": decision["model"],
+                           "error_class": "prepare_failed", "seconds": prepared["seconds"]})
+            print(json.dumps(out, indent=2, ensure_ascii=False))
+            sys.exit(1)
     if args.verify and ws["mode"] == "worktree":
         # A verify command that names files by their base-repo absolute path would test the base checkout,
         # not the executor's worktree. Rewrite those paths into the worktree and say so.
@@ -1530,9 +1621,17 @@ def cmd_run(args, policy):
     # Commit first and verify the committed tree: some suites (release builders) refuse dirty sources.
     fin = finalize_workspace(ws, title, decision["backend"], rdir, keep=True)
     verify = None
+    prepare_error = None
     if args.verify and (result is not None or changed):  # a budget-killed executor may still have finished the edit
-        set_status(rdir, state="verifying")
-        verify = run_verify(args.verify, ws["path"], max(60, min(600, int(deadline - NOW()) + 300)))
+        if lockfiles_changed(ws):
+            prepared = run_workspace_prepare(ws["repo"], ws["root"], "before_verify")
+            if prepared:
+                prepare.append(prepared)
+                if prepared["rc"] != 0:
+                    prepare_error = prepared
+        if not prepare_error:
+            set_status(rdir, state="verifying")
+            verify = run_verify(args.verify, ws["path"], max(60, min(600, int(deadline - NOW()) + 300)))
     if verify and verify["rc"] not in (0, 124) and getattr(args, "verify_baseline", False) and ws["mode"] == "worktree":
         # Repos often carry known failures; judge the run by failures it introduced, not by the suite's exit code.
         base = verify_against_baseline(args.verify, ws, max(60, min(600, int(deadline - NOW()) + 300)))
@@ -1550,14 +1649,17 @@ def cmd_run(args, policy):
     stopped = bool((jload(f"{rdir}/status.json", {}) or {}).get("stop_requested"))
     status = (result or {}).get("status") or ("stopped" if stopped else
                                               "budget_exceeded" if attempts[-1]["error_class"] == "budget_exceeded" else "failed")
-    if verify and verify["rc"] == 0 and result is None and status == "budget_exceeded":
+    if prepare_error:
+        status, verify_note = "failed", "workspace prepare failed before verify"
+    elif verify and verify["rc"] == 0 and result is None and status == "budget_exceeded":
         status, verify_note = "partial", "executor hit the budget without a final report; host verify passed"
     else:
         status, verify_note = adjust_status_for_verify(status, verify)
     usage = (attempts[-1].get("meta") or {}).get("usage")
     wall_seconds = round(sum(a["seconds"] for a in attempts), 3)
     out = {
-        "id": rid, "status": status, "title": title, "verify": verify, "verify_note": verify_note,
+        "id": rid, "status": status, "error_class": "prepare_failed" if prepare_error else attempts[-1]["error_class"],
+        "title": title, "prepare": prepare, "workspace_note": note, "verify": verify, "verify_note": verify_note,
         "backend": decision["backend"], "model": decision["model"], "effort": decision.get("effort"),
         "usage": usage, "seconds": wall_seconds,
         "result": result, "workspace": {k: v for k, v in ws.items() if k in ("mode", "path", "repo", "base", "note")},
@@ -1569,7 +1671,8 @@ def cmd_run(args, policy):
     append_ledger({"id": rid, "ts": NOW(), "title": title, "profile": prof, "status": status,
                    "backend": decision["backend"], "model": decision["model"], "effort": decision.get("effort"),
                    "tier": decision.get("tier"), "attempts": [{k: a[k] for k in a if k != "error_tail"} for a in attempts],
-                   "error_class": attempts[-1]["error_class"], "seconds": wall_seconds, "usage": usage,
+                   "error_class": "prepare_failed" if prepare_error else attempts[-1]["error_class"],
+                   "seconds": wall_seconds, "usage": usage,
                    "commit": fin.get("commit"), "files": len((result or {}).get("files_changed") or []),
                    "reasons": decision.get("reasons")})
     print(json.dumps(out, indent=2, ensure_ascii=False))
@@ -1766,7 +1869,7 @@ def lane_prepare_workspace(lane, rid, base_rev=None):
             raise RuntimeError(f"lane worktree belongs to a different repository: {wt}")
     # Temporarily remove only dependency symlinks created for this worktree. This lets `git clean
     # -fdx` remove every prior task artifact without deleting linked dependency targets.
-    names = set(load_policy().get("workspace", {}).get("link_dirs", ["node_modules", ".venv", "venv"]))
+    names = workspace_link_dirs(repo)
     links = []
     for dirpath, dirnames, _ in os.walk(wt, followlinks=False):
         for d in list(dirnames):
@@ -1792,7 +1895,8 @@ def lane_prepare_workspace(lane, rid, base_rev=None):
                     if "/" + rel not in have:
                         f.write("/" + rel + "\n")
     return {"mode": "worktree", "path": wt, "root": wt, "repo": repo, "branch": f"openswarm/{rid}",
-            "base": base, "base_dirty": False, "linked": linked, "lane": lane["name"]}
+            "base": base, "base_dirty": False, "linked": linked, "lane": lane["name"],
+            "workspace_note": workspace_note(repo)}
 
 
 class LaneChild:
@@ -2338,10 +2442,18 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
     changed = bool(git(["status", "--porcelain"], ws["root"])[1].strip())
     fin = finalize_workspace(ws, title, lane["backend"], rdir, keep=True)
     verify = None
+    prepare_error = None
     if spec.get("verify") and (final is not None or changed):
-        set_status(rdir, state="verifying")
-        timeout = max(60, min(600, int(spec["started"] + max(0, float(spec.get("budget_minutes") or 0)) * 60 - NOW()) + 300))
-        verify = run_verify(spec["verify"], ws["path"], timeout)
+        if lockfiles_changed(ws):
+            prepared = run_workspace_prepare(ws["repo"], ws["root"], "before_verify")
+            if prepared:
+                ws.setdefault("prepare", []).append(prepared)
+                if prepared["rc"] != 0:
+                    prepare_error = prepared
+        if not prepare_error:
+            set_status(rdir, state="verifying")
+            timeout = max(60, min(600, int(spec["started"] + max(0, float(spec.get("budget_minutes") or 0)) * 60 - NOW()) + 300))
+            verify = run_verify(spec["verify"], ws["path"], timeout)
     if verify and verify["rc"] not in (0, 124) and spec.get("verify_baseline"):
         base = verify_against_baseline(spec["verify"], ws, max(60, min(600, int(NOW() - spec["started"]) + 300)))
         if base.get("rc") is not None:
@@ -2352,7 +2464,10 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
                 verify["rc_raw"], verify["rc"] = verify["rc"], 0
         else:
             verify["baseline"] = {"error": base.get("error")}
-    if stopped:
+    if prepare_error or error_class == "prepare_failed":
+        status, verify_note = "failed", "workspace prepare failed" if error_class == "prepare_failed" else "workspace prepare failed before verify"
+        error_class = "prepare_failed"
+    elif stopped:
         status, verify_note = "stopped", None
     elif budget_hit and not (verify and verify["rc"] == 0 and final is None):
         status, verify_note = "budget_exceeded", None
@@ -2371,7 +2486,8 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
     if ws.get("mode") == "worktree":
         detach_at = fin.get("commit") or ws["base"]
         lane_git(["checkout", "--detach", detach_at], ws["root"])
-    out = {"id": rid, "status": status, "title": title, "lane": lane["name"], "verify": verify,
+    out = {"id": rid, "status": status, "error_class": error_class, "title": title, "lane": lane["name"],
+           "prepare": ws.get("prepare", []), "workspace_note": ws.get("workspace_note"), "verify": verify,
            "verify_note": verify_note, "backend": lane["backend"], "model": model, "effort": lane.get("effort"),
            **({"resolved_model": model} if lane["backend"] == "cursor" else {}),
            "usage": usage, "seconds": round(sum(attempt["seconds"] for attempt in attempts), 3), "result": final, "workspace":
@@ -2397,6 +2513,24 @@ def lane_do_run(lane, spec, child, server, current):
     turn, pending = {}, []
     try:
         ws = lane_prepare_workspace(lane, rid, spec.get("base"))
+        if ws.get("workspace_note"):
+            set_status(rdir, workspace_note=ws["workspace_note"])
+        ws["prepare"] = []
+        prepared = run_workspace_prepare(ws["repo"], ws["root"], "before_executor")
+        if prepared:
+            ws["prepare"].append(prepared)
+            if prepared["rc"] != 0:
+                evp = os.path.join(rdir, f"events.1.{lane['backend']}.jsonl")
+                open(evp, "a").close()
+                lane_record_event(evp, {"type": "error", "error": "workspace prepare failed"})
+                # lane_prepare_workspace already reset and cleaned this worktree, so discard only prepare artifacts.
+                lane_git(["reset", "--hard", ws["base"]], ws["root"])
+                lane_git(["clean", "-fdx"], ws["root"])
+                attempt = {"backend": lane["backend"], "model": lane["model"], "effort": lane.get("effort"),
+                           "rc": prepared["rc"], "seconds": prepared["seconds"], "error_class": "prepare_failed",
+                           "meta": {"usage": {}}, "events": evp, "error_tail": None}
+                return lane_finalize_run(lane, spec, ws, None, {}, "prepare_failed", prepared["rc"], evp,
+                                         attempts=[attempt])
         if spec.get("verify"):
             rewritten = rewrite_verify_paths(spec["verify"], ws["repo"], ws["root"])
             if rewritten != spec["verify"]:
@@ -3177,18 +3311,28 @@ def cmd_batch(args, policy):
 def verify_in_worktree(repo, rev, command, timeout):
     repo = os.path.realpath(os.path.expanduser(repo))
     started = NOW()
+    prepare = []
+    note = workspace_note(repo)
     with tempfile.TemporaryDirectory(prefix=".openswarm-verify-", dir=os.path.dirname(repo)) as path:
         rc, _, _ = git(["worktree", "add", "-q", "--detach", path, rev], repo, timeout=300)
         if rc:
             raise RuntimeError("verification worktree creation failed")
         try:
             exclude_dependency_links(path, link_dependency_dirs(repo, path))
-            result = run_verify(rewrite_verify_paths(command, repo, path), path, timeout)
+            prepared = run_workspace_prepare(repo, path, "before_verify")
+            if prepared:
+                prepare.append(prepared)
+            if prepared and prepared["rc"] != 0:
+                result = {"rc": prepared["rc"], "failing": [], "error_class": "prepare_failed"}
+            else:
+                result = run_verify(rewrite_verify_paths(command, repo, path), path, timeout)
         finally:
             rc, _, _ = git(["worktree", "remove", "--force", path], repo, timeout=60)
             if rc:
                 raise RuntimeError("verification worktree cleanup failed")
-    return {"rc": result["rc"], "failing": result["failing"], "seconds": round(NOW() - started, 3)}
+    return {"rc": result["rc"], "failing": result["failing"], "seconds": round(NOW() - started, 3),
+            "prepare": prepare, "workspace_note": note, **({"error_class": "prepare_failed"}
+                                                               if result.get("error_class") else {})}
 
 
 def cmd_verify_remote(args):
@@ -3231,7 +3375,9 @@ def cmd_verify_remote(args):
                                      "--verify", args.verify, "--timeout", str(args.timeout)], timeout=args.timeout + 60)
     finally:
         host_require(target, host_git(target, target_repo, ["update-ref", "-d", ref]), "verification ref cleanup")
-    outcome = {"host": target["name"], "rc": outcome["rc"], "failing": outcome["failing"], "seconds": outcome["seconds"]}
+    outcome = {"host": target["name"], "rc": outcome["rc"], "failing": outcome["failing"], "seconds": outcome["seconds"],
+               "prepare": outcome.get("prepare", []), "workspace_note": outcome.get("workspace_note"),
+               **({"error_class": outcome["error_class"]} if outcome.get("error_class") else {})}
     result["verify_remote"] = outcome
     path = os.path.join(DATA, "remote-results", rid + ".json")
     jsave(path, result)

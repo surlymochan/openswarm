@@ -55,6 +55,12 @@ beside the base repo (`.openswarm-wt-<repo>-<id>`) so committed relative links t
 (`workspace.sibling_worktrees: false` restores the central `~/.claude/openswarm/worktrees`). Verify also runs when an
 executor hit its budget but left changes; that case ends `partial` for the planner to review, never `done`.
 
+For a repo whose dependencies must be installed in each worktree, set `workspace.prepare` in policy by absolute repo
+path or basename (for example `"my-bun-monorepo": "bun install --frozen-lockfile"`) and list replaced links in
+`workspace.prepare_replaces_links` (normally `["node_modules"]`). It runs before execution and before verify after a
+lockfile change; each result records its rc and seconds. With no policy, Bun workspaces (`workspaces` + `bun.lock`)
+only emit `workspace_note` because their linked `node_modules` can resolve stale packages from the base checkout.
+
 **Anything longer, or several tasks:** detach, then monitor with events. Never sit in a blind wait.
 ```bash
 $XS run --detach --cwd <repo> ... --verify '<test cmd>' --task-file /tmp/task.md     # prints {"id": ...}
