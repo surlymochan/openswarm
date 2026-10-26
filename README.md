@@ -111,7 +111,8 @@ Routing decisions use live quota data, not guesses.
 - **Host-side verification.** `--verify '<cmd>'` runs your test command on the committed worktree.
   - Its exit code overrides the executor's self-report.
   - `--verify-baseline` ignores failures that already exist on the base commit.
-- **Automatic fallback.** Rate limits and model-at-capacity errors trip a 30-minute breaker, and the task moves to the next backend in the same worktree.
+- **Automatic fallback.** One-shot Pi, Codex and Cursor runs retry visible 429s in the same session; other fallback-eligible rate limits and model-at-capacity errors can move to another backend.
+- **Rate-limit recovery and provider caps.** Resident lanes retry visible provider 429s in the same session using `rate_limit.backoff_seconds` (default `[30, 60, 120, 240]`) and `rate_limit.max_retries` (default `4`). `concurrency` accepts provider/backend caps plus `total`; defaults are `{"codex": 4, "minimax-cn": 6, "total": 10}`. Excess local turns queue across lanes and runs.
 - **Risk alerts.** `openswarm watch` streams progress and flags dangerous executor commands (push, `rm -rf ..`, secret prints, `sudo`, publish). It also reports stalls and heartbeats.
 - **Planner-friendly.**
   - `SKILL.md` teaches Claude Code the whole loop.
@@ -249,6 +250,8 @@ defaults to 1, with remaining cards queued until slots free. Backend, model and 
 through to each `run --detach`. One line is printed per state change; detached output goes to
 `$OPENSWARM_HOME/batches/<id>/batch.out`. Polling works without Monitor.
 
+Provider caps in `policy.local.json` also constrain batch dispatch across the hosts listed in `fleet.json`. The planner checks fleet status before each launch and leaves excess cards queued until a provider slot frees. This fleet-wide coordination is planner-owned and uses no `concurrency_url`; direct `fleet exec ... lane assign` only observes the target host's local cap, so use `batch` when multiple hosts share one provider account.
+
 Base synchronization and result collection use git bundles through the transport: no git remotes or pushes.
 Each completed run's `openswarm/<run-id>` branch is fetched into the planner checkout, then removed on the
 executor host after its commit is confirmed locally. Local runs in the planner checkout retain their branches.
@@ -295,8 +298,10 @@ openswarm bus init <bus-owner>/<bus-repo>
 ```
 
 ```json
-{"bus":{"repo":"<bus-owner>/<bus-repo>","allowed_executors":["<github-login>"],"poll_seconds":60,"labels_prefix":"openswarm"}}
+{"bus":{"repo":"<bus-owner>/<bus-repo>","allowed_executors":["<github-login>"],"allowed_planners":["<planner-login>"],"poll_seconds":60,"labels_prefix":"openswarm"}}
 ```
+
+Both bus allowlists default to deny. `allowed_planners` must include the GitHub login used by the planner to create issues and digest comments.
 
 Dispatch from a target GitHub repository after the base commit has been pushed:
 

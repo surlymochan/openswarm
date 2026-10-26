@@ -14,8 +14,14 @@ import json, os, sys, time
 mode = os.environ.get("FAKE_PI_MODE", "ok")
 log = os.environ.get("FAKE_PI_LOG")
 if log:
-    with open(log, "w") as fh:
+    with open(log, "a") as fh:
         json.dump(sys.argv, fh)
+        fh.write("\n")
+sessions = sys.argv[sys.argv.index("--session-dir") + 1] if "--session-dir" in sys.argv else "."
+attempt_marker = os.path.join(sessions, "fake-rate-attempted")
+rate_once_first = os.environ.get("FAKE_PI_MODE") == "rate-once" and not os.path.exists(attempt_marker)
+if rate_once_first:
+    open(attempt_marker, "w").close()
 if mode == "sleep":
     time.sleep(30)
     sys.exit(0)
@@ -29,7 +35,7 @@ def end(text, usage, **extra):
     print(json.dumps({"type": "message_end", "message": msg}))
 print(json.dumps({"type": "session", "id": "s1"}))
 print(json.dumps({"type": "message_end", "message": {"role": "user", "content": [], "usage": {"input": 999}}}))
-if mode == "rate":
+if mode == "rate" or rate_once_first:
     end("", {"input": 1, "output": 0, "cacheRead": 0, "cacheWrite": 0},
         stopReason="error", errorMessage="429 rate limit exceeded")
     sys.stderr.write("rate limit: too many requests\n")
@@ -81,10 +87,10 @@ class PiBackend(unittest.TestCase):
             st = json.load(f)
         return xs.route(prof, st, policy or POLICY)
 
-    def dispatch(self, **kw):
+    def dispatch(self, policy=None, **kw):
         with contextlib.redirect_stdout(io.StringIO()):
             try:
-                xs.cmd_run(ns(cwd=self.cwd, **kw), POLICY)
+                xs.cmd_run(ns(cwd=self.cwd, **kw), policy or POLICY)
             except SystemExit as e:
                 return e.code
         self.fail("cmd_run returned without exiting")
@@ -136,12 +142,33 @@ class PiBackend(unittest.TestCase):
 
     def test_error_event_fails_the_attempt(self):
         os.environ["FAKE_PI_MODE"] = "rate"
-        code = self.dispatch()
+        policy = xs.deep_merge(POLICY, {"rate_limit": {"max_retries": 0}})
+        code = self.dispatch(policy=policy)
         self.assertEqual(code, 1)
         entry, result = self.last_result()
         self.assertEqual(result["attempts"][0]["error_class"], "rate_limit")
         self.assertEqual(xs.rate_limit_breaker_key("pi", {"model": None}, "429"), "pi/all")
         self.assertIn("pi/all", xs.breakers())
+
+    def test_rate_limit_retries_with_pi_session_continue(self):
+        os.environ["FAKE_PI_MODE"] = "rate-once"
+        policy = xs.deep_merge(POLICY, {"rate_limit": {"backoff_seconds": [0], "max_retries": 1}})
+        self.assertEqual(self.dispatch(policy=policy), 0)
+        entry, result = self.last_result()
+        self.assertEqual(result["status"], "done")
+        self.assertEqual([attempt["error_class"] for attempt in result["attempts"]], ["rate_limit", None])
+        event_files = [os.path.join(result["run_dir"], name) for name in os.listdir(result["run_dir"])
+                       if name.startswith("events.") and name.endswith(".jsonl")]
+        events = []
+        for path in event_files:
+            with open(path) as fh:
+                events.extend(json.loads(line) for line in fh)
+        self.assertEqual(sum(event.get("type") == "RATELIMIT" for event in events), 1)
+        with open(self.log) as fh:
+            calls = [json.loads(line) for line in fh]
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("--continue", calls[0])
+        self.assertIn("--continue", calls[1])
 
     def test_budget_kills_the_process(self):
         os.environ["FAKE_PI_MODE"] = "sleep"

@@ -87,7 +87,7 @@ How to react:
 
 ### GitHub issue bus for uncontrolled executors
 
-Use `--backend github-issue` only when the executor is outside the controlled fleet (another person's agent, a cloud agent, or an unmanaged host). For machines you control, use SSH fleet lanes. Initialize a dedicated bus repo with `openswarm bus init <owner/repo>`, then configure `bus.repo`, `bus.allowed_executors` (GitHub logins), `bus.poll_seconds`, and `bus.labels_prefix` in `$OPENSWARM_HOME/policy.local.json`.
+Use `--backend github-issue` only when the executor is outside the controlled fleet (another person's agent, a cloud agent, or an unmanaged host). For machines you control, use SSH fleet lanes. Initialize a dedicated bus repo with `openswarm bus init <owner/repo>`, then configure `bus.repo`, `bus.allowed_executors`, and `bus.allowed_planners` (both GitHub login allowlists; include the planner login in `allowed_planners`) in `$OPENSWARM_HOME/policy.local.json`.
 
 ```bash
 $XS run --backend github-issue --cwd <target-repo> --base <pushed-commit> --budget-minutes 40 --verify 'pytest -q' --task-file /tmp/task.md
@@ -106,6 +106,7 @@ For long-lived Codex, Cursor Agent ACP, or Pi executors, configure `$OPENSWARM_H
 $XS lane up C1 K1 M1                      # omit names to start all configured lanes
 $XS lane status
 $XS lane assign C1 --task-file /tmp/task.md --title "..." --verify 'pytest -q' --budget-minutes 30
+$XS fleet exec worker -- lane assign C1 --task-file /tmp/task.md --title "..." --verify 'pytest -q' --budget-minutes 30
 $XS watch <run-id>
 $XS lane steer C1 --text "..."             # delivered to the active turn
 $XS lane abort C1                          # or $XS stop <run-id>
@@ -114,7 +115,12 @@ $XS lane launchd-plist C1                  # print only; install the plist yours
 $XS lane systemd-unit K1                   # print a system unit only; install it yourself if wanted
 ```
 
-`lane assign` refuses a non-idle lane and immediately returns the normal run id. Review the run through `watch`,
+`lane assign` refuses a non-idle lane and immediately returns the normal run id. A provider cap in
+`policy.local.json` can keep an accepted assignment queued until a slot frees. Use
+`fleet exec <host> -- lane assign <lane> --task-file <path>` for an explicit remote lane; it observes that
+host's local cap. Check `fleet status` for current runs, and use `batch` for planner-coordinated provider and
+total caps across hosts sharing an account.
+Review the run through `watch`,
 `runs`, `report`, and `runs/<id>/result.json` as usual. Each lane has a persistent `$OPENSWARM_HOME/lanes/<name>/wt`;
 assignments reset it to the requested `--base` (default: repo `HEAD`) and commit edits on `openswarm/<run-id>`.
 The next assignment reuses that worktree after detaching it. Cursor `lane steer` cancels the active ACP prompt,
@@ -223,7 +229,7 @@ In a team, make teammates **thin openswarm dispatchers**: each teammate owns a s
   - Burn pace >1.25× of an even rate: effort −1.
   - Window resets within 24h with <60% used: effort +1, to use the quota before it expires.
 - Codex `ultra` effort is never used. It self-delegates and blows budgets.
-- Rate-limit errors open a 30-minute breaker for that model or limit and fall back to the next backend in the same worktree (reset first). Fallback is disabled when you force `--backend`.
+- Visible 429s from Pi, Codex and Cursor retry in the same session and open a 30-minute breaker; after retries, the run is partial if it has work or failed otherwise. Other fallback-eligible rate limits and unavailable models can move to the next backend in the same worktree. Fallback is disabled when you force `--backend`.
 - OpenCode Go: plan auto-detected (Go unless spend proves Plus). Per-model caps come from the docs table in `policy.json` (5h = 20%, 7d = 50%, 30d = 100% of the monthly cap). It only sees `opencode run` spend, not OpenCode Go traffic that goes through other clients or proxies.
 - DeepSeek is used only when its balance is above the floor (¥10).
 - `cursor` is opt-in. Routing never selects it unless `routing.default_order` lists `cursor`, or the run passes `--backend cursor`. The model is `--model` or `cursor.default_model` (`grok-4.7-high`). The run's `result.json` and ledger entry record `usage` (`inputTokens`, `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`) and wall-clock `seconds`. Quota for Cursor is unknown, so it does not affect the other backends' windows.

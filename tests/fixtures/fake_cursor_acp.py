@@ -3,6 +3,7 @@
 import json
 import os
 import select
+import subprocess
 import sys
 import time
 
@@ -112,6 +113,9 @@ for line in sys.stdin:
         if "LANE_TEST_NO_CHANGE" not in prompt:
             with open(os.path.join(cwd, "lane_result.txt"), "w") as stream:
                 stream.write(prompt)
+        if "LANE_TEST_AGENT_COMMIT" in prompt:
+            subprocess.run(["git", "add", "lane_result.txt"], cwd=cwd, check=True)
+            subprocess.run(["git", "commit", "-qm", "agent committed"], cwd=cwd, check=True)
         if "LANE_TEST_NO_REPORT" in prompt or REPORT_MARKER not in prompt:
             # The live agent ends the turn without a JSON report when the prompt does not ask for one.
             response(request, {"stopReason": "end_turn"})

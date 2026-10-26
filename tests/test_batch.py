@@ -52,7 +52,7 @@ class FakeFleetFixture:
         self.calls = []
         self.patches = [mock.patch.object(xs, "DATA", str(self.data)),
                         mock.patch.object(xs, "host_run", side_effect=self.transport),
-                        mock.patch.object(xs, "sh", return_value=(0, "", ""))]
+                        mock.patch.object(xs, "sh", side_effect=self.shell)]
         for patch in self.patches:
             patch.start()
         self.addCleanup(self.tmp.cleanup)
@@ -62,9 +62,16 @@ class FakeFleetFixture:
     def git(self, repo, *args):
         return subprocess.check_output(["git", "-C", str(repo), *args], stderr=subprocess.PIPE).decode().strip()
 
+    def shell(self, command, **kwargs):
+        if command[:2] == ["instabox", "ls"]:
+            states = [{"name": host["box"], "status": "Running"} for host in self.hosts.values()
+                      if host["kind"] == "instabox"]
+            return 0, json.dumps(states), ""
+        return 0, "", ""
+
     def transport(self, host, command, timeout=60, input=None):
         self.calls.append((host["name"], command))
-        home = self.data if host["kind"] == "local" else self.root / host["name"] / "data"
+        home = self.data if host["name"] == "local" else self.root / host["name"] / "data"
         proc = subprocess.run(["sh", "-c", command], capture_output=True, input=input, timeout=timeout,
                               env={**os.environ, "OPENSWARM_HOME": str(home)})
         return proc.returncode, proc.stdout, proc.stderr
@@ -134,7 +141,8 @@ class BatchTests(FakeFleetFixture, unittest.TestCase):
         markdown = (self.data / "batches" / summary["id"] / "summary.md").read_text()
         self.assertIn("FAIL card one", markdown)
         self.assertIn("Verify rc", markdown)
-        self.assertEqual(xs.sh.call_count, 2)
+        wakes = [call for call in xs.sh.call_args_list if call.args[0][:2] == ["instabox", "wake"]]
+        self.assertEqual(len(wakes), 2)
         self.assertEqual(self.git(self.repo, "rev-parse", "HEAD"), self.base)
         self.assertEqual(self.git(self.repo, "remote"), "")
 
@@ -149,6 +157,43 @@ class BatchTests(FakeFleetFixture, unittest.TestCase):
             self.assertEqual([call["active_before"] for call in starts], [0, 1, 0])
             self.assertTrue(all(call["args"]["base"] == self.initial for call in starts))
         self.assertEqual(summary["base"], self.initial)
+
+    def test_batch_provider_cap_queues_across_fleet_hosts(self):
+        for name in ("b1", "b2"):
+            self.hosts[name]["kind"] = "local"
+        (self.data / "fleet.json").write_text(json.dumps({"hosts": list(self.hosts.values())}))
+        (self.data / "policy.local.json").write_text(json.dumps({"concurrency": {"pi": 1}}))
+        (self.cards / "one.md").write_text("first card")
+        (self.cards / "two.md").write_text("second card")
+        rc, summary, _ = self.run_batch()
+        self.assertEqual(rc, 0)
+        self.assertEqual([row["host"] for row in summary["cards"]], ["b1", "b2"])
+        starts, finishes = [], []
+        for name in ("b1", "b2"):
+            rows = [json.loads(line) for line in (self.root / name / "data" / "calls.jsonl").read_text().splitlines()]
+            starts.extend(row["ts"] for row in rows if row["event"] == "start")
+            finishes.extend(row["ts"] for row in rows if row["event"] == "finish")
+        self.assertEqual(len(starts), 2)
+        self.assertEqual(len(finishes), 2)
+        self.assertLess(finishes[0], starts[1])
+
+    def test_batch_total_cap_queues_across_fleet_hosts(self):
+        for name in ("b1", "b2"):
+            self.hosts[name]["kind"] = "local"
+        (self.data / "fleet.json").write_text(json.dumps({"hosts": list(self.hosts.values())}))
+        (self.data / "policy.local.json").write_text(json.dumps({"concurrency": {"total": 1}}))
+        (self.cards / "one.md").write_text("first card")
+        (self.cards / "two.md").write_text("second card")
+        rc, summary, _ = self.run_batch()
+        self.assertEqual(rc, 0)
+        starts, finishes = [], []
+        for name in ("b1", "b2"):
+            rows = [json.loads(line) for line in (self.root / name / "data" / "calls.jsonl").read_text().splitlines()]
+            starts.extend(row["ts"] for row in rows if row["event"] == "start")
+            finishes.extend(row["ts"] for row in rows if row["event"] == "finish")
+        self.assertEqual(len(starts), 2)
+        self.assertEqual(len(finishes), 2)
+        self.assertLess(finishes[0], starts[1])
 
     def test_unreachable_active_run_does_not_release_slot_for_queued_card(self):
         for i in range(3):

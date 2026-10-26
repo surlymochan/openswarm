@@ -265,6 +265,51 @@ class BusTests(unittest.TestCase):
         non_string_id = {**trusted, "run_id": 123}
         self.assertIsNone(xs.bus_extract_task("```openswarm-task\n" + json.dumps(non_string_id) + "\n```"))
 
+    def test_task_digest_uses_exact_fence_and_ignores_untrusted_first_comment(self):
+        metadata = {"run_id": "float-budget", "repo": "org/target", "base": self.base,
+                    "branch_hint": "openswarm/float-budget", "budget_minutes": 1.0,
+                    "report_schema": {"minimum": 1, "fraction": 1.25}}
+        created = xs.bus_create_issue("org/bus", self.cfg, "float metadata", "test exact digest", metadata)
+        issue = self.issue(created["number"])
+        fence, extracted = xs.bus_extract_task_fence(issue["body"])
+        comments = [{"user": {"login": "outsider"}, "body": xs.bus_task_digest_comment(fence)}]
+        comments.extend(issue["comments"])
+        self.assertIn('"budget_minutes": 1.0', fence)
+        self.assertEqual(comments[-1]["body"], xs.bus_task_digest_comment(fence))
+        self.assertTrue(xs.bus_worker_task_is_trusted(issue, extracted, comments, ["planner"]))
+        self.assertFalse(xs.bus_worker_task_is_trusted(issue, extracted, comments[:1], ["planner"]))
+
+    def test_cancel_comment_redacts_provider_credentials(self):
+        created = xs.bus_create_issue("org/bus", self.cfg, "cancel", "test cancel", {
+            "run_id": "cancel-secret", "repo": "org/target", "base": self.base,
+            "budget_minutes": 1, "report_schema": xs.RESULT_SCHEMA})
+        secret = "ghp_12345678901234567890"
+        xs.bus_cancel_issue("org/bus", created["number"], self.cfg, f"gh failed with {secret}")
+        comment = self.issue(created["number"])["comments"][-1]["body"]
+        self.assertNotIn(secret, comment)
+        self.assertIn("[REDACTED]", comment)
+
+    def test_result_branch_validation_matches_run_id_pattern(self):
+        report = {"status": "done", "summary": "ok", "files_changed": [], "tests": "",
+                  "followups": [], "branch": "openswarm/a_B-9", "commit": None}
+        body = lambda value: "```openswarm-result\n" + json.dumps({**report, "branch": value}) + "\n```"
+        self.assertIsNotNone(xs.bus_parse_result(body(report["branch"])))
+        self.assertIsNone(xs.bus_parse_result(body("openswarm/a.b")))
+
+    def test_cmd_run_redacts_github_bus_errors_in_result_and_ledger(self):
+        secret = "github_pat_12345678901234567890"
+        args = self.run_args()
+        with mock.patch.object(xs, "new_run_id", return_value="redact-bus-error"), \
+                mock.patch.object(xs, "cmd_bus_run", side_effect=xs.BusError(f"gh failed: {secret}")), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            xs.cmd_run(args, self.policy)
+        rdir = Path(xs.RUNS) / "redact-bus-error"
+        result = json.loads((rdir / "result.json").read_text())
+        ledger = Path(xs.LEDGER).read_text()
+        self.assertNotIn(secret, result["error"])
+        self.assertNotIn(secret, ledger)
+        self.assertIn("[REDACTED]", result["error"])
+
     def test_unpushed_base_fails_before_issue_creation(self):
         (self.repo / "local-only.txt").write_text("not pushed\n")
         self.git(self.repo, "add", "local-only.txt")

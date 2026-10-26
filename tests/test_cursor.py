@@ -19,7 +19,9 @@ if log:
 if mode == "sleep":
     time.sleep(30)
     sys.exit(0)
-if mode == "rate":
+if mode == "rate" or (mode == "rate-once" and not os.path.exists(log + ".retry")):
+    if mode == "rate-once":
+        open(log + ".retry", "w").close()
     print(json.dumps({
         "type": "result", "subtype": "error", "is_error": True,
         "result": "429 rate limit exceeded",
@@ -78,10 +80,10 @@ class CursorBackend(unittest.TestCase):
             st = json.load(f)
         return xs.route(prof, st, policy or POLICY)
 
-    def dispatch(self, **kw):
+    def dispatch(self, policy=POLICY, **kw):
         with contextlib.redirect_stdout(io.StringIO()):
             try:
-                xs.cmd_run(ns(cwd=self.cwd, **kw), POLICY)
+                xs.cmd_run(ns(cwd=self.cwd, **kw), policy)
             except SystemExit as e:
                 return e.code
         self.fail("cmd_run returned without exiting")
@@ -158,9 +160,10 @@ class CursorBackend(unittest.TestCase):
         for flag in ("-p", "--trust", "--force", "--"):
             self.assertIn(flag, argv)
 
-    def test_rate_limit_is_classified_for_fallback(self):
+    def test_rate_limit_is_classified_without_retries(self):
         os.environ["FAKE_CURSOR_MODE"] = "rate"
-        code = self.dispatch()
+        policy = xs.deep_merge(POLICY, {"rate_limit": {"max_retries": 0}})
+        code = self.dispatch(policy=policy)
         self.assertEqual(code, 1)
         entry, result = self.last_result()
         self.assertEqual(len(result["attempts"]), 1)
@@ -169,6 +172,21 @@ class CursorBackend(unittest.TestCase):
         self.assertEqual(xs.rate_limit_breaker_key("cursor", {"model": "grok-4.7-high"}, "429"),
                          "cursor/grok-4.7-high")
         self.assertIn("cursor/grok-4.7-high", xs.breakers())
+
+    def test_rate_limit_retries_with_cursor_continue(self):
+        os.environ["FAKE_CURSOR_MODE"] = "rate-once"
+        policy = xs.deep_merge(POLICY, {"rate_limit": {"backoff_seconds": [0], "max_retries": 1}})
+        self.assertEqual(self.dispatch(policy=policy), 0)
+        _entry, result = self.last_result()
+        self.assertEqual(result["status"], "done")
+        self.assertEqual([attempt["error_class"] for attempt in result["attempts"]], ["rate_limit", None])
+        event_path = os.path.join(xs.RUNS, result["id"], "events.1.cursor.jsonl")
+        with open(event_path) as fh:
+            event_rows = [json.loads(line) for line in fh]
+        self.assertEqual(sum(row.get("type") == "RATELIMIT" for row in event_rows), 1)
+        with open(self.log) as fh:
+            argv = json.load(fh)
+        self.assertEqual(argv.count("--continue"), 1)
 
     def test_budget_kills_the_process(self):
         os.environ["FAKE_CURSOR_MODE"] = "sleep"

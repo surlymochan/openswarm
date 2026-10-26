@@ -29,6 +29,7 @@ class LaneTests(unittest.TestCase):
         for path in FIXTURES.glob("fake_*py"):
             path.chmod(0o755)
         self.env = dict(os.environ, OPENSWARM_HOME=str(self.data))
+        self.env["FAKE_PI_RPC_LOG"] = str(self.root / "fake-pi-rpc.jsonl")
         self.lane_name = "L1"
         self.backend = "codex"
         self.set_config()
@@ -36,7 +37,7 @@ class LaneTests(unittest.TestCase):
     def tearDown(self):
         if self.data.exists():
             try:
-                self.cli("lane", "down", self.lane_name, check=False, timeout=45)
+                self.cli("lane", "down", check=False, timeout=45)
             except (OSError, subprocess.TimeoutExpired):
                 pass
         self.tmp.cleanup()
@@ -123,6 +124,84 @@ class LaneTests(unittest.TestCase):
         self.assertFalse((self.repo / "lane_result.txt").exists())
         self.assertEqual(self.git("status", "--porcelain"), "")
         self.assertEqual(self.git("-C", str(self.data / "lanes" / self.lane_name / "wt"), "branch", "--show-current"), "")
+
+    def test_pi_rate_limit_retries_in_session_and_watch_shows_alert(self):
+        self.set_config("pi")
+        (self.data / "policy.local.json").write_text(json.dumps({"rate_limit": {
+            "backoff_seconds": [0], "max_retries": 1}}))
+        self.start_lane()
+        run_id = self.assign("LANE_TEST_RATE_LIMIT_ONCE resume after provider limit")
+        self.assertEqual(self.wait_run(run_id)["status"], "done")
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        events = [json.loads(line) for path in (self.data / "runs" / run_id).glob("events.*.jsonl")
+                  for line in path.read_text().splitlines()]
+        self.assertEqual(sum(event.get("type") == "RATELIMIT" for event in events), 1)
+        messages = [json.loads(line) for line in pathlib.Path(self.env["FAKE_PI_RPC_LOG"]).read_text().splitlines()]
+        self.assertEqual(sum(row.get("type") == "new_session" for row in messages), 1)
+        prompts = [row["message"] for row in messages if row.get("type") == "prompt"]
+        self.assertEqual(len(prompts), 2)
+        self.assertEqual(prompts[1], "You were interrupted by a provider rate limit. Continue the task from where you stopped; finish with the final JSON report.")
+        watched = self.cli("watch", run_id, "--quiet").stdout
+        self.assertIn("RATELIMIT:", watched)
+        self.assertEqual(result["status"], "done")
+
+    def test_repeated_rate_limit_keeps_partial_work_with_note(self):
+        self.set_config("pi")
+        (self.data / "policy.local.json").write_text(json.dumps({"rate_limit": {
+            "backoff_seconds": [0], "max_retries": 1}}))
+        self.start_lane()
+        run_id = self.assign("LANE_TEST_RATE_LIMIT_PARTIAL keep partial changes")
+        self.assertEqual(self.wait_run(run_id)["status"], "partial")
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual(result["verify_note"], "rate limited")
+        self.assertEqual(result["error_class"], "rate_limit")
+        self.assertIsNotNone(result["commit"])
+        empty_run = self.assign("LANE_TEST_RATE_LIMIT_ALWAYS no changes")
+        self.assertEqual(self.wait_run(empty_run)["status"], "failed")
+        empty_result = json.loads((self.data / "runs" / empty_run / "result.json").read_text())
+        self.assertEqual(empty_result["verify_note"], "rate limited")
+        self.assertIsNone(empty_result["commit"])
+
+    def test_provider_cap_queues_second_lane_until_slot_frees(self):
+        self.set_config("pi")
+        config_path = self.data / "lanes.json"
+        config = json.loads(config_path.read_text())
+        config["lanes"].append(dict(config["lanes"][0], name="L2"))
+        config_path.write_text(json.dumps(config))
+        (self.data / "policy.local.json").write_text(json.dumps({"concurrency": {"fake-provider": 1}}))
+        self.cli("lane", "up", "L1")
+        self.cli("lane", "up", "L2")
+        first = self.assign("LANE_TEST_WAIT_SHORT first provider task")
+        self.wait_running(first)
+        second = json.loads(self.cli("lane", "assign", "L2", "--prompt", "second provider task").stdout)["id"]
+        queued = self.wait_for(lambda: (state if (state := self.run_state(second)).get("queue_reason") else None),
+                               description="second provider turn to queue")
+        self.assertEqual(queued["queue_reason"], "provider concurrency limit")
+        lanes = {row["name"]: row for row in json.loads(self.cli("lane", "status").stdout)}
+        self.assertEqual(lanes["L2"]["run_state"], "queued")
+        self.assertEqual(self.wait_run(first)["status"], "done")
+        self.assertEqual(self.wait_run(second)["status"], "done")
+
+    def test_total_cap_queues_different_backends_until_slot_frees(self):
+        self.set_config("pi")
+        config_path = self.data / "lanes.json"
+        config = json.loads(config_path.read_text())
+        second_lane = dict(config["lanes"][0], name="L2", backend="codex", model="fake-model", effort="xhigh")
+        second_lane.pop("provider", None)
+        second_lane["binary"] = str(FIXTURES / "fake_app_server.py")
+        config["lanes"].append(second_lane)
+        config_path.write_text(json.dumps(config))
+        (self.data / "policy.local.json").write_text(json.dumps({"concurrency": {"total": 1}}))
+        self.cli("lane", "up", "L1")
+        self.cli("lane", "up", "L2")
+        first = self.assign("LANE_TEST_WAIT_SHORT first total-cap task")
+        self.wait_running(first)
+        second = json.loads(self.cli("lane", "assign", "L2", "--prompt", "second backend task").stdout)["id"]
+        queued = self.wait_for(lambda: (state if (state := self.run_state(second)).get("queue_reason") else None),
+                               description="second backend turn to queue on total cap")
+        self.assertEqual(queued["queue_reason"], "provider concurrency limit")
+        self.assertEqual(self.wait_run(first)["status"], "done")
+        self.assertEqual(self.wait_run(second)["status"], "done")
 
     def test_codex_assign_commits_and_writes_normal_result(self):
         self.start_lane()
@@ -233,6 +312,19 @@ class LaneTests(unittest.TestCase):
         self.assertIn("MSG:", watched)
         ledger = [json.loads(line) for line in (self.data / "ledger.jsonl").read_text().splitlines()]
         self.assertTrue(any(entry["id"] == run_id and entry["status"] == "done" for entry in ledger))
+
+    def test_cursor_agent_commit_is_reported_with_branch_and_diffstat(self):
+        self.set_config("cursor")
+        self.start_lane()
+        run_id = self.assign("LANE_TEST_AGENT_COMMIT commit the result in the worktree")
+        state = self.wait_run(run_id)
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual(state["status"], "done")
+        self.assertEqual(result["branch"], f"openswarm/{run_id}")
+        self.assertTrue(result["commit"])
+        self.assertIn("lane_result.txt", result["diffstat"])
+        self.assertEqual(self.git("show", f"openswarm/{run_id}:lane_result.txt"),
+                         (self.data / "lanes" / self.lane_name / "wt" / "lane_result.txt").read_text().rstrip("\n"))
 
     def test_cursor_systemd_unit_is_printed_not_installed(self):
         self.set_config("cursor")

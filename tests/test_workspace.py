@@ -1,5 +1,5 @@
 """Regression tests for worktrees, dependency links, host-side verification, risk rules and credential opt-ins."""
-import base64, json, os, shutil, subprocess, sys, tempfile, unittest
+import base64, json, os, shlex, shutil, subprocess, sys, tempfile, threading, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -74,6 +74,49 @@ class WorkspaceTest(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(ws["root"], "prepared.marker")))
         self.assertFalse(os.path.exists(os.path.join(ws["root"], "node_modules", "leftpad", "index.js")))
         xs.cleanup_worktree(ws, None)
+
+    def test_concurrent_repo_prepares_are_serialized(self):
+        home = os.path.join(self.tmp, "home")
+        active = os.path.join(self.tmp, "prepare-active")
+        script = ("import pathlib,sys,time; p=pathlib.Path(sys.argv[1]); "
+                  "p.mkdir(); time.sleep(.15); p.rmdir()")
+        command = f"python3 -c {shlex.quote(script)} {shlex.quote(active)}"
+        write(os.path.join(home, "policy.local.json"), json.dumps({"workspace": {
+            "prepare": {os.path.realpath(self.repo): command}}}))
+        old_data, xs.DATA = xs.DATA, home
+        self.addCleanup(setattr, xs, "DATA", old_data)
+        workdirs = [os.path.join(self.tmp, "prepare-a"), os.path.join(self.tmp, "prepare-b")]
+        for path in workdirs:
+            os.makedirs(path)
+        barrier = threading.Barrier(3)
+        results = []
+
+        def prepare(path):
+            barrier.wait()
+            results.append(xs.run_workspace_prepare(self.repo, path, "before_executor"))
+
+        threads = [threading.Thread(target=prepare, args=(path,)) for path in workdirs]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=5)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(result["rc"] == 0 for result in results), results)
+        self.assertTrue(all(result["attempts"] == [0] for result in results), results)
+
+    def test_workspace_prepare_retries_once_after_failure(self):
+        home = os.path.join(self.tmp, "retry-home")
+        marker = os.path.join(self.tmp, "prepare-first-attempt")
+        command = f"if [ ! -f {shlex.quote(marker)} ]; then touch {shlex.quote(marker)}; exit 1; fi; exit 0"
+        write(os.path.join(home, "policy.local.json"), json.dumps({"workspace": {
+            "prepare": {os.path.realpath(self.repo): command}}}))
+        old_data, xs.DATA = xs.DATA, home
+        self.addCleanup(setattr, xs, "DATA", old_data)
+        result = xs.run_workspace_prepare(self.repo, self.repo, "before_executor")
+        self.assertEqual(result["rc"], 0)
+        self.assertEqual(result["attempts"], [1, 0])
 
     def test_bun_workspace_without_prepare_gets_warning_only(self):
         write(os.path.join(self.repo, "package.json"), json.dumps({"workspaces": ["packages/*"]}))

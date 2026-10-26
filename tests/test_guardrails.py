@@ -91,13 +91,14 @@ class GuardrailsTests(unittest.TestCase):
         self.assertEqual(json.loads(output.getvalue())["per_backend"]["cursor"]["used_minutes"], 2)
 
     def test_fallback_checks_new_backend_cap_before_executing(self):
-        policy = xs.deep_merge(self.policy, {"budget": {"per_backend": {"codex": 0}}})
+        policy = xs.deep_merge(self.policy, {"budget": {"per_backend": {"codex": 0}},
+                                             "rate_limit": {"max_retries": 0}})
         args = argparse.Namespace(run_id=None, prompt="task", task_file=None, title="fallback", cwd=str(self.root),
                                   type="impl", difficulty=3, context_tokens=0, backend=None, model=None, effort=None,
                                   budget_minutes=5, detach=False, dry_run=False, no_worktree=True, base=None,
                                   verify=None, no_fallback=False, keep_worktree=False)
         decisions = [{"ok": True, "backend": b, "model": "fake"} for b in ("pi", "codex")]
-        executor = mock.Mock(return_value=(75, None, {"usage": {}}, "rate limit"))
+        executor = mock.Mock(return_value=(1, None, {"usage": {}}, "selected model is unavailable"))
         next_executor = mock.Mock()
         output = io.StringIO()
         with mock.patch.object(xs, "get_state", return_value={}), mock.patch.object(xs, "probe", return_value={}), \

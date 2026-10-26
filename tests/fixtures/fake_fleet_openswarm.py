@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 import uuid
 
 home = Path(os.environ["OPENSWARM_HOME"])
@@ -22,12 +23,19 @@ def git(repo, *args):
 
 
 def record(value):
+    value.setdefault("ts", time.time())
     with (home / "calls.jsonl").open("a") as stream:
         stream.write(json.dumps(value) + "\n")
 
 
 if sys.argv[1:3] == ["fleet", "_snapshot"]:
-    print(json.dumps({"lanes": [], "active_runs": []}))
+    active_runs = []
+    for path in (home / "runs").glob("*/status.json"):
+        status = json.loads(path.read_text())
+        if status.get("state") == "running":
+            active_runs.append(status)
+    print(json.dumps({"lanes": [], "active_runs": active_runs,
+                      "providers": {"pi": None, "codex": None, "cursor": None}}))
 elif sys.argv[1:3] == ["fleet", "_run-info"]:
     rid = sys.argv[3]
     path = home / "runs" / rid / "stub.json"
@@ -69,7 +77,9 @@ elif sys.argv[1:2] == ["run"]:
     card = Path(args.task_file).read_text()
     record({"event": "start", "id": rid, "active_before": len(active), "args": vars(args), "card": card})
     save(home / "runs" / rid / "stub.json", {"repo": args.cwd, "base": args.base, "card": card, "polls": 0})
-    save(home / "runs" / rid / "status.json", {"id": rid, "state": "running"})
+    backend = args.backend
+    save(home / "runs" / rid / "status.json", {"id": rid, "state": "running", "backend": backend,
+                                                 "concurrency_keys": [backend, "total"] if backend else ["total"]})
     print(json.dumps({"id": rid, "state": "started"}))
 else:
     sys.exit(2)

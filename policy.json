@@ -212,7 +212,7 @@
     },
     "variant_supported": false
   },
-  "concurrency": [
+  "recommended_concurrency": [
     {
       "codex_used_below": 0.5,
       "codex": 4,
@@ -229,14 +229,24 @@
       "ocgo": 2
     }
   ],
+  "concurrency": {
+    "codex": 4,
+    "minimax-cn": 6,
+    "total": 10
+  },
+  "rate_limit": {
+    "backoff_seconds": [30, 60, 120, 240],
+    "max_retries": 4
+  },
   "run": {
     "timeout_seconds": 2400,
     "fallback": true
   },
   "bus": {
-    "_doc": "GitHub issue bus for executors outside the controlled fleet. Configure bus.repo and allowed_executors in policy.local.json.",
+    "_doc": "GitHub issue bus for executors outside the controlled fleet. Configure bus.repo, allowed_executors, and allowed_planners in policy.local.json; allowed_planners must include the planner login.",
     "repo": null,
     "allowed_executors": [],
+    "allowed_planners": [],
     "poll_seconds": 60,
     "labels_prefix": "openswarm",
     "open_pr": false
