@@ -43,11 +43,13 @@ class BusTests(unittest.TestCase):
         self.git(self.repo, "remote", "add", "origin", str(self.bare))
         self.git(self.repo, "push", "-q", "origin", "main")
         self.env_names = ("OPENSWARM_HOME", "OPENSWARM_GH_BIN", "OPENSWARM_FAKE_GH_STATE",
-                          "OPENSWARM_FAKE_GH_LOGIN", "OPENSWARM_BUS_TARGET_URL", "OPENSWARM_STATE_FILE",
+                          "OPENSWARM_FAKE_GH_LOGIN", "OPENSWARM_FAKE_GH_ISSUE_LOGIN",
+                          "OPENSWARM_BUS_TARGET_URL", "OPENSWARM_STATE_FILE",
                           "OPENSWARM_PI_BIN")
         self.old_env = {key: os.environ.get(key) for key in self.env_names}
         os.environ.update({"OPENSWARM_HOME": str(self.data), "OPENSWARM_GH_BIN": str(FAKE_GH),
-                           "OPENSWARM_FAKE_GH_STATE": str(self.state_path), "OPENSWARM_FAKE_GH_LOGIN": "executor",
+                           "OPENSWARM_FAKE_GH_STATE": str(self.state_path), "OPENSWARM_FAKE_GH_LOGIN": "planner",
+                           "OPENSWARM_FAKE_GH_ISSUE_LOGIN": "planner",
                            "OPENSWARM_BUS_TARGET_URL": str(self.bare), "OPENSWARM_STATE_FILE": _load.FIXTURE_STATE})
         FAKE_GH.chmod(FAKE_GH.stat().st_mode | stat.S_IEXEC)
         self.constants = {key: getattr(xs, key) for key in ("DATA", "RUNS", "LEDGER", "WORKTREES", "BREAKERS")}
@@ -57,6 +59,8 @@ class BusTests(unittest.TestCase):
         xs.WORKTREES = str(self.data / "worktrees")
         xs.BREAKERS = str(self.data / "breakers.json")
         self.policy = xs.deep_merge(xs.load_policy(), {"bus": {"repo": "org/bus", "allowed_executors": ["executor"],
+                                                               "allowed_planners": ["planner"],
+                                                               "worker_repos": ["org/target"],
                                                                "poll_seconds": 0.02, "labels_prefix": "openswarm"}})
         self.cfg = xs.bus_config(self.policy)
         self.addCleanup(self.cleanup)
@@ -93,7 +97,7 @@ class BusTests(unittest.TestCase):
         try:
             return xs.bus_comment("org/bus", number, body)
         finally:
-            os.environ["OPENSWARM_FAKE_GH_LOGIN"] = previous or "executor"
+            os.environ["OPENSWARM_FAKE_GH_LOGIN"] = previous or "planner"
 
     def set_labels(self, number, add, remove):
         labels = xs.bus_label_names(self.cfg)
@@ -125,8 +129,9 @@ class BusTests(unittest.TestCase):
             thread.start()
             self.addCleanup(lambda: thread.join(timeout=5))
             for _ in range(250):
-                if self.state()["repos"]["org/bus"]["issues"]:
-                    return thread, outcome, self.issue()
+                issues = self.state()["repos"]["org/bus"]["issues"]
+                if issues and issues[0]["comments"]:
+                    return thread, outcome, issues[0]
                 time.sleep(0.01)
         self.fail("planner did not create its issue")
 
@@ -212,6 +217,18 @@ class BusTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["result"]["status"], "failed")
 
+    def test_result_status_wins_over_terminal_labels(self):
+        thread, outcome, issue = self.start_planner()
+        self.add_comment(issue["number"], "/claim external-agent")
+        self.set_labels(issue["number"], ["claimed"], ["queued"])
+        self.send_result(issue["number"], self.report("done", None, None), label="failed")
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive(), {"outcome": outcome, "issue": self.issue()})
+        self.assertEqual(outcome.get("exit"), 0)
+        run_id = xs.bus_extract_task(issue["body"])["run_id"]
+        result = json.loads((Path(xs.RUNS) / run_id / "result.json").read_text())
+        self.assertEqual(result["status"], "done")
+
     def test_budget_expiry_cancels_issue(self):
         thread, outcome, issue = self.start_planner(budget=0.015)
         thread.join(timeout=5)
@@ -240,6 +257,13 @@ class BusTests(unittest.TestCase):
         forged = {**trusted, "run_id": "forged-run", "branch_hint": "openswarm/forged-run"}
         body = "```openswarm-task\n" + json.dumps(forged) + "\n```\nreal task\n```openswarm-task\n" + json.dumps(trusted) + "\n```"
         self.assertEqual(xs.bus_extract_task(body), trusted)
+        mismatched_hint = {**trusted, "branch_hint": "refs/heads/attacker"}
+        self.assertEqual(xs.bus_extract_task("```openswarm-task\n" + json.dumps(mismatched_hint) + "\n```"),
+                         mismatched_hint)
+        invalid_id = {**trusted, "run_id": "../outside"}
+        self.assertIsNone(xs.bus_extract_task("```openswarm-task\n" + json.dumps(invalid_id) + "\n```"))
+        non_string_id = {**trusted, "run_id": 123}
+        self.assertIsNone(xs.bus_extract_task("```openswarm-task\n" + json.dumps(non_string_id) + "\n```"))
 
     def test_unpushed_base_fails_before_issue_creation(self):
         (self.repo / "local-only.txt").write_text("not pushed\n")
@@ -272,11 +296,13 @@ print(json.dumps({'type':'message_end','message':message}), flush=True)
         (self.data / "policy.local.json").write_text(json.dumps(local_policy))
         run_id = "worker-e2e"
         metadata = {"run_id": run_id, "repo": "org/target", "base": self.base,
-                    "branch_hint": f"openswarm/{run_id}", "budget_minutes": 1,
+                    "branch_hint": "openswarm/ignored-hint", "verify": f"touch {self.root / 'untrusted-verify-ran'}",
+                    "budget_minutes": 1,
                     "report_schema": xs.RESULT_SCHEMA}
         issue = xs.bus_create_issue("org/bus", self.cfg, "worker e2e", "write worker.txt", metadata)
         worker_args = argparse.Namespace(bus="org/bus", name="external-agent", backend="pi", model=None,
-                                         budget_minutes=1, once=True)
+                                         budget_minutes=1, once=True, repos="org/target", verify=None)
+        os.environ["OPENSWARM_FAKE_GH_LOGIN"] = "executor"
         xs.cmd_bus_worker(worker_args, self.policy)
         current = self.issue(issue["number"])
         names = {label["name"] for label in current["labels"]}
@@ -285,8 +311,64 @@ print(json.dumps({'type':'message_end','message':message}), flush=True)
         report = next(report for report in result_comments if report)
         self.assertEqual(report["status"], "done")
         self.assertEqual(report["branch"], f"openswarm/{run_id}")
+        self.assertFalse((self.root / "untrusted-verify-ran").exists())
+        self.assertTrue(any("Ignored task verify" in note for note in report["followups"]))
         self.assertTrue(report["commit"])
         self.assertIn("worker.txt", self.git(None, "--git-dir", str(self.bare), "ls-tree", "-r", "--name-only", report["commit"]))
+
+    def test_worker_rejects_changed_task_body_and_unlisted_repo(self):
+        metadata = {"run_id": "digest-check", "repo": "org/target", "base": self.base,
+                    "branch_hint": "openswarm/digest-check", "budget_minutes": 1,
+                    "report_schema": xs.RESULT_SCHEMA}
+        issue = xs.bus_create_issue("org/bus", self.cfg, "digest", "write a file", metadata)
+        state = self.state()
+        changed = next(row for row in state["repos"]["org/bus"]["issues"] if row["number"] == issue["number"])
+        changed["body"] = changed["body"].replace('"budget_minutes": 1', '"budget_minutes": 2')
+        self.state_path.write_text(json.dumps(state))
+        os.environ["OPENSWARM_FAKE_GH_LOGIN"] = "executor"
+        worker_args = argparse.Namespace(bus="org/bus", name="external-agent", backend="pi", model=None,
+                                         budget_minutes=1, once=True, repos="org/target", verify=None)
+        self.assertFalse(xs.bus_worker_run(changed, self.cfg, worker_args, self.policy))
+        self.assertEqual(len(self.issue(issue["number"])["comments"]), 1)
+        self.assertIn("openswarm:queued", {label["name"] for label in self.issue(issue["number"])["labels"]})
+
+        other = {**metadata, "run_id": "repo-check", "repo": "org/other",
+                 "branch_hint": "openswarm/invalid/ignored"}
+        other_issue = xs.bus_create_issue("org/bus", self.cfg, "repo", "write a file", other)
+        self.assertFalse(xs.bus_worker_run(other_issue, self.cfg, worker_args, self.policy))
+        self.assertEqual(len(self.issue(other_issue["number"])["comments"]), 1)
+
+        os.environ["OPENSWARM_FAKE_GH_ISSUE_LOGIN"] = "not-planner"
+        forged_author_issue = xs.bus_create_issue("org/bus", self.cfg, "author", "write a file", metadata)
+        os.environ["OPENSWARM_FAKE_GH_ISSUE_LOGIN"] = "planner"
+        self.assertFalse(xs.bus_worker_run(forged_author_issue, self.cfg, worker_args, self.policy))
+        self.assertEqual(len(self.issue(forged_author_issue["number"])["comments"]), 1)
+
+    def test_bus_redacts_events_results_and_gh_errors(self):
+        secrets = "ghp_12345678901234567890 github_pat_12345678901234567890 sk-12345678901234567890 Bearer abcdefghijklmnop"
+        event_path = Path(xs.RUNS) / "redact" / "events.jsonl"
+        xs.bus_event(str(event_path), secrets)
+        event = event_path.read_text()
+        for token in ("ghp_123", "github_pat_", "sk-123", "Bearer abc"):
+            self.assertNotIn(token, event)
+        self.assertGreaterEqual(event.count("[REDACTED]"), 4)
+
+        rdir = Path(xs.RUNS) / "redact"
+        with self.assertRaises(SystemExit):
+            xs.bus_finish_run("redact", str(rdir), "redact test", str(self.repo), str(self.bare), None,
+                              {"status": "failed", "summary": secrets, "files_changed": [], "tests": "",
+                               "followups": [], "branch": None, "commit": None}, None, "failed", time.time())
+        saved = (rdir / "result.json").read_text()
+        ledger = Path(xs.LEDGER).read_text()
+        self.assertNotIn("github_pat_", saved)
+        self.assertNotIn("ghp_123", saved)
+        self.assertNotIn("sk-123", ledger)
+
+        with mock.patch.object(xs.subprocess, "run", return_value=mock.Mock(returncode=1, stdout="",
+                                                                               stderr="github_pat_12345678901234567890")):
+            with self.assertRaises(xs.BusError) as error:
+                xs.gh_transport("repos/org/bus/issues")
+        self.assertNotIn("github_pat_", str(error.exception))
 
 
 if __name__ == "__main__":

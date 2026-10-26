@@ -80,6 +80,8 @@ def route(state, parts, query, method, payload):
         number = max([issue["number"] for issue in bucket["issues"]] or [0]) + 1
         issue = {"number": number, "id": number, "title": payload["title"], "body": payload["body"],
                  "labels": [{"name": label} for label in payload.get("labels", [])], "comments": [],
+                 "user": {"login": os.environ.get("OPENSWARM_FAKE_GH_ISSUE_LOGIN",
+                                                   os.environ.get("OPENSWARM_FAKE_GH_LOGIN", "planner"))},
                  "created_at": datetime.now(timezone.utc).isoformat(), "state": "open",
                  "html_url": f"https://github.com/{repo}/issues/{number}"}
         bucket["issues"].append(issue)

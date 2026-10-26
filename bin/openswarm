@@ -30,6 +30,7 @@ import datetime as dt
 import glob
 import fnmatch
 import fcntl
+import hashlib
 import html
 import json
 import math
@@ -2044,12 +2045,30 @@ def cmd_run(args, policy):
 BUS_STATES = ("queued", "claimed", "done", "failed", "cancelled")
 BUS_EXECUTOR_BACKENDS = ("codex", "ocgo", "deepseek", "cursor", "pi")
 BUS_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-BUS_RUN_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
+BUS_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$")
 BUS_SHA_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
+BUS_SECRET_RE = re.compile(
+    r"(?i)(?:\bgh[pousr]_[A-Za-z0-9_]{8,}|\bgithub_pat_[A-Za-z0-9_]{8,}|\bsk-[A-Za-z0-9_-]{8,}|\bBearer\s+[^\s\"']+)"
+)
 
 
 class BusError(RuntimeError):
     pass
+
+
+def bus_redact(value):
+    """Remove common credential formats before issue-bus data reaches disk or logs."""
+    return BUS_SECRET_RE.sub("[REDACTED]", str(value))
+
+
+def bus_sanitize(value):
+    if isinstance(value, str):
+        return bus_redact(value)
+    if isinstance(value, list):
+        return [bus_sanitize(item) for item in value]
+    if isinstance(value, dict):
+        return {key: bus_sanitize(item) for key, item in value.items()}
+    return value
 
 
 def gh_transport(endpoint, method="GET", payload=None, allow_not_found=False):
@@ -2064,12 +2083,12 @@ def gh_transport(endpoint, method="GET", payload=None, allow_not_found=False):
     try:
         proc = subprocess.run(command, input=input_text, capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired) as error:
-        raise BusError(f"gh api failed: {error}")
+        raise BusError(bus_redact(f"gh api failed: {error}"))
     if proc.returncode:
         detail = (proc.stderr or proc.stdout).strip()
         if allow_not_found and re.search(r"(?:HTTP )?404|Not Found", detail, re.I):
             return None
-        raise BusError(f"gh api {method} {endpoint} failed: {detail[:500]}")
+        raise BusError(f"gh api {method} {endpoint} failed: {bus_redact(detail)[:500]}")
     if not proc.stdout.strip():
         return {}
     try:
@@ -2101,6 +2120,10 @@ def bus_config(policy, repo=None):
     if not isinstance(allowed, list) or any(not isinstance(login, str) or not login.strip() for login in allowed):
         raise BusError("policy.bus.allowed_executors must be a list of GitHub logins")
     cfg["allowed_executors"] = [login.strip().casefold() for login in allowed]
+    planners = cfg.get("allowed_planners") or []
+    if not isinstance(planners, list) or any(not isinstance(login, str) or not login.strip() for login in planners):
+        raise BusError("policy.bus.allowed_planners must be a list of GitHub logins")
+    cfg["allowed_planners"] = [login.strip().casefold() for login in planners]
     cfg["poll_seconds"] = max(0.01, float(cfg.get("poll_seconds", 60)))
     prefix = str(cfg.get("labels_prefix") or "openswarm").strip().rstrip(":")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", prefix):
@@ -2193,11 +2216,11 @@ def bus_extract_task(body):
         task = json.loads(match.group(1))
     except ValueError:
         return None
-    if not isinstance(task, dict) or not BUS_RUN_ID_RE.fullmatch(str(task.get("run_id") or "")):
+    if (not isinstance(task, dict) or not isinstance(task.get("run_id"), str)
+            or not BUS_RUN_ID_RE.fullmatch(task["run_id"])):
         return None
-    if not BUS_REPO_RE.fullmatch(str(task.get("repo") or "")) or not BUS_SHA_RE.fullmatch(str(task.get("base") or "")):
-        return None
-    if task.get("branch_hint") != f"openswarm/{task['run_id']}":
+    if (not isinstance(task.get("repo"), str) or not BUS_REPO_RE.fullmatch(task["repo"])
+            or not isinstance(task.get("base"), str) or not BUS_SHA_RE.fullmatch(task["base"])):
         return None
     budget = task.get("budget_minutes")
     if isinstance(budget, bool) or not isinstance(budget, (int, float)) or not math.isfinite(budget) or budget <= 0:
@@ -2205,6 +2228,24 @@ def bus_extract_task(body):
     if task.get("verify") is not None and not isinstance(task.get("verify"), str):
         return None
     return task
+
+
+def bus_task_digest(task):
+    canonical = json.dumps(task, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def bus_task_digest_comment(task):
+    return f"openswarm-task-digest: sha256:{bus_task_digest(task)}"
+
+
+def bus_worker_task_is_trusted(issue, task, comments, allowed_planners):
+    author = str((issue.get("user") or {}).get("login") or "").casefold()
+    if not author or author not in allowed_planners or not comments:
+        return False
+    first = comments[0]
+    commenter = str((first.get("user") or {}).get("login") or "").casefold()
+    return commenter in allowed_planners and first.get("body") == bus_task_digest_comment(task)
 
 
 def bus_comments(repo, number):
@@ -2271,15 +2312,18 @@ def bus_create_issue(repo, cfg, title, task, metadata, executor=None):
             gh_transport(f"repos/{repo}/labels", "POST", {"name": route_label, "color": "c5def5",
                                                               "description": f"Route task to {executor}"})
         labels.append(route_label)
-    return gh_transport(f"repos/{repo}/issues", "POST", {
+    issue = gh_transport(f"repos/{repo}/issues", "POST", {
         "title": f"[openswarm] {title}", "body": body, "labels": labels,
     })
+    if issue.get("number"):
+        bus_comment(repo, issue["number"], bus_task_digest_comment(metadata))
+    return issue
 
 
 def bus_event(path, text):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a") as stream:
-        stream.write(json.dumps({"type": "text", "part": {"text": text}}, ensure_ascii=False) + "\n")
+        stream.write(json.dumps({"type": "text", "part": {"text": bus_redact(text)}}, ensure_ascii=False) + "\n")
 
 
 def bus_fetch_branch(root, remote, run_id, branch, expected_commit):
@@ -2323,6 +2367,7 @@ def bus_finish_run(rid, rdir, title, root, remote, issue, result, executor, stat
     branch = commit = None
     diffstat = ""
     verify_note = None
+    result = bus_sanitize(result) if result else None
     task = bus_extract_task((issue or {}).get("body", "")) or {}
     error = None
     if result and result.get("branch") and result.get("commit"):
@@ -2354,12 +2399,13 @@ def bus_finish_run(rid, rdir, title, root, remote, issue, result, executor, stat
         "bus": bus_info, "run_dir": rdir,
     }
     if error:
-        output["error"] = error
+        output["error"] = bus_redact(error)
+    output = bus_sanitize(output)
     jsave(f"{rdir}/result.json", output)
-    append_ledger({"id": rid, "ts": now, "title": title, "status": status, "backend": "github-issue",
-                   "seconds": elapsed, "summary": (result or {}).get("summary"), "commit": commit,
-                   "files": len((result or {}).get("files_changed") or []), "bus": bus_info,
-                   "error_class": output["error_class"]})
+    append_ledger(bus_sanitize({"id": rid, "ts": now, "title": title, "status": status, "backend": "github-issue",
+                                "seconds": elapsed, "summary": (result or {}).get("summary"), "commit": commit,
+                                "files": len((result or {}).get("files_changed") or []), "bus": bus_info,
+                                "error_class": output["error_class"]}))
     set_status(rdir, state="finished", status=status, finished=now, commit=commit, bus=bus_info)
     print(json.dumps(output, indent=2, ensure_ascii=False))
     raise SystemExit(0 if status == "done" else 1)
@@ -2437,7 +2483,8 @@ def cmd_bus_run(args, policy, rid, rdir, task, title, budget_min):
             if comment_id and comment_id not in seen_comments:
                 seen_comments.add(comment_id)
                 login = (comment.get("user") or {}).get("login") or "unknown"
-                bus_event(event_path, f"{login}: {short(comment.get('body') or '', 320)}")
+                body = bus_redact(comment.get("body") or "")
+                bus_event(event_path, f"{login}: {short(body, 320)}")
         names = issue_label_names(current)
         if states["cancelled"] in names:
             final_status = "stopped"
@@ -2445,20 +2492,16 @@ def cmd_bus_run(args, policy, rid, rdir, task, title, budget_min):
         claim = bus_winning_claim(comments, cfg["allowed_executors"])
         if claim:
             claim_login = str((claim.get("user") or {}).get("login") or "")
-            for comment in reversed(comments):
+            claim_index = comments.index(claim)
+            for comment in reversed(comments[claim_index + 1:]):
                 if str((comment.get("user") or {}).get("login") or "").casefold() != claim_login.casefold():
                     continue
                 parsed = bus_parse_result(comment.get("body") or "")
                 if not parsed:
                     continue
-                if states["failed"] in names:
-                    parsed["status"] = "failed"
-                    result, final_status = parsed, "failed"
-                elif states["done"] in names:
-                    result, final_status = parsed, parsed["status"]
-                if final_status:
-                    executor = bus_claim(claim)
-                    break
+                result, final_status = parsed, parsed["status"]
+                executor = bus_claim(claim)
+                break
         if final_status:
             break
         if NOW() >= deadline:
@@ -2546,7 +2589,9 @@ def bus_issue_task(issue):
     return task, card
 
 
-def bus_worker_clone(task, workdir):
+def bus_worker_clone(task, workdir, allowed_repos=None):
+    if task.get("repo") not in set(allowed_repos or []):
+        raise BusError("task repository is not in the worker repository allowlist")
     url = envvar("BUS_TARGET_URL") or f"https://github.com/{task['repo']}.git"
     code, _, error = sh(["git", "clone", "--no-checkout", url, workdir], timeout=300)
     if code:
@@ -2567,9 +2612,23 @@ def bus_worker_open_pr(repo, branch, title, task):
     return response.get("html_url")
 
 
+def bus_worker_repos(args, policy):
+    configured = getattr(args, "repos", None)
+    if configured is not None:
+        values = [value.strip() for value in configured.split(",") if value.strip()]
+    else:
+        values = (policy.get("bus") or {}).get("worker_repos") or []
+    if not isinstance(values, list) or any(not isinstance(value, str) or not BUS_REPO_RE.fullmatch(value) for value in values):
+        raise BusError("worker repositories must be a list of owner/repo names")
+    return set(values)
+
+
 def bus_worker_run(issue, cfg, args, policy):
     task, task_card = bus_issue_task(issue)
     if not task:
+        return False
+    allowed_repos = bus_worker_repos(args, policy)
+    if task["repo"] not in allowed_repos:
         return False
     labels = {state: bus_label(cfg, state) for state in BUS_STATES}
     names = issue_label_names(issue)
@@ -2581,6 +2640,9 @@ def bus_worker_run(issue, cfg, args, policy):
     login = str((gh_transport("user") or {}).get("login") or "").casefold()
     if not login or login not in cfg["allowed_executors"]:
         raise BusError("the authenticated GitHub account is not in policy.bus.allowed_executors")
+    comments = bus_comments(cfg["repo"], issue["number"])
+    if not bus_worker_task_is_trusted(issue, task, comments, cfg["allowed_planners"]):
+        return False
     bus_set_issue_labels(cfg["repo"], issue["number"], cfg, add=[labels["claimed"]], remove=[labels["queued"]])
     own_claim = bus_comment(cfg["repo"], issue["number"], f"/claim {args.name}")
     winner = bus_winning_claim(bus_comments(cfg["repo"], issue["number"]), cfg["allowed_executors"])
@@ -2592,7 +2654,7 @@ def bus_worker_run(issue, cfg, args, policy):
     if os.path.exists(repo_path):
         shutil.rmtree(repo_path)
     try:
-        bus_worker_clone(task, repo_path)
+        bus_worker_clone(task, repo_path, allowed_repos)
         rdir = os.path.join(RUNS, task["run_id"])
         os.makedirs(rdir, exist_ok=True)
         with open(os.path.join(rdir, "task.md"), "w") as stream:
@@ -2606,8 +2668,15 @@ def bus_worker_run(issue, cfg, args, policy):
                    "--backend", args.backend]
         if args.model:
             command += ["--model", args.model]
-        if task.get("verify"):
-            command += ["--verify", str(task["verify"])]
+        verify_allow = (policy.get("bus") or {}).get("worker_verify_allow") or []
+        if not isinstance(verify_allow, list) or any(not isinstance(value, str) for value in verify_allow):
+            raise BusError("policy.bus.worker_verify_allow must be a list of strings")
+        task_verify = task.get("verify")
+        own_verify = getattr(args, "verify", None)
+        effective_verify = own_verify or (task_verify if task_verify in verify_allow else None)
+        ignored_verify = bool(task_verify and task_verify not in verify_allow and task_verify != own_verify)
+        if effective_verify:
+            command += ["--verify", effective_verify]
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                    start_new_session=True)
         while process.poll() is None:
@@ -2623,7 +2692,7 @@ def bus_worker_run(issue, cfg, args, policy):
             return False
         local = jload(os.path.join(rdir, "result.json"), {}) or {}
         nested = local.get("result") or {}
-        branch, commit = local.get("branch"), local.get("commit")
+        branch, commit = f"openswarm/{task['run_id']}", local.get("commit")
         report_status = nested.get("status") or local.get("status") or "failed"
         summary = nested.get("summary") or local.get("error") or f"worker run ended with {report_status}"
         pr_url = None
@@ -2633,15 +2702,18 @@ def bus_worker_run(issue, cfg, args, policy):
             code, _, push_error = sh(["git", "push", "origin", f"{branch}:{branch}"], cwd=repo_path, timeout=300)
             if code:
                 report_status = "failed"
-                summary += f"; push failed: {push_error.strip()[:180]}"
+                summary += f"; push failed: {bus_redact(push_error.strip())[:180]}"
             elif (policy.get("bus") or {}).get("open_pr"):
                 pr_url = bus_worker_open_pr(task["repo"], branch, issue.get("title", "openswarm task"), task)
         if labels["cancelled"] in issue_label_names(gh_transport(f"repos/{cfg['repo']}/issues/{issue['number']}")):
             return False
-        report = {"status": report_status if report_status in ("done", "partial", "failed") else "failed",
+        followups = nested.get("followups") or []
+        if ignored_verify:
+            followups = [*followups, "Ignored task verify because it is not in the worker verify allowlist or worker --verify."]
+        report = bus_sanitize({"status": report_status if report_status in ("done", "partial", "failed") else "failed",
                   "summary": summary, "files_changed": nested.get("files_changed") or [],
                   "tests": nested.get("tests") or "not run: executor did not return a test report",
-                  "followups": nested.get("followups") or [], "branch": branch, "commit": commit, "pr_url": pr_url}
+                  "followups": followups, "branch": branch, "commit": commit, "pr_url": pr_url})
         terminal = "failed" if report["status"] == "failed" else "done"
         body = "```openswarm-result\n" + json.dumps(report, ensure_ascii=False, indent=2) + "\n```"
         bus_comment(cfg["repo"], issue["number"], body)
@@ -2652,7 +2724,7 @@ def bus_worker_run(issue, cfg, args, policy):
         current = gh_transport(f"repos/{cfg['repo']}/issues/{issue['number']}")
         if labels["cancelled"] in issue_label_names(current):
             return False
-        report = {"status": "failed", "summary": str(error)[:500], "files_changed": [],
+        report = {"status": "failed", "summary": bus_redact(str(error))[:500], "files_changed": [],
                   "tests": "not run: worker failed before verification", "followups": [], "branch": None,
                   "commit": None, "pr_url": None}
         bus_comment(cfg["repo"], issue["number"], "```openswarm-result\n" + json.dumps(report, indent=2) + "\n```")
@@ -5192,6 +5264,8 @@ def main():
     sp.add_argument("--backend", choices=BUS_EXECUTOR_BACKENDS, default="codex")
     sp.add_argument("--model")
     sp.add_argument("--budget-minutes", type=float, default=40)
+    sp.add_argument("--repos", help="worker-local owner/repo allowlist, comma-separated")
+    sp.add_argument("--verify", help="worker-owned verify command")
     sp.add_argument("--once", action="store_true", help="claim at most one queued issue, then exit")
 
     sp = sub.add_parser("lane", help="manage resident executor lanes")

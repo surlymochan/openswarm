@@ -19,6 +19,9 @@ Configure `policy.local.json` under `$OPENSWARM_HOME`:
   "bus": {
     "repo": "<bus-owner>/<bus-repo>",
     "allowed_executors": ["<github-login>"],
+    "allowed_planners": ["<planner-github-login>"],
+    "worker_repos": ["<target-owner>/<target-repo>"],
+    "worker_verify_allow": ["<exact-verify-command>"],
     "poll_seconds": 60,
     "labels_prefix": "openswarm",
     "open_pr": false
@@ -32,7 +35,7 @@ Configure `policy.local.json` under `$OPENSWARM_HOME`:
 openswarm bus-worker --bus <bus-owner>/<bus-repo> --name <executor-name> --backend codex --once
 ```
 
-Omit `--once` for a resident worker. `--backend` may be `codex`, `ocgo`, `deepseek`, `cursor`, or `pi`; `--model` is optional. Set `open_pr` to `true` to have the worker open a draft PR after pushing its branch.
+Pass `--repos owner/repo[,owner/repo]` to set a worker-local target repository allowlist, or configure `bus.worker_repos`; with neither configured the worker refuses every task. Omit `--once` for a resident worker. `--backend` may be `codex`, `ocgo`, `deepseek`, `cursor`, or `pi`; `--model` is optional. A task's `verify` command runs only when it exactly matches `worker_verify_allow` or the worker's own `--verify`; other task commands are ignored and reported in the result followups. Set `open_pr` to `true` to have the worker open a draft PR after pushing its branch.
 
 Dispatch a task from a target repository whose `origin` is its GitHub remote. The selected base commit must already be advertised by a remote branch or tag; push it first if necessary:
 
@@ -59,7 +62,7 @@ An issue is one task card. Its title is `[openswarm] <run title>`. The task desc
 }
 ```
 
-The state labels are `openswarm:queued` → `openswarm:claimed` → `openswarm:done` or `openswarm:failed`. The planner may instead set `openswarm:cancelled`. An optional `executor:<name>` label routes a card to one worker name. A worker claims by adding `openswarm:claimed` and commenting `/claim <executor-name>`. The earliest `/claim` comment authored by an allowlisted GitHub account wins.
+The state labels are `openswarm:queued`, `openswarm:claimed`, `openswarm:done`, and `openswarm:failed`; they are display labels and do not authorize planner state transitions. The planner acts on `openswarm:cancelled` only as a stop signal. An optional `executor:<name>` label routes a card to one worker name. A worker claims by adding `openswarm:claimed` and commenting `/claim <executor-name>`. The earliest `/claim` comment authored by an allowlisted GitHub account wins. The planner posts an `openswarm-task-digest: sha256:<hex>` first comment over the canonical task JSON.
 
 The worker checks out the requested base, runs openswarm's regular local run machinery with a hard budget and optional verify command, pushes `openswarm/<run-id>` to the target repository, then posts a fenced `openswarm-result` JSON comment:
 
@@ -76,10 +79,10 @@ The worker checks out the requested base, runs openswarm's regular local run mac
 }
 ```
 
-`status`, `summary`, `files_changed`, `tests`, and `followups` follow openswarm's regular result schema. The bus result adds `branch`, `commit`, and optional `pr_url`. `done` and `failed` labels mark the terminal result. The planner fetches the reported result branch, verifies it locally when requested, writes the usual run result and ledger entry, and never merges or pushes to the target repository.
+`status`, `summary`, `files_changed`, `tests`, and `followups` follow openswarm's regular result schema. The bus result adds `branch`, `commit`, and optional `pr_url`. The planner takes the terminal status from a valid `openswarm-result` comment authored by the winning claimer, regardless of done or failed labels. It fetches the reported result branch, verifies it locally when requested, writes the usual run result and ledger entry, and never merges or pushes to the target repository. The worker always pushes `openswarm/<run_id>`; `branch_hint` is informational and ignored.
 
 ## Trust and cancellation
 
-Issue comments are untrusted input. The planner accepts claims and results only from `bus.allowed_executors`; only the earliest allowed claimer's result is used. The planner treats comments as data, never runs comment text, validates the result fields and branch name, and checks the fetched commit against the reported SHA. Workers must stop when an issue is labelled `openswarm:cancelled`.
+Issue content and comments are untrusted input. The worker accepts a card only when its issue author and first digest comment are both from `bus.allowed_planners` and the digest matches the task JSON in the current body. Workers require a target repository in their worker-local `--repos` or `bus.worker_repos` allowlist. The planner accepts claims and results only from `bus.allowed_executors`; only the earliest allowed claimer's result is used. The planner treats comments as data, never runs comment text, validates the result fields and branch name, and checks the fetched commit against the reported SHA. Workers must stop when an issue is labelled `openswarm:cancelled`.
 
 Do not put secrets in issue bodies or comments. Do not grant bus workers more target repository access than needed to push their task branch. The planner never merges PRs and never pushes to the target repository itself. Revoke executor access when a worker is retired.
