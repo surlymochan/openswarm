@@ -11,7 +11,7 @@ Subcommands:
   status           human summary of state + recommended concurrency
   route            pick backend/model/effort for a task profile (JSON out)
   run              route + execute in an isolated git worktree, record ledger (JSON out)
-  lessons          preview lessons or propose additions from PR review findings
+  lessons          preview, propose, and escalate executor lessons
   lane             manage long-lived Codex app-server / Cursor ACP / Pi RPC executor lanes
   fleet            inspect hosts and forward openswarm commands over local / SSH / instabox transports
   batch            queue task cards across fleet hosts and collect their branches
@@ -754,6 +754,252 @@ def cmd_lessons_propose(args, policy):
                 stream.write(summary)
             jsave(seen_path, {**seen, "comment_ids": next_seen})
             print(f"wrote {len(proposals)} lesson proposal(s) to {output_dir}; seen index: {seen_path}")
+    finally:
+        if lock is not None:
+            lock.close()
+
+
+LESSON_ESCALATION_GUARDS = {
+    "secret_exposure": {
+        "kind": "openswarm risk rule regex",
+        "draft": (r"(?i)(?:api[_-]?key|token|password|secret)\s*[:=]\s*"
+                  r"[\"']?[A-Za-z0-9_./+=-]{8,}[\"']?"),
+        "message": "Blocked: possible credential in command or patch output.",
+        "test": "Add a risk-rule test that blocks a fake credential and allows a safe control string.",
+    },
+    "trust_boundary": {
+        "kind": "verify step",
+        "draft": "Before side effects, require an authorization check for the caller and resource.",
+        "message": "Reject unauthorized access before performing the protected action.",
+        "test": "Add tests proving an unauthorized caller is denied without side effects and an authorized caller succeeds.",
+    },
+    "input_validation": {
+        "kind": "repo lint/GritQL rule",
+        "draft": (r"(?i)\b(?:eval|exec|yaml\.load|subprocess\.run)\s*\(\s*"
+                  r"(?:request|user|input|payload)\b"),
+        "message": "Unvalidated external input reaches a sensitive sink.",
+        "test": "Add lint fixtures for an unvalidated external value at a sensitive sink and a validated control case.",
+    },
+    "concurrency": {
+        "kind": "CI check",
+        "draft": "Run the regression test with concurrent writers and assert the final state is complete and consistent.",
+        "message": "Concurrent updates must not lose or partially publish state.",
+        "test": "Add a deterministic concurrent-writer test that fails on lost updates or partial output.",
+    },
+    "missing_test": {
+        "kind": "CI check",
+        "draft": "Require a focused regression test whenever a behavior-changing source path is modified.",
+        "message": "Behavior changes require a regression test in the same change.",
+        "test": "Add a CI fixture with a changed source and no test (must fail), plus a paired test (must pass).",
+    },
+    "i18n_literal": {
+        "kind": "repo lint/GritQL rule",
+        "draft": (r"(?i)(?:label|title|placeholder|button_text)\s*=\s*"
+                  r"[\"'][^\"']+[\"']"),
+        "message": "User-visible text must use the repository's localization helper.",
+        "test": "Add lint fixtures for a hard-coded user-visible string and a localized control case.",
+    },
+    "platform_assumption": {
+        "kind": "verify step",
+        "draft": "Run the focused verification on ubuntu-latest, macos-latest, and windows-latest.",
+        "message": "Platform-sensitive behavior must pass on all supported operating systems.",
+        "test": "Add or extend a CI matrix test covering path, environment, and process behavior on each supported OS.",
+    },
+    "error_handling": {
+        "kind": "CI check",
+        "draft": "Inject the operation's failure and timeout paths and assert errors are surfaced to the caller.",
+        "message": "Failures and timeouts must not be silently swallowed.",
+        "test": "Add failure-injection tests for the error and timeout paths, including the expected return code or exception.",
+    },
+    "other": {
+        "kind": "verify step",
+        "draft": "Run a focused regression check for the affected lesson rule before merge.",
+        "message": "The regression check must fail before the fix and pass after it.",
+        "test": "Add a minimal failing-before/fixed-after regression test for this lesson.",
+    },
+}
+
+
+def lesson_proposal_field(text, field):
+    for line in str(text).splitlines():
+        content = lesson_yaml_comment(line).strip()
+        match = re.fullmatch(rf"{re.escape(field)}:[ \t]*(.*)", content)
+        if match and match.group(1):
+            try:
+                return lesson_yaml_scalar(match.group(1))
+            except ValueError:
+                return None
+    return None
+
+
+def lesson_accepted_recurrences(repo):
+    """Read accepted recurrence proposals which have not moved into lessons/ yet."""
+    result = {}
+    directory = os.path.join(repo, "proposals")
+    for path in sorted(glob.glob(os.path.join(directory, "**", "*.yaml"), recursive=True)):
+        try:
+            with open(path, encoding="utf-8") as stream:
+                text = stream.read()
+        except OSError as error:
+            print(f"openswarm: warning: cannot read recurrence proposal {path}: {error}", file=sys.stderr)
+            continue
+        proposal_type = lesson_proposal_field(text, "proposal_type")
+        lesson_id = lesson_proposal_field(text, "lesson_id")
+        if proposal_type != "recurrence" or not isinstance(lesson_id, str):
+            continue
+        accepted_value = lesson_proposal_field(text, "accepted")
+        accepted = accepted_value is True or str(accepted_value or "").casefold() in {
+            "true", "yes", "accepted", "approved"}
+        accepted = accepted or any(
+            str(lesson_proposal_field(text, field) or "").casefold() in
+            ("accepted", "approved", "accept", "approve")
+            for field in ("status", "decision", "state", "review_status", "acceptance"))
+        if accepted:
+            result.setdefault(lesson_id, []).append({
+                "path": path,
+                "source": lesson_proposal_field(text, "source"),
+            })
+    return result
+
+
+def lesson_evidence_link(label, value, relative=False):
+    value = str(value or "").strip()
+    if value.startswith(("https://", "http://")):
+        target = urllib.parse.quote(value, safe=":/?#[]@!$&'*+,;=%")
+        return f"- [{label}]({target})"
+    if relative and value:
+        target = urllib.parse.quote(value, safe="/.-_")
+        return f"- [{label}]({target})"
+    return f"- {label}: `{value or 'not recorded'}`"
+
+
+def lesson_guard_proposal(lesson, lesson_file, recurrence_proposals, recurrences, date, output_dir):
+    lesson_id = lesson["id"]
+    root_class = lesson.get("root_cause_class") or lesson_root_cause_class(lesson.get("rule"))
+    guard = LESSON_ESCALATION_GUARDS.get(root_class, LESSON_ESCALATION_GUARDS["other"])
+    applies = lesson.get("applies_to") or {}
+    paths = applies.get("paths") or []
+    lines = [f"# L3 guard proposal: {lesson_id}", "", f"Generated: {date}", "",
+             "## Lesson", "", f"- ID: `{lesson_id}`",
+             f"- Guard level: `{lesson.get('guard_level')}` → `L3`",
+             f"- Recurrences: `{recurrences}`",
+             f"- Root cause class: `{root_class}`",
+             f"- Rule: {lesson_plain_text(lesson.get('rule'))}",
+             f"- Applies to paths: `{', '.join(paths) if paths else 'all paths'}`", "", "## Evidence", "",
+             lesson_evidence_link("Lesson file", os.path.relpath(lesson_file, output_dir), relative=True)]
+    source = lesson.get("source")
+    if source:
+        sources = source if isinstance(source, list) else [source]
+        lines.extend(lesson_evidence_link("Lesson source", item) for item in sources)
+    else:
+        lines.append("- Lesson source: not recorded")
+    for proposal in recurrence_proposals:
+        relative = os.path.relpath(proposal["path"], output_dir)
+        lines.append(lesson_evidence_link("Accepted recurrence proposal", relative, relative=True))
+        if proposal.get("source"):
+            lines.append(lesson_evidence_link("Recurrence source", proposal["source"]))
+    lines.extend(["", "## Proposed guard", "", f"- Kind: **{guard['kind']}**", "",
+                  "Draft:", "", "```text", guard["draft"], "```", "",
+                  f"Failure message: `{guard['message']}`", "", "## Required accompanying test", "",
+                  guard["test"], ""])
+    return "\n".join(lines)
+
+
+def lesson_records_with_paths(repo):
+    directory = os.path.join(repo, "lessons")
+    records = []
+    try:
+        filenames = sorted(name for name in os.listdir(directory) if name.endswith(".yaml"))
+    except FileNotFoundError:
+        return records
+    except OSError as error:
+        raise ValueError(f"cannot read lessons directory {directory}: {error}") from error
+    for filename in filenames:
+        path = os.path.join(directory, filename)
+        try:
+            with open(path, encoding="utf-8") as stream:
+                lesson = parse_lesson_yaml(stream.read())
+        except (OSError, ValueError) as error:
+            print(f"openswarm: warning: skipping lesson file {path}: {error}", file=sys.stderr)
+            continue
+        records.append((lesson, path))
+    return records
+
+
+def cmd_lessons_escalate(args, policy):
+    repo = os.path.expanduser(str((policy.get("knowledge") or {}).get("repo") or DEFAULT_KNOWLEDGE_REPO))
+    date = policy_day(policy)[0]
+    proposals_root = os.path.join(repo, "proposals")
+    output_dir = os.path.abspath(os.path.expanduser(args.out)) if args.out else os.path.join(proposals_root, date)
+    seen_path = os.path.join(proposals_root, "escalate-seen.json")
+    lock = None
+    if not args.dry_run:
+        os.makedirs(proposals_root, exist_ok=True)
+        lock = open(seen_path + ".lock", "a", encoding="utf-8")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        if os.path.isfile(seen_path):
+            try:
+                with open(seen_path, encoding="utf-8") as stream:
+                    seen = json.load(stream)
+            except (OSError, ValueError) as error:
+                raise ValueError(f"cannot read escalation seen index {seen_path}: {error}") from error
+        else:
+            seen = {}
+        if not isinstance(seen, dict):
+            raise ValueError(f"invalid escalation seen index: {seen_path}")
+        seen_ids = seen.get("lesson_ids", {})
+        if isinstance(seen_ids, list):
+            seen_ids = {str(value): {} for value in seen_ids}
+        if not isinstance(seen_ids, dict):
+            raise ValueError(f"invalid escalation lesson_ids index: {seen_path}")
+
+        records = lesson_records_with_paths(repo)
+        accepted = lesson_accepted_recurrences(repo)
+        proposals, rendered, next_seen = [], {}, dict(seen_ids)
+        skipped = 0
+        for lesson, lesson_file in records:
+            lesson_id = lesson["id"]
+            if lesson.get("guard_level") == "L3":
+                continue
+            base = lesson.get("recurrences", 0)
+            base = base if isinstance(base, int) and not isinstance(base, bool) and base >= 0 else 0
+            recurrence_proposals = accepted.get(lesson_id, [])
+            recurrences = base + len(recurrence_proposals)
+            if recurrences < 1:
+                continue
+            filename = f"guard-{lesson_id}.md"
+            if lesson_id in seen_ids or os.path.exists(os.path.join(output_dir, filename)):
+                skipped += 1
+                next_seen.setdefault(lesson_id, {"file": filename, "date": date})
+                continue
+            proposal = lesson_guard_proposal(lesson, lesson_file, recurrence_proposals,
+                                             recurrences, date, output_dir)
+            proposals.append((lesson_id, filename))
+            rendered[filename] = proposal
+            next_seen[lesson_id] = {"file": filename, "date": date, "recurrences": recurrences}
+
+        if args.dry_run:
+            for filename, contents in rendered.items():
+                print(f"--- {filename} ---")
+                print(contents, end="")
+            print(f"Guard proposals: {len(proposals)}; already seen: {skipped}.")
+        else:
+            os.makedirs(output_dir, exist_ok=True)
+            for filename, contents in rendered.items():
+                path = os.path.join(output_dir, filename)
+                fd, temporary = tempfile.mkstemp(prefix=filename + ".tmp", dir=output_dir)
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                        stream.write(contents)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temporary, path)
+                finally:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+            jsave(seen_path, {**seen, "lesson_ids": next_seen})
+            print(f"wrote {len(proposals)} L3 guard proposal(s) to {output_dir}; seen index: {seen_path}")
     finally:
         if lock is not None:
             lock.close()
@@ -7881,6 +8127,9 @@ def main():
     lp.add_argument("--since", type=float, default=30, help="only inspect runs from the last DAYS (default: 30)")
     lp.add_argument("--out", help="proposal output directory (default: knowledge.repo/proposals/<date>)")
     lp.add_argument("--dry-run", action="store_true", help="print proposals without writing proposal files")
+    lp = lessons_sub.add_parser("escalate", help="propose L3 guards for recurring lessons")
+    lp.add_argument("--out", help="proposal output directory (default: knowledge.repo/proposals/<date>)")
+    lp.add_argument("--dry-run", action="store_true", help="print proposals without writing proposal or seen files")
 
     def add_profile(p, include_bus=False):
         p.add_argument("--type", default="impl",
@@ -8106,6 +8355,12 @@ def main():
             block, _ = select_lessons(policy, a.card_type, a.backend, paths=a.paths)
             if block:
                 print(block)
+        elif a.lessons_cmd == "escalate":
+            try:
+                cmd_lessons_escalate(a, policy)
+            except ValueError as error:
+                print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False), file=sys.stderr)
+                sys.exit(2)
         else:
             try:
                 cmd_lessons_propose(a, policy)

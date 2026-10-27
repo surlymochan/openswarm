@@ -188,6 +188,17 @@ New lesson and recurrence proposals are written under `knowledge.repo/proposals/
 tracks processed inline comment ids in `knowledge.repo/proposals/seen.json`; it never edits existing lessons.
 `--dry-run` prints the proposed YAML and summary without writing proposal or seen-index files.
 
+Escalate recurring lessons into reviewable L3 guard drafts with:
+
+```bash
+openswarm lessons escalate [--out DIR] [--dry-run]
+```
+
+The command writes `guard-<lesson-id>.md` proposals for non-L3 lessons with at least one recurrence, including
+accepted recurrence proposals still under `proposals/`. Each draft maps its root-cause class to a fixed guard kind
+and includes evidence links plus the required accompanying test. `proposals/escalate-seen.json` makes runs
+idempotent; escalation never edits lessons or enforcement code.
+
 ## Routing weights (record-only)
 
 `openswarm routing weights` summarizes ledger runs by backend, model and card type. It writes

@@ -94,6 +94,28 @@ class LessonsTests(unittest.TestCase):
         finally:
             sys.argv = original_argv
 
+    def run_escalate(self, *args):
+        original_argv = sys.argv
+        try:
+            sys.argv = ["openswarm", "lessons", "escalate", *args]
+            output = io.StringIO()
+            with mock.patch.object(xs, "load_policy", return_value=self.policy), \
+                    contextlib.redirect_stdout(output):
+                xs.main()
+            return output.getvalue()
+        finally:
+            sys.argv = original_argv
+
+    def write_recurrence_proposal(self, name, lesson_id, status="accepted", source=None):
+        directory = self.root / "proposals" / "previous"
+        directory.mkdir(parents=True, exist_ok=True)
+        source_line = f'source: "{source}"\n' if source else ""
+        path = directory / name
+        path.write_text(
+            f"proposal_type: recurrence\nlesson_id: {lesson_id}\nstatus: {status}\n"
+            f"root_cause_class: input_validation\nrecurrences: 1\n{source_line}", encoding="utf-8")
+        return path
+
     def test_selection_filters_card_type_backend_and_paths_then_orders_specificity(self):
         self.write_lesson("global.yaml", "L-0001", "general rule")
         self.write_lesson("specific.yaml", "L-0002", "specific rule", card_types="[fix]",
@@ -199,8 +221,69 @@ class LessonsTests(unittest.TestCase):
         self.run_propose()
 
         proposal = self.root / "proposals" / xs.policy_day(self.policy)[0] / "recurrence-L-0030-701.yaml"
-        self.assertIn("recurrences: 5", proposal.read_text(encoding="utf-8"))
+        text = proposal.read_text(encoding="utf-8")
+        self.assertIn('lesson_id: "L-0030"', text)
+        self.assertIn('root_cause_class: "input_validation"', text)
+        self.assertIn("recurrences: 5", text)
         self.assertEqual((self.lessons / "validation.yaml").read_text(encoding="utf-8").count("recurrences: 4"), 1)
+
+    def test_propose_requires_overlapping_paths_for_same_class_recurrence(self):
+        self.write_lesson("validation.yaml", "L-0030", "validate input", paths="[tests/*.py]",
+                          root_cause_class="input_validation", recurrences=4)
+        self.set_ledger_finding()
+
+        self.run_propose()
+
+        proposal = self.root / "proposals" / xs.policy_day(self.policy)[0] / "L-0001.yaml"
+        self.assertTrue(proposal.is_file())
+        self.assertIn('root_cause_class: "input_validation"', proposal.read_text(encoding="utf-8"))
+
+    def test_escalate_writes_l3_guards_from_recurrences_and_accepted_proposals(self):
+        self.write_lesson("accepted.yaml", "L-0040", "validate input", paths="[src/*.py]",
+                          root_cause_class="input_validation", recurrences=0)
+        (self.lessons / "accepted.yaml").write_text(
+            (self.lessons / "accepted.yaml").read_text(encoding="utf-8") +
+            'source: "https://github.com/octo/project/blob/main/LESSONS.md#L-0040"\n', encoding="utf-8")
+        self.write_recurrence_proposal(
+            "recurrence-L-0040-701.yaml", "L-0040", source="https://github.com/octo/project/pull/14#discussion_r701")
+        self.write_lesson("recurring.yaml", "L-0041", "retry errors", recurrences=1,
+                          root_cause_class="error_handling")
+        self.write_lesson("l3.yaml", "L-0042", "already a reminder", guard="L3", recurrences=5)
+        self.write_lesson("pending.yaml", "L-0043", "validate a different input", recurrences=0,
+                          root_cause_class="input_validation")
+        self.write_recurrence_proposal("pending-L-0043-702.yaml", "L-0043", status="proposed")
+
+        output = self.run_escalate()
+
+        directory = self.root / "proposals" / xs.policy_day(self.policy)[0]
+        generated = sorted(path.name for path in directory.glob("guard-*.md"))
+        self.assertEqual(generated, ["guard-L-0040.md", "guard-L-0041.md"])
+        proposal = (directory / "guard-L-0040.md").read_text(encoding="utf-8")
+        self.assertIn("- Recurrences: `1`", proposal)
+        self.assertIn("Accepted recurrence proposal", proposal)
+        self.assertIn("https://github.com/octo/project/pull/14#discussion_r701", proposal)
+        self.assertIn("repo lint/GritQL rule", proposal)
+        self.assertIn("Unvalidated external input reaches a sensitive sink.", proposal)
+        self.assertIn("Add lint fixtures", proposal)
+        self.assertIn("wrote 2 L3 guard proposal(s)", output)
+
+    def test_escalate_is_idempotent_and_dry_run_writes_nothing(self):
+        self.write_lesson("recurring.yaml", "L-0050", "retry errors", recurrences=1,
+                          root_cause_class="error_handling")
+        dry_output = self.run_escalate("--dry-run")
+        self.assertIn("--- guard-L-0050.md ---", dry_output)
+        self.assertIn("failure-injection tests", dry_output)
+        self.assertFalse((self.root / "proposals" / xs.policy_day(self.policy)[0]).exists())
+        self.assertFalse((self.root / "proposals" / "escalate-seen.json").exists())
+
+        self.run_escalate()
+        proposal_path = self.root / "proposals" / xs.policy_day(self.policy)[0] / "guard-L-0050.md"
+        original = proposal_path.read_text(encoding="utf-8")
+        second = self.run_escalate()
+        self.assertIn("wrote 0 L3 guard proposal(s)", second)
+        self.assertEqual(proposal_path.read_text(encoding="utf-8"), original)
+        seen = json.loads((self.root / "proposals" / "escalate-seen.json").read_text(encoding="utf-8"))
+        self.assertIn("L-0050", seen["lesson_ids"])
 
     def test_unknown_finding_class_maps_to_other(self):
         self.write_lesson("existing.yaml", "L-0001", "unrelated", root_cause_class="error_handling")
