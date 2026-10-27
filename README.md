@@ -89,8 +89,8 @@ openswarm splits the work:
 - **Claude** decomposes the task, writes acceptance criteria, reviews diffs and integrates.
 - **Executors** do the typing:
   - [Codex CLI](https://github.com/openai/codex) is the main executor.
-  - [OpenCode](https://opencode.ai) Go handles cheap or mechanical work, non-GPT second opinions, overflow, and 1M context.
-  - DeepSeek is the metered last resort.
+  - [OpenCode](https://opencode.ai) Go and DeepSeek are opt-in backends: force either with `--backend`, or add it to `routing.default_order` to enable automatic routing.
+  - Automatic routing defaults to Codex only; configured OpenCode Go and DeepSeek can handle mechanical work, non-GPT second opinions, overflow, and large context.
   - Cursor CLI (`cursor-agent`) runs only when you pass `--backend cursor`, or when you add `cursor` to `routing.default_order`. It is not part of automatic routing.
 
 Routing decisions use live quota data, not guesses.
@@ -99,7 +99,7 @@ Routing decisions use live quota data, not guesses.
 
 - **Live model discovery.** Reads the current Codex and OpenCode model catalogues and sorts them into tiers (fast, balanced, deep). Legacy models go last.
 - **Quota-aware routing.** Looks at 5-hour, 7-day and 30-day windows, burn pace and reset times:
-  - At the soft limit, easy work spills to other backends.
+  - At the soft limit, easy work spills to other enabled backends.
   - A hard limit skips the backend.
   - Quota that is about to expire unused gets spent at higher effort.
 - **Isolated execution.** Each run gets its own `git worktree` and `openswarm/<id>` branch.
@@ -430,15 +430,16 @@ See [docs/BUS.md](docs/BUS.md) for the issue/result schema and worker setup. The
 
 | Input | Effect |
 | --- | --- |
-| `--type review/audit` | Goes to a non-GPT family first (OpenCode Go) for an independent opinion |
-| `--type mechanical/docs/test` at difficulty ≤ 2 | OpenCode Go first, to save Codex |
+| `--type review/audit` | Prefers a non-GPT family first when one is enabled in `routing.default_order` |
+| `--type mechanical/docs/test` at difficulty ≤ 2 | Prefers OpenCode Go first when it is enabled in `routing.default_order` |
 | `--difficulty 1..5` | Sets tier and effort: fast/low, fast/medium, balanced/medium, balanced/high, deep/high |
-| `--context-tokens` > 220k | Prefers 1M-context backends |
+| `--context-tokens` > 220k | Prefers enabled 1M-context backends |
 | A window ≥ 95% used | Skips the backend |
 | A window ≥ 85% used | Spills difficulty ≤ 3 to other backends; harder tasks stay with effort −1 |
 | Burn pace > 1.25× even | Effort −1 |
 | Resets within 24h with < 60% used | Effort +1, so quota isn't wasted |
-| DeepSeek balance below floor | Skips DeepSeek |
+| DeepSeek balance below floor | Skips DeepSeek when it is enabled for routing |
+| `--backend ocgo` or `--backend deepseek` | Forces that opt-in backend; automatic routing uses either only when listed in `routing.default_order` |
 | `--backend cursor` | Forces the Cursor CLI. Cursor is never chosen on its own unless `cursor` is listed in `routing.default_order` |
 
 The full rules are in [`SKILL.md`](SKILL.md#7-routing-rules-what-route-does). Every threshold is in

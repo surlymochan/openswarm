@@ -1,0 +1,23 @@
+usage: openswarm bus-worker [-h] --bus BUS --name NAME
+                            [--backend {codex,ocgo,deepseek,cursor,agy,pi}]
+                            [--model MODEL] [--budget-minutes BUDGET_MINUTES]
+                            [--repos REPOS] [--verify VERIFY]
+                            [--card-type CARD_TYPE] [--rework-of REWORK_OF]
+                            [--paths PATHS [PATHS ...]] [--once]
+
+options:
+  -h, --help            show this help message and exit
+  --bus BUS             bus repository owner/name
+  --name NAME           executor name used in /claim comments
+  --backend {codex,ocgo,deepseek,cursor,agy,pi}
+  --model MODEL
+  --budget-minutes BUDGET_MINUTES
+  --repos REPOS         worker-local owner/repo allowlist, comma-separated
+  --verify VERIFY       worker-owned verify command
+  --card-type CARD_TYPE
+                        default card type for bus tasks
+  --rework-of REWORK_OF
+                        run id this task reworks
+  --paths PATHS [PATHS ...]
+                        path hints for matching applicable lessons
+  --once                claim at most one queued issue, then exit

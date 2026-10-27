@@ -13,6 +13,8 @@ xs.breakers = lambda: {}  # isolate from any breakers on disk
 xs.load_policy = lambda: xs.jload(f"{xs.SKILL_DIR}/policy.json", {})  # ignore policy.local.json overrides
 
 POLICY = xs.load_policy()
+OPT_IN_POLICY = copy.deepcopy(POLICY)
+OPT_IN_POLICY["routing"]["default_order"] = ["codex", "ocgo", "deepseek"]
 with open(_load.FIXTURE_STATE) as f:
     BASE = json.load(f)
 NOW = time.time()
@@ -40,8 +42,8 @@ def prof(type_="impl", d=3, **kw):
 
 
 class RoutingScenarios(unittest.TestCase):
-    def check(self, p, st, expect):
-        r = xs.route(p, st, POLICY)
+    def check(self, p, st, expect, policy=POLICY):
+        r = xs.route(p, st, policy)
         for k, v in expect.items():
             ok = v(r.get(k)) if callable(v) else r.get(k) == v
             self.assertTrue(ok, f"{k}={r.get(k)!r}; route={json.dumps({x: r.get(x) for x in ('ok', 'backend', 'model', 'effort', 'skipped', 'reasons')})}")
@@ -54,23 +56,25 @@ class RoutingScenarios(unittest.TestCase):
     def test_02_hardest_goes_to_codex_deep(self):
         self.check(prof("debug", 5), scenario(), {"backend": "codex", "model": lambda m: m in DEEP})
 
-    def test_03_mechanical_low_difficulty_goes_to_ocgo(self):
-        self.check(prof("mechanical", 1), scenario(), {"backend": "ocgo"})
+    def test_03_mechanical_low_difficulty_uses_codex_by_default(self):
+        self.check(prof("mechanical", 1), scenario(), {"backend": "codex"})
 
-    def test_04_review_goes_to_non_gpt_family(self):
-        self.check(prof("review", 3), scenario(), {"backend": "ocgo"})
+    def test_04_review_uses_codex_when_non_gpt_backends_are_disabled(self):
+        self.check(prof("review", 3), scenario(), {"backend": "codex"})
 
     def test_05_codex_soft_limit_spills_easy_work(self):
-        self.check(prof(d=3), scenario(codex_week=0.90), {"backend": "ocgo"})
+        self.check(prof(d=3), scenario(codex_week=0.90), {"backend": "ocgo"}, OPT_IN_POLICY)
 
     def test_06_codex_soft_limit_keeps_hard_work_with_lower_effort(self):
-        self.check(prof("debug", 5), scenario(codex_week=0.90), {"backend": "codex", "effort": "medium"})
+        self.check(prof("debug", 5), scenario(codex_week=0.90),
+                   {"backend": "codex", "effort": "medium"}, OPT_IN_POLICY)
 
     def test_07_codex_hard_limit_and_ocgo_exhausted_fall_to_deepseek(self):
-        self.check(prof(d=3), scenario(codex_week=0.97, ocgo_usage=0.9), {"backend": "deepseek"})
+        self.check(prof(d=3), scenario(codex_week=0.97, ocgo_usage=0.9), {"backend": "deepseek"}, OPT_IN_POLICY)
 
     def test_08_everything_exhausted_is_unroutable(self):
-        self.check(prof(d=3), scenario(codex_week=0.97, ocgo_usage=0.9, ds_balance=3), {"ok": False})
+        self.check(prof(d=3), scenario(codex_week=0.97, ocgo_usage=0.9, ds_balance=3),
+                   {"ok": False}, OPT_IN_POLICY)
 
     def test_09_expiring_unused_quota_raises_effort(self):
         self.check(prof(d=3), scenario(codex_week=0.4, codex_hleft=10), {"backend": "codex", "effort": "high"})
@@ -85,7 +89,7 @@ class RoutingScenarios(unittest.TestCase):
         self.check(prof(d=3), scenario(claude_fresh=False), {"claude_review": "light"})
 
     def test_13_huge_context_prefers_1m_backend(self):
-        self.check(prof(d=3, context_tokens=600000), scenario(), {"backend": "ocgo"})
+        self.check(prof(d=3, context_tokens=600000), scenario(), {"backend": "ocgo"}, OPT_IN_POLICY)
 
     def test_14_forced_backend_and_model_are_honoured(self):
         self.check(prof(d=2, backend="deepseek", model="deepseek-flash"), scenario(),
@@ -100,7 +104,22 @@ class RoutingScenarios(unittest.TestCase):
         st["codex"]["binary"] = None
         st["ocgo"]["binary"] = None
         self.check(prof(d=3), st, {"backend": "deepseek",
-                                   "skipped": lambda s: set(s) == {"codex", "ocgo"}})
+                                   "skipped": lambda s: set(s) == {"codex", "ocgo"}}, OPT_IN_POLICY)
+
+    def test_17_default_order_excludes_opt_in_backends(self):
+        self.assertEqual(POLICY["routing"]["default_order"], ["codex"])
+        self.check(prof("mechanical", 1), scenario(), {"backend": "codex"})
+        self.check(prof("review", 3), scenario(), {"backend": "codex"})
+
+    def test_18_opt_in_backends_remain_forceable(self):
+        for backend in ("ocgo", "deepseek"):
+            with self.subTest(backend=backend):
+                self.check(prof(d=3, backend=backend), scenario(), {"backend": backend})
+
+    def test_19_configured_opt_in_backends_join_automatic_order(self):
+        policy = copy.deepcopy(POLICY)
+        policy["routing"]["default_order"] = ["ocgo", "codex"]
+        self.check(prof("mechanical", 1), scenario(), {"backend": "ocgo"}, policy)
 
 
 if __name__ == "__main__":

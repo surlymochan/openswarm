@@ -3009,19 +3009,33 @@ def concurrency(st, policy):
 def route(prof, st, policy, exclude=()):
     r = policy["routing"]
     notes = []
+    default_order = list(r["default_order"])
+
+    def prioritize(preferred):
+        return [backend for backend in preferred if backend in default_order] + [
+            backend for backend in default_order if backend not in preferred]
+
     if prof.get("backend"):
         order = [canonical_backend(prof["backend"])]
     elif prof["type"] in r["review_types"]:
-        order = ["ocgo", "codex", "deepseek"]
-        notes.append("review: prefer a non-GPT family for an independent second opinion")
+        if any(backend in default_order for backend in ("ocgo", "deepseek")):
+            order = prioritize(("ocgo", "codex", "deepseek"))
+            notes.append("review: prefer a non-GPT family for an independent second opinion")
+        else:
+            order = default_order
     elif prof["difficulty"] <= r["ocgo_first_max_difficulty"] and prof["type"] in r["ocgo_first_types"]:
-        order = ["ocgo", "codex", "deepseek"]
-        notes.append("low-difficulty mechanical work: OpenCode Go first to save Codex")
+        if "ocgo" in default_order:
+            order = prioritize(("ocgo", "codex", "deepseek"))
+            notes.append("low-difficulty mechanical work: OpenCode Go first to save Codex")
+        else:
+            order = default_order
     else:
-        order = list(r["default_order"])
+        order = default_order
     if prof.get("context_tokens", 0) > r["large_context_tokens"] and not prof.get("backend"):
-        order = ["ocgo", "deepseek"] + [b for b in order if b not in ("ocgo", "deepseek")]
-        notes.append("context exceeds codex window: prefer 1M-context backends")
+        context_backends = [backend for backend in ("ocgo", "deepseek") if backend in order]
+        if context_backends:
+            order = context_backends + [backend for backend in order if backend not in context_backends]
+            notes.append("context exceeds codex window: prefer 1M-context backends")
     order = [b for b in order if b not in exclude]
     skipped = {}
     for b in order:
@@ -7219,43 +7233,56 @@ def cmd_lane_simple(args):
 
 
 def cmd_lane_plist(args):
-    import plistlib
     lane = lanes_by_name([args.name])[0]
-    name = lane["name"]
-    label = f"com.openswarm.lane.{name}"
-    log = os.path.join(lane_root(name), "supervisor.log")
-    obj = {"Label": label, "ProgramArguments": [sys.executable, os.path.realpath(__file__), "lane", "serve", name],
-           "RunAtLoad": True, "KeepAlive": True, "StandardOutPath": log, "StandardErrorPath": log}
-    obj["EnvironmentVariables"] = {"OPENSWARM_HOME": DATA}
-    lanes_file = envvar("LANES_FILE")
-    if lanes_file:
-        obj["EnvironmentVariables"]["OPENSWARM_LANES_FILE"] = lanes_file
-    plist = plistlib.dumps(obj, fmt=plistlib.FMT_XML).decode()
-    print(json.dumps({"name": name, "plist": plist}, indent=2, ensure_ascii=False))
+    print(generate_lane_service_definition(lane, "launchd-plist"))
 
 
 def systemd_quote(value):
     return '"' + str(value).replace("%", "%%").replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def cmd_lane_systemd(args):
-    import pwd
-    lane = lanes_by_name([args.name])[0]
-    user = pwd.getpwuid(os.getuid()).pw_name
-    home = os.path.expanduser("~")
-    path = os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-    local_bin = os.path.join(home, ".local", "bin")
-    path = os.pathsep.join(dict.fromkeys([*path.split(os.pathsep), local_bin]))
-    command = [sys.executable, os.path.realpath(__file__), "lane", "serve", lane["name"]]
-    lines = ["[Unit]", f"Description=openswarm lane {lane['name']}", "After=network.target", "",
-             "[Service]", "Type=simple", f"User={user}", f"ExecStart={' '.join(systemd_quote(x) for x in command)}",
-             f"Environment={systemd_quote('OPENSWARM_HOME=' + DATA)}", f"Environment={systemd_quote('PATH=' + path)}",
-             "Restart=always", "MemoryMax=900M", "CPUQuota=150%", "Nice=10"]
+def generate_lane_service_definition(lane, service_manager):
+    """Render the requested service definition from one normalized lane command."""
+    name = lane["name"]
+    command = [sys.executable, os.path.realpath(__file__), "lane", "serve", name]
     lanes_file = envvar("LANES_FILE")
+    environment = {"OPENSWARM_HOME": DATA}
     if lanes_file:
-        lines.append(f"Environment={systemd_quote('OPENSWARM_LANES_FILE=' + lanes_file)}")
-    lines.extend(["", "[Install]", "WantedBy=multi-user.target", ""])
-    print("\n".join(lines))
+        environment["OPENSWARM_LANES_FILE"] = lanes_file
+
+    if service_manager == "launchd-plist":
+        import plistlib
+        log = os.path.join(lane_root(name), "supervisor.log")
+        obj = {"Label": f"com.openswarm.lane.{name}", "ProgramArguments": command,
+               "RunAtLoad": True, "KeepAlive": True, "StandardOutPath": log, "StandardErrorPath": log,
+               "EnvironmentVariables": environment}
+        plist = plistlib.dumps(obj, fmt=plistlib.FMT_XML).decode()
+        return json.dumps({"name": name, "plist": plist}, indent=2, ensure_ascii=False)
+
+    if service_manager == "systemd-unit":
+        import pwd
+        user = pwd.getpwuid(os.getuid()).pw_name
+        home = os.path.expanduser("~")
+        path = os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+        local_bin = os.path.join(home, ".local", "bin")
+        path = os.pathsep.join(dict.fromkeys([*path.split(os.pathsep), local_bin]))
+        lines = ["[Unit]", f"Description=openswarm lane {name}", "After=network.target", "",
+                 "[Service]", "Type=simple", f"User={user}",
+                 f"ExecStart={' '.join(systemd_quote(x) for x in command)}",
+                 f"Environment={systemd_quote('OPENSWARM_HOME=' + environment['OPENSWARM_HOME'])}",
+                 f"Environment={systemd_quote('PATH=' + path)}", "Restart=always", "MemoryMax=900M",
+                 "CPUQuota=150%", "Nice=10"]
+        if "OPENSWARM_LANES_FILE" in environment:
+            lines.append(f"Environment={systemd_quote('OPENSWARM_LANES_FILE=' + environment['OPENSWARM_LANES_FILE'])}")
+        lines.extend(["", "[Install]", "WantedBy=multi-user.target", ""])
+        return "\n".join(lines)
+
+    raise ValueError(f"unsupported lane service manager: {service_manager}")
+
+
+def cmd_lane_systemd(args):
+    lane = lanes_by_name([args.name])[0]
+    print(generate_lane_service_definition(lane, "systemd-unit"))
 
 
 # ---------------------------------------------------------------- fleet
@@ -9983,41 +10010,89 @@ def main():
     pp.add_argument("--since", type=float, default=30, help="only inspect evidence from the last DAYS (default: 30)")
     patterns_sub.add_parser("retire-check", help="propose retirement when active patterns do not improve outcomes")
 
-    def add_profile(p, include_bus=False):
-        p.add_argument("--type", default="impl",
-                       help="impl|refactor|debug|test|docs|mechanical|review|research|migration|format|rename")
-        p.add_argument("--difficulty", type=int, default=3, help="1 (trivial) .. 5 (hardest)")
-        p.add_argument("--context-tokens", type=int, default=0, help="approx context the executor must read")
-        backends = ["codex", "ocgo", "deepseek", "cursor", "agy", "gemini", "pi"] + (["github-issue"] if include_bus else [])
-        p.add_argument("--backend", choices=backends,
-                       help="force a backend. cursor, agy (alias gemini) and pi are opt-in and are not chosen "
-                            "unless named here or listed in routing")
-        p.add_argument("--model")
-        p.add_argument("--effort")
+    def add_dispatch_arguments(p, *fields, profile_backends=None, backend_choices=None,
+                               backend_default=None, backend_help=None, card_type_help=None, rework_of_help=None,
+                               verify_help=None, verify_baseline_help=None, budget_type=float,
+                               budget_default=None, budget_help=None, task_file_required=False,
+                               title_required=False, task_source_required=False):
+        """Define the shared task, routing, verification, and budget CLI fields.
+
+        The command handlers still own their trust and execution behavior; this helper only keeps
+        the repeated argument definitions and their help text aligned.
+        """
+        if profile_backends is None:
+            profile_backends = ["codex", "ocgo", "deepseek", "cursor", "agy", "gemini", "pi"]
+        for field in fields:
+            if field == "profile":
+                p.add_argument("--type", default="impl",
+                               help="impl|refactor|debug|test|docs|mechanical|review|research|migration|format|rename")
+                p.add_argument("--difficulty", type=int, default=3, help="1 (trivial) .. 5 (hardest)")
+                p.add_argument("--context-tokens", type=int, default=0, help="approx context the executor must read")
+                p.add_argument("--backend", choices=profile_backends,
+                               help="force a backend. cursor, agy (alias gemini) and pi are opt-in and are not chosen "
+                                    "unless named here or listed in routing")
+                p.add_argument("--model")
+                p.add_argument("--effort")
+            elif field == "backend":
+                if backend_choices is not False:
+                    kwargs = {"choices": backend_choices if backend_choices is not None else list(PLANNERS)}
+                else:
+                    kwargs = {}
+                if backend_default is not None:
+                    kwargs["default"] = backend_default
+                if backend_help is not None:
+                    kwargs["help"] = backend_help
+                p.add_argument("--backend", **kwargs)
+            elif field == "model":
+                p.add_argument("--model")
+            elif field == "effort":
+                p.add_argument("--effort")
+            elif field == "prompt":
+                p.add_argument("--prompt")
+            elif field == "task-file":
+                p.add_argument("--task-file", required=task_file_required)
+            elif field == "task-source":
+                group = p.add_mutually_exclusive_group(required=task_source_required)
+                group.add_argument("--task-file")
+                group.add_argument("--prompt")
+            elif field == "title":
+                p.add_argument("--title", required=title_required)
+            elif field == "verify":
+                p.add_argument("--verify", help=verify_help)
+            elif field == "verify-baseline":
+                p.add_argument("--verify-baseline", action="store_true", help=verify_baseline_help)
+            elif field == "budget":
+                p.add_argument("--budget-minutes", type=budget_type, default=budget_default, help=budget_help)
+            elif field == "card-type":
+                p.add_argument("--card-type", help=card_type_help)
+            elif field == "rework-of":
+                p.add_argument("--rework-of", help=rework_of_help)
+            elif field == "paths":
+                p.add_argument("--paths", nargs="+", default=[], help="path hints for matching applicable lessons")
+            else:
+                raise ValueError(f"unknown dispatch argument field: {field}")
 
     sp = sub.add_parser("route")
-    add_profile(sp)
-    sp.add_argument("--card-type", help="optional task card type used for record-only routing advice")
+    add_dispatch_arguments(sp, "profile", "card-type",
+                           card_type_help="optional task card type used for record-only routing advice")
     sp.add_argument("--refresh", action="store_true")
 
     sp = sub.add_parser("run")
-    add_profile(sp, include_bus=True)
-    sp.add_argument("--card-type", help="optional task card type from knowledge/card-types.yaml")
-    sp.add_argument("--rework-of", help="run id this task is reworking")
-    sp.add_argument("--paths", nargs="+", default=[], help="path hints for matching applicable lessons")
-    sp.add_argument("--prompt")
-    sp.add_argument("--task-file")
-    sp.add_argument("--title")
+    add_dispatch_arguments(sp, "profile", "card-type", "rework-of", "paths", "prompt", "task-file", "title",
+                           profile_backends=["codex", "ocgo", "deepseek", "cursor", "agy", "gemini", "pi",
+                                             "github-issue"],
+                           card_type_help="optional task card type from knowledge/card-types.yaml",
+                           rework_of_help="run id this task is reworking")
     sp.add_argument("--cwd", default=os.getcwd())
     sp.add_argument("--base", help="base commit for an isolated worktree; defaults to HEAD")
     sp.add_argument("--no-worktree", action="store_true")
-    sp.add_argument("--verify-baseline", action="store_true",
-                    help="when verify fails, rerun it on the base commit and pass if no failures are new")
-    sp.add_argument("--verify", help="acceptance command run on the host in the worktree after the executor finishes; "
-                                     "its exit code overrides a sandbox-limited partial/done")
+    add_dispatch_arguments(sp, "verify-baseline", "verify",
+                           verify_baseline_help="when verify fails, rerun it on the base commit and pass if no failures are new",
+                           verify_help="acceptance command run on the host in the worktree after the executor finishes; "
+                                       "its exit code overrides a sandbox-limited partial/done")
     sp.add_argument("--keep-worktree", action="store_true")
     sp.add_argument("--no-fallback", action="store_true")
-    sp.add_argument("--budget-minutes", type=float, help="hard wall-clock budget; executor is killed when exceeded")
+    add_dispatch_arguments(sp, "budget", budget_help="hard wall-clock budget; executor is killed when exceeded")
     sp.add_argument("--detach", action="store_true", help="run in background; monitor with `openswarm watch <id>`")
     sp.add_argument("--run-id", help=argparse.SUPPRESS)
     sp.add_argument("--no-auto-review", action="store_true", help=argparse.SUPPRESS)
@@ -10025,19 +10100,20 @@ def main():
     sp.add_argument("--executor", help="optional GitHub bus executor routing label")
 
     sp = sub.add_parser("compare", help="run one task in parallel on two executor families")
-    sp.add_argument("--task-file", required=True)
-    sp.add_argument("--title", required=True)
+    add_dispatch_arguments(sp, "task-file", "title", task_file_required=True, title_required=True)
     sp.add_argument("--a", help="first executor backend or BACKEND:MODEL")
     sp.add_argument("--b", help="second executor backend or BACKEND:MODEL")
-    sp.add_argument("--verify", help="acceptance command run on both worktrees")
-    sp.add_argument("--card-type", help="optional task card type from knowledge/card-types.yaml")
-    sp.add_argument("--budget-minutes", type=float, help="per-run hard wall-clock budget")
+    add_dispatch_arguments(sp, "verify", "card-type", "budget",
+                           verify_help="acceptance command run on both worktrees",
+                           card_type_help="optional task card type from knowledge/card-types.yaml",
+                           budget_help="per-run hard wall-clock budget")
 
     sp = sub.add_parser("regress", help="run or compare a regression-card suite")
     regress_sub = sp.add_subparsers(dest="regress_cmd", required=True)
     rp = regress_sub.add_parser("run", help="run regression cards from knowledge.repo/regression")
     selector = rp.add_mutually_exclusive_group(required=True)
-    selector.add_argument("--backend", help="force BACKEND or BACKEND:MODEL for every card")
+    add_dispatch_arguments(selector, "backend", backend_choices=False,
+                           backend_help="force BACKEND or BACKEND:MODEL for every card")
     selector.add_argument("--lane", help="run cards on one configured resident lane")
     selector.add_argument("--routing", choices=("static", "weighted"), help="use static or weighted routing")
     rp.add_argument("--cards", help="comma-separated card ids; defaults to every card")
@@ -10126,16 +10202,13 @@ def main():
     sp.add_argument("--cards")
     sp.add_argument("--hosts")
     sp.add_argument("--per-host", type=int, default=1)
-    sp.add_argument("--backend", choices=list(PLANNERS))
-    sp.add_argument("--model")
-    sp.add_argument("--effort")
-    sp.add_argument("--verify")
-    sp.add_argument("--budget-minutes", type=int)
+    add_dispatch_arguments(sp, "backend", "model", "effort", "verify", "budget",
+                           backend_choices=list(PLANNERS), budget_type=int)
     sp.add_argument("--base")
     sp.add_argument("--detach", action="store_true")
-    sp.add_argument("--card-type", help="optional task card type from knowledge/card-types.yaml")
-    sp.add_argument("--rework-of", help="run id this batch reworks")
-    sp.add_argument("--paths", nargs="+", default=[], help="path hints for matching applicable lessons")
+    add_dispatch_arguments(sp, "card-type", "rework-of", "paths",
+                           card_type_help="optional task card type from knowledge/card-types.yaml",
+                           rework_of_help="run id this batch reworks")
     sp.add_argument("--batch-id", help=argparse.SUPPRESS)
     sp.add_argument("--poll-seconds", type=float, default=2, help=argparse.SUPPRESS)
 
@@ -10157,14 +10230,13 @@ def main():
     sp = sub.add_parser("bus-worker", help="run the reference GitHub issue bus worker")
     sp.add_argument("--bus", required=True, help="bus repository owner/name")
     sp.add_argument("--name", required=True, help="executor name used in /claim comments")
-    sp.add_argument("--backend", choices=BUS_EXECUTOR_BACKENDS, default="codex")
-    sp.add_argument("--model")
-    sp.add_argument("--budget-minutes", type=float, default=40)
+    add_dispatch_arguments(sp, "backend", "model", "budget", backend_choices=BUS_EXECUTOR_BACKENDS,
+                           backend_default="codex", budget_default=40)
     sp.add_argument("--repos", help="worker-local owner/repo allowlist, comma-separated")
-    sp.add_argument("--verify", help="worker-owned verify command")
-    sp.add_argument("--card-type", help="default card type for bus tasks")
-    sp.add_argument("--rework-of", help="run id this task reworks")
-    sp.add_argument("--paths", nargs="+", default=[], help="path hints for matching applicable lessons")
+    add_dispatch_arguments(sp, "verify", "card-type", "rework-of", "paths",
+                           verify_help="worker-owned verify command",
+                           card_type_help="default card type for bus tasks",
+                           rework_of_help="run id this task reworks")
     sp.add_argument("--once", action="store_true", help="claim at most one queued issue, then exit")
 
     sp = sub.add_parser("lane", help="manage resident executor lanes")
@@ -10176,17 +10248,12 @@ def main():
     lane_sub.add_parser("status", help="show configured lane state")
     lp = lane_sub.add_parser("assign", help="assign one task to an idle lane")
     lp.add_argument("name")
-    task_group = lp.add_mutually_exclusive_group(required=True)
-    task_group.add_argument("--task-file")
-    task_group.add_argument("--prompt")
-    lp.add_argument("--title")
-    lp.add_argument("--verify")
-    lp.add_argument("--verify-baseline", action="store_true")
-    lp.add_argument("--budget-minutes", type=float)
+    add_dispatch_arguments(lp, "task-source", "title", "verify", "verify-baseline", "budget",
+                           task_source_required=True)
     lp.add_argument("--base")
-    lp.add_argument("--card-type", help="optional task card type from knowledge/card-types.yaml")
-    lp.add_argument("--rework-of", help="run id this task is reworking")
-    lp.add_argument("--paths", nargs="+", default=[], help="path hints for matching applicable lessons")
+    add_dispatch_arguments(lp, "card-type", "rework-of", "paths",
+                           card_type_help="optional task card type from knowledge/card-types.yaml",
+                           rework_of_help="run id this task is reworking")
     lp = lane_sub.add_parser("steer", help="steer the active turn")
     lp.add_argument("name")
     lp.add_argument("--text", required=True)
