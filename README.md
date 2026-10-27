@@ -155,6 +155,8 @@ For longer work, detach and watch:
 openswarm run --detach --cwd ~/code/myrepo --verify 'pytest -q' --task-file /tmp/task.md   # prints {"id": ...}
 openswarm watch <id1> <id2>          # one line per actionable event; exits on DONE or after 28 min
 openswarm watch <id1> <id2> --quiet  # alerts, heartbeats and terminal events only
+openswarm resume                     # recover live runs, busy lanes and recent results after planner restart
+openswarm resume --since-hours 12 --json
 openswarm report --since-minutes 60  # one-screen digest for scheduled check-ins
 openswarm stop <id>                  # kill the executor; partial work is still committed to its branch
 ```
@@ -467,7 +469,7 @@ Cursor CLI is a fourth executor, opt-in only (`--backend cursor`).
 
 | Path | What |
 | --- | --- |
-| `bin/openswarm` | The CLI: `probe`, `status`, `route`, `run`, `review`, `lessons`, `patterns`, `lane`, `fleet`, `batch`, `verify-remote`, `watch`, `runs`, `report`, `retro`, `stop`, `ingest-claude`, `ledger` |
+| `bin/openswarm` | The CLI: `probe`, `status`, `route`, `run`, `review`, `lessons`, `patterns`, `lane`, `fleet`, `batch`, `verify-remote`, `watch`, `runs`, `resume`, `report`, `retro`, `stop`, `ingest-claude`, `ledger` |
 | `SKILL.md` | Claude Code skill: the planner's operating manual |
 | `policy.json` | Defaults: thresholds, difficulty map, model caps, local data sources |
 | `backends/*.json` | One manifest per executor: invocation, quota source, data boundary |

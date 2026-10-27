@@ -63,7 +63,39 @@ class FleetTests(unittest.TestCase):
                 mock.patch.object(xs, "host_run", return_value=(0, b'{"lanes": [], "active_runs": []}', b"")), \
                 contextlib.redirect_stdout(output):
             xs.cmd_fleet(argparse.Namespace(fleet_cmd="status", json=False))
-        self.assertEqual(output.getvalue(), "box  reachable  lanes=0 active=0\n")
+        self.assertEqual(output.getvalue(), "box  no lanes  lanes=0 active=0\n")
+
+    def test_empty_lane_config_is_valid(self):
+        config = self.root / "lanes.json"
+        config.write_text('{"lanes": []}')
+        with mock.patch.object(xs, "envvar", side_effect=lambda name, default=None:
+                               str(config) if name == "LANES_FILE" else default):
+            self.assertEqual(xs.lane_config(), [])
+
+    def test_fleet_snapshot_preserves_invalid_lane_config_reason(self):
+        config = self.root / "lanes.json"
+        config.write_text('{"lanes": [')
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(xs, "envvar", side_effect=lambda name, default=None:
+                                                  str(config) if name == "LANES_FILE" else default))
+            stack.enter_context(mock.patch.object(xs, "execution_provider", return_value="provider"))
+            stack.enter_context(mock.patch.object(xs, "load_policy", return_value={}))
+            stack.enter_context(mock.patch.object(xs, "agy_status", return_value={}))
+            snapshot = xs.fleet_snapshot()
+        self.assertEqual(snapshot["lanes"], [])
+        self.assertFalse(snapshot["lane_config_valid"])
+        self.assertIn("invalid lane config", snapshot["lane_config_error"])
+        self.assertIn("lanes.json", snapshot["lane_config_error"])
+
+    def test_text_status_shows_config_invalid_with_reason(self):
+        self.config([{"name": "host", "kind": "local"}])
+        output = io.StringIO()
+        snapshot = {"lanes": [], "active_runs": [], "lane_config_valid": False,
+                    "lane_config_error": "invalid lane config /etc/openswarm/lanes.json: bad JSON"}
+        with mock.patch.object(xs, "host_json", return_value=snapshot), contextlib.redirect_stdout(output):
+            xs.cmd_fleet(argparse.Namespace(fleet_cmd="status", json=False))
+        self.assertIn("host  config invalid  lanes=0 active=0", output.getvalue())
+        self.assertIn("invalid lane config /etc/openswarm/lanes.json: bad JSON", output.getvalue())
 
     def test_transport_argv_binary_input_and_timeout(self):
         for host, prefix in [({"kind": "ssh", "ssh": "alias"}, ["ssh", "alias", "--"]),

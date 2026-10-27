@@ -1,6 +1,7 @@
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -146,6 +147,49 @@ class LaneTests(unittest.TestCase):
         self.assertFalse((self.repo / "lane_result.txt").exists())
         self.assertEqual(self.git("status", "--porcelain"), "")
         self.assertEqual(self.git("-C", str(self.data / "lanes" / self.lane_name / "wt"), "branch", "--show-current"), "")
+
+    def test_assignment_refreshes_head_and_records_workspace_note(self):
+        self.start_lane()
+        (self.repo / "package.json").write_text('{"workspaces": ["packages/*"]}\n')
+        (self.repo / "bun.lock").write_text("# test lock\n")
+        (self.repo / "after-lane-start.txt").write_text("new repo head\n")
+        self.git("add", "package.json", "bun.lock", "after-lane-start.txt")
+        self.git("commit", "-q", "-m", "move lane base")
+        head = self.git("rev-parse", "HEAD")
+
+        run_id = self.assign("refresh to current repo head")
+        self.wait_run(run_id)
+        status = self.run_state(run_id)
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual(result["workspace"]["base"], head)
+        self.assertIn("Bun workspace detected", result["workspace_note"])
+        self.assertEqual(status["workspace_note"], result["workspace_note"])
+        self.assertTrue((self.data / "lanes" / self.lane_name / "wt" / "after-lane-start.txt").exists())
+
+    def test_assignment_rebuilds_a_broken_lane_worktree(self):
+        self.start_lane()
+        wt = self.data / "lanes" / self.lane_name / "wt"
+        (wt / ".git").unlink()
+        (wt / "stale-worktree-file").write_text("discarded\n")
+        expected_head = self.git("rev-parse", "HEAD")
+
+        run_id = self.assign("rebuild broken lane worktree")
+        self.assertEqual(self.wait_run(run_id)["status"], "done")
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual(result["workspace"]["base"], expected_head)
+        self.assertFalse((wt / "stale-worktree-file").exists())
+
+    def test_assignment_rebuilds_a_missing_lane_worktree(self):
+        self.start_lane()
+        wt = self.data / "lanes" / self.lane_name / "wt"
+        shutil.rmtree(wt)
+        expected_head = self.git("rev-parse", "HEAD")
+
+        run_id = self.assign("rebuild missing lane worktree")
+        self.assertEqual(self.wait_run(run_id)["status"], "done")
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual(result["workspace"]["base"], expected_head)
+        self.assertTrue(wt.is_dir())
 
     def test_pi_rate_limit_retries_in_session_and_watch_shows_alert(self):
         self.set_config("pi")
@@ -617,11 +661,19 @@ class LaneTests(unittest.TestCase):
 
     def test_busy_lane_refuses_second_assignment_and_down_leaves_no_process(self):
         self.start_lane()
+        original_head = self.git("rev-parse", "HEAD")
         first = self.assign("LANE_TEST_WAIT keep busy")
         self.wait_running(first)
+        (self.repo / "later-commit.txt").write_text("must not enter the running turn\n")
+        self.git("add", "later-commit.txt")
+        self.git("commit", "-q", "-m", "advance repo while lane is busy")
         second = self.cli("lane", "assign", self.lane_name, "--prompt", "should be rejected", check=False)
         self.assertNotEqual(second.returncode, 0)
         self.assertIn("busy", json.loads(second.stdout)["error"])
+        wt = self.data / "lanes" / self.lane_name / "wt"
+        self.assertEqual(subprocess.run(["git", "rev-parse", "HEAD"], cwd=wt, check=True,
+                                        capture_output=True, text=True).stdout.strip(), original_head)
+        self.assertFalse((wt / "later-commit.txt").exists())
         supervisor_pid = self.lane_state()["supervisor_pid"]
         child_pid = self.lane_state()["child_pid"]
         self.cli("lane", "down", self.lane_name, timeout=45)

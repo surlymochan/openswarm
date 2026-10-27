@@ -25,6 +25,7 @@ Subcommands:
   bus-worker       run the reference GitHub issue bus executor
   watch            stream actionable events (progress, risk, stalls) for one or more runs
   runs / report    snapshot of recent runs / compact scheduled check-in
+  resume           recover active runs and recent results after planner restart
   retro            weekly fleet retrospective (Markdown report + JSON summary)
   stop             terminate a run (partial work is still committed to its branch)
   ingest-claude    record Claude plan usage (from statusline JSON on stdin, or flags)
@@ -5756,9 +5757,10 @@ def lane_validate_socket_path(name):
 def lane_config():
     path = envvar("LANES_FILE", os.path.join(DATA, "lanes.json"))
     try:
-        cfg = jload(path)
-    except Exception:
-        cfg = None
+        with open(path, encoding="utf-8") as stream:
+            cfg = json.load(stream)
+    except (OSError, ValueError, UnicodeError) as error:
+        raise ValueError(f"invalid lane config {path}: {error}") from error
     if not isinstance(cfg, dict) or not isinstance(cfg.get("lanes"), list):
         raise ValueError(f"invalid lane config {path}: expected {{\"lanes\":[...]}}")
     names, out = set(), []
@@ -5801,8 +5803,6 @@ def lane_config():
         if lane.get("binary") and not os.access(lane["binary"], os.X_OK):
             raise ValueError(f"invalid lane config {where}: binary override is not executable")
         out.append(dict(lane))
-    if not out:
-        raise ValueError(f"invalid lane config {path}: lanes must not be empty")
     return out
 
 
@@ -5879,6 +5879,36 @@ def lane_git(args, cwd, timeout=60):
     return rc, out.strip(), err.strip()
 
 
+def lane_worktree_matches(repo, wt):
+    if not os.path.isdir(wt) or os.path.islink(wt):
+        return False
+    rc, root, _ = lane_git(["rev-parse", "--show-toplevel"], wt)
+    if rc or os.path.realpath(root) != os.path.realpath(wt):
+        return False
+    rc, wt_common, _ = lane_git(["rev-parse", "--git-common-dir"], wt)
+    rc2, repo_common, _ = lane_git(["rev-parse", "--git-common-dir"], repo)
+    if rc or rc2:
+        return False
+    if not os.path.isabs(wt_common):
+        wt_common = os.path.join(wt, wt_common)
+    if not os.path.isabs(repo_common):
+        repo_common = os.path.join(repo, repo_common)
+    return os.path.realpath(wt_common) == os.path.realpath(repo_common)
+
+
+def lane_rebuild_worktree(repo, wt, base):
+    if os.path.islink(wt) or (os.path.lexists(wt) and not os.path.isdir(wt)):
+        os.unlink(wt)
+    elif os.path.isdir(wt):
+        lane_git(["worktree", "remove", "--force", wt], repo, timeout=300)
+        if os.path.lexists(wt):
+            shutil.rmtree(wt, ignore_errors=True)
+    lane_git(["worktree", "prune"], repo, timeout=300)
+    rc, _, err = lane_git(["worktree", "add", "--detach", "-q", wt, base], repo, timeout=300)
+    if rc:
+        raise RuntimeError(f"lane worktree rebuild failed: {err[:250]}")
+
+
 def lane_prepare_workspace(lane, rid, base_rev=None):
     repo = os.path.realpath(lane["repo"])
     rc, top, err = lane_git(["rev-parse", "--show-toplevel"], repo)
@@ -5890,24 +5920,8 @@ def lane_prepare_workspace(lane, rid, base_rev=None):
         raise RuntimeError(f"invalid base revision {base_rev!r}: {err}")
     wt = os.path.join(lane_root(lane["name"]), "wt")
     os.makedirs(os.path.dirname(wt), exist_ok=True)
-    if not os.path.exists(wt):
-        rc, _, err = lane_git(["worktree", "add", "--detach", "-q", wt, base], repo, timeout=300)
-        if rc:
-            raise RuntimeError(f"lane worktree creation failed: {err[:250]}")
-    else:
-        rc, root, err = lane_git(["rev-parse", "--show-toplevel"], wt)
-        if rc or os.path.realpath(root) != os.path.realpath(wt):
-            raise RuntimeError(f"lane worktree path exists but is not the expected git worktree: {wt}")
-        rc, git_common, _ = lane_git(["rev-parse", "--git-common-dir"], wt)
-        rc2, repo_common, _ = lane_git(["rev-parse", "--git-common-dir"], repo)
-        if rc or rc2:
-            raise RuntimeError(f"lane worktree is invalid: {wt}")
-        if not os.path.isabs(git_common):
-            git_common = os.path.join(wt, git_common)
-        if not os.path.isabs(repo_common):
-            repo_common = os.path.join(repo, repo_common)
-        if os.path.realpath(git_common) != os.path.realpath(repo_common):
-            raise RuntimeError(f"lane worktree belongs to a different repository: {wt}")
+    if not lane_worktree_matches(repo, wt):
+        lane_rebuild_worktree(repo, wt, base)
     # Temporarily remove only dependency symlinks created for this worktree. This lets `git clean
     # -fdx` remove every prior task artifact without deleting linked dependency targets.
     names = workspace_link_dirs(repo)
@@ -5920,10 +5934,20 @@ def lane_prepare_workspace(lane, rid, base_rev=None):
                 dirnames.remove(d)
     for p in links:
         os.unlink(p)
-    for args in (["reset", "--hard", base], ["clean", "-fdx"], ["checkout", "-B", f"openswarm/{rid}", base]):
-        rc, _, err = lane_git(args, wt, timeout=300)
-        if rc:
+    steps = (["reset", "--hard", base], ["clean", "-fdx"], ["checkout", "-B", f"openswarm/{rid}", base])
+    for attempt in range(2):
+        failed = None
+        for args in steps:
+            rc, _, err = lane_git(args, wt, timeout=300)
+            if rc:
+                failed = (args, err)
+                break
+        if not failed:
+            break
+        if attempt:
+            args, err = failed
             raise RuntimeError(f"lane worktree preparation failed ({' '.join(args[:2])}): {err[:250]}")
+        lane_rebuild_worktree(repo, wt, base)
     linked = link_dependency_dirs(repo, wt)
     if linked:
         rc, ex, _ = lane_git(["rev-parse", "--git-path", "info/exclude"], wt)
@@ -8004,7 +8028,11 @@ def instabox_states(hosts):
 
 
 def fleet_snapshot():
-    lanes = lane_status_rows() if os.path.exists(envvar("LANES_FILE", os.path.join(DATA, "lanes.json"))) else []
+    config_error = None
+    try:
+        lanes = lane_status_rows() if os.path.exists(envvar("LANES_FILE", os.path.join(DATA, "lanes.json"))) else []
+    except ValueError as error:
+        lanes, config_error = [], str(error)
     runs = []
     for path in sorted(glob.glob(os.path.join(RUNS, "*", "status.json"))):
         row = run_digest(os.path.basename(os.path.dirname(path)))
@@ -8014,7 +8042,8 @@ def fleet_snapshot():
     providers = {backend: execution_provider(backend, policy=policy)
                  for backend in ("codex", "cursor", "agy", "pi", "ocgo", "deepseek")}
     return {"lanes": lanes, "active_runs": runs, "providers": providers,
-            "backends": {"agy": agy_status(policy)}}
+            "backends": {"agy": agy_status(policy)}, "lane_config_valid": config_error is None,
+            "lane_config_error": config_error}
 
 
 def cmd_fleet(args):
@@ -8057,13 +8086,25 @@ def cmd_fleet(args):
                 row.update(host_json(host, ["fleet", "_snapshot"], timeout=20), reachable=True)
             except RuntimeError as e:
                 row["error"] = str(e)
+        if row["paused"]:
+            row["status"] = "paused"
+        elif not row["reachable"]:
+            row["status"] = "unreachable"
+        elif row.get("lane_config_valid") is False:
+            row["status"] = "config invalid"
+        elif not row["lanes"]:
+            row["status"] = "no lanes"
+        else:
+            row["status"] = "reachable"
         rows.append(row)
     if args.json:
         print(json.dumps({"hosts": rows}, indent=2, ensure_ascii=False))
     else:
         for row in rows:
-            state = "paused" if row["paused"] else ("reachable" if row["reachable"] else "unreachable")
+            state = row["status"]
             print(f"{row['name']}  {state}  lanes={len(row['lanes'])} active={len(row['active_runs'])}")
+            if state == "config invalid" and row.get("lane_config_error"):
+                print(f"  config invalid: {row['lane_config_error']}")
             agy = (row.get("backends") or {}).get("agy") or {}
             if agy:
                 print(f"  agy bin={agy.get('binary') or '-'} model={agy.get('default_model') or '-'} "
@@ -8451,7 +8492,7 @@ def pid_alive(pid):
     try:
         os.kill(int(pid), 0)
         return True
-    except OSError:
+    except (OSError, TypeError, ValueError, OverflowError):
         return False
 
 
@@ -8794,6 +8835,66 @@ def cmd_runs(args, policy):
         lane = f" lane={r['lane']}" if r.get("lane") else ""
         print(f"{r['id']}  {r['state']:<10} {r['status'] or '-':<15} {r['backend'] or '-'}/{r['model'] or '-'}{lane}"
               f"  {r['elapsed_min']}m/{r['budget_min']}m cmds={r['cmds']}{flag}\n    {r['title']}\n    last: {r['last_msg']}")
+
+
+def cmd_resume(args):
+    since_hours = args.since_hours
+    if not math.isfinite(since_hours) or since_hours < 0:
+        raise ValueError("--since-hours must be a finite non-negative number")
+    now = NOW()
+    active_runs, recent_finished = [], []
+    for path in sorted(glob.glob(os.path.join(RUNS, "*", "status.json")), reverse=True):
+        rid = os.path.basename(os.path.dirname(path))
+        status = jload(path, {}) or {}
+        state = status.get("state")
+        runner_pid = status.get("runner_pid")
+        if state in ("running", "queued") and pid_alive(runner_pid):
+            row = run_digest(rid)
+            row["watch"] = f"openswarm watch {rid}"
+            active_runs.append(row)
+        finished = status.get("finished")
+        if state == "finished" and isinstance(finished, (int, float)) and not isinstance(finished, bool) and \
+                math.isfinite(finished) and now - since_hours * 3600 <= finished <= now:
+            result_path = os.path.join(RUNS, rid, "result.json")
+            result = jload(result_path, {}) or {}
+            recent_finished.append({"id": rid, "finished": finished,
+                                    "status": status.get("status") or result.get("status"),
+                                    "result_path": result_path})
+    recent_finished.sort(key=lambda row: row["finished"], reverse=True)
+    try:
+        lanes = lane_status_rows()
+        config_error = None
+    except ValueError as error:
+        lanes, config_error = [], str(error)
+    busy_lanes = []
+    for lane in lanes:
+        if lane.get("state") != "busy":
+            continue
+        current_run = lane.get("current_run")
+        busy_lanes.append({**lane, "watch": f"openswarm watch {current_run}" if current_run else None})
+    snapshot = {"active_runs": active_runs, "busy_lanes": busy_lanes,
+                "recent_finished": recent_finished, "lane_config_error": config_error}
+    if args.json:
+        print(json.dumps(snapshot, indent=2, ensure_ascii=False))
+        return
+    print("Active runs:")
+    if not active_runs:
+        print("  none")
+    for row in active_runs:
+        print(f"  {row['id']} {row['state']} {row.get('title') or '-'} — {row['watch']}")
+    print("Busy lanes:")
+    if config_error:
+        print(f"  config invalid: {config_error}")
+    elif not busy_lanes:
+        print("  none")
+    for lane in busy_lanes:
+        run = f" run={lane['current_run']} — {lane['watch']}" if lane.get("current_run") else ""
+        print(f"  {lane['name']}{run}")
+    print(f"Recently finished (last {since_hours:g} hours):")
+    if not recent_finished:
+        print("  none")
+    for row in recent_finished:
+        print(f"  {row['id']} {row['status'] or '-'} — {row['result_path']}")
 
 
 def token_count(usage):
@@ -10160,6 +10261,11 @@ def main():
     sp.add_argument("--active", action="store_true")
     sp.add_argument("--json", action="store_true")
 
+    sp = sub.add_parser("resume", help="list active runs and busy lanes after planner restart")
+    sp.add_argument("--since-hours", type=float, default=6,
+                    help="include finished runs from the last N hours (default: 6)")
+    sp.add_argument("--json", action="store_true")
+
     sp = sub.add_parser("report", help="compact check-in: quotas + active runs + recently finished")
     sp.add_argument("--since-minutes", type=float, default=60)
     sp.add_argument("--daily", action="store_true", help="report one local ledger day without live probes")
@@ -10392,6 +10498,12 @@ def main():
         cmd_watch(a, policy)
     elif a.cmd == "runs":
         cmd_runs(a, policy)
+    elif a.cmd == "resume":
+        try:
+            cmd_resume(a)
+        except ValueError as error:
+            print(f"openswarm: {error}", file=sys.stderr)
+            sys.exit(2)
     elif a.cmd == "report":
         cmd_report(a, policy)
     elif a.cmd == "retro":
