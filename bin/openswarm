@@ -21,7 +21,7 @@ Subcommands:
   runs / report    snapshot of recent runs / compact scheduled check-in
   stop             terminate a run (partial work is still committed to its branch)
   ingest-claude    record Claude plan usage (from statusline JSON on stdin, or flags)
-  ledger           show recent runs
+  ledger           show recent runs or ingest GitHub PR results
 
 Local data sources and credentials are documented in README.md ("What openswarm reads").
 Nothing that reads another tool's login/auth file is enabled by default.
@@ -5032,6 +5032,271 @@ def cmd_fleet_ledger_pull(args):
     print(f"pulled {len(merged)} ledger entries into {destination}")
 
 
+GH_INGEST_CACHE_TTL = 3600
+GH_INGEST_BADGES = ("P0", "P1", "P2")
+
+
+def gh_ingest_cache_path(run_id, repo, endpoint):
+    key = "\0".join((str(run_id), str(repo), str(endpoint))).encode("utf-8")
+    name = hashlib.sha256(key).hexdigest() + ".json"
+    return os.path.join(HOME, ".claude", "openswarm", "cache", "gh", name)
+
+
+def gh_ingest_api(run_id, repo, endpoint):
+    path = gh_ingest_cache_path(run_id, repo, endpoint)
+    try:
+        if NOW() - os.path.getmtime(path) < GH_INGEST_CACHE_TTL:
+            with open(path, encoding="utf-8") as stream:
+                return json.load(stream)
+    except (OSError, ValueError):
+        pass
+    result = gh_transport(endpoint)
+    # GitHub comments and issue bodies can contain accidentally pasted credentials.
+    jsave(path, bus_sanitize(result))
+    return result
+
+
+def gh_ingest_pages(run_id, repo, endpoint):
+    rows, page = [], 1
+    while True:
+        separator = "&" if "?" in endpoint else "?"
+        result = gh_ingest_api(run_id, repo, f"{endpoint}{separator}per_page=100&page={page}")
+        if isinstance(result, dict) and isinstance(result.get("items"), list):
+            result = result["items"]
+        if not isinstance(result, list):
+            return rows
+        rows.extend(result)
+        if len(result) < 100:
+            return rows
+        page += 1
+
+
+def github_repo_from_url(value):
+    if not isinstance(value, str):
+        return None
+    match = re.match(r"^(?:https?://github\.com/|git@github\.com:|ssh://git@github\.com/)([^/]+)/([^/#]+?)(?:\.git)?/?$",
+                     value.strip())
+    if not match:
+        return None
+    repo = f"{match.group(1)}/{match.group(2)}"
+    return repo if BUS_REPO_RE.fullmatch(repo) else None
+
+
+def ledger_repo_candidates(entry, requested):
+    if requested:
+        return requested
+    for key in ("repo", "repository", "github_repo"):
+        value = entry.get(key)
+        if isinstance(value, str):
+            if BUS_REPO_RE.fullmatch(value):
+                return [value]
+            repo = github_repo_from_url(value)
+            if repo:
+                return [repo]
+    for parent, key in (("workspace", "repo"), ("bus", "repo")):
+        value = (entry.get(parent) or {}).get(key) if isinstance(entry.get(parent), dict) else None
+        if isinstance(value, str):
+            if BUS_REPO_RE.fullmatch(value):
+                return [value]
+            repo = github_repo_from_url(value)
+            if repo:
+                return [repo]
+    rc, remote, _ = sh(["git", "remote", "get-url", "origin"], timeout=5)
+    repo = github_repo_from_url(remote.strip()) if rc == 0 else None
+    return [repo] if repo else []
+
+
+def gh_pr_number(pr):
+    number = pr.get("number") if isinstance(pr, dict) else None
+    try:
+        return int(number)
+    except (TypeError, ValueError):
+        return None
+
+
+def gh_search_items(run_id, repo, qualifier):
+    query = f"repo:{repo} is:pr {qualifier} {run_id}"
+    endpoint = "search/issues?" + urllib.parse.urlencode({"q": query})
+    items = []
+    for item in gh_ingest_pages(run_id, repo, endpoint):
+        if isinstance(item, dict) and item.get("pull_request") and gh_pr_number(item):
+            items.append(item)
+    return items
+
+
+def linked_pr_for_run(entry, repo):
+    run_id = str(entry.get("run_id") or entry.get("id") or "")
+    branch = entry.get("branch")
+    commit = entry.get("commit")
+    candidates = []
+    if isinstance(branch, str) and branch:
+        owner = repo.split("/", 1)[0]
+        head = urllib.parse.urlencode({"state": "all", "head": f"{owner}:{branch}"})
+        endpoint = f"repos/{repo}/pulls?{head}"
+        candidates.extend(gh_ingest_pages(run_id, repo, endpoint))
+    if isinstance(commit, str) and BUS_SHA_RE.fullmatch(commit):
+        endpoint = f"repos/{repo}/commits/{commit}/pulls"
+        candidates.extend(gh_ingest_pages(run_id, repo, endpoint))
+    candidates = [item for item in candidates if gh_pr_number(item)]
+    if candidates:
+        return candidates[0]
+
+    if not run_id:
+        return None
+    for item in gh_search_items(run_id, repo, "in:body"):
+        if run_id.casefold() in str(item.get("body") or "").casefold():
+            return item
+    for item in gh_search_items(run_id, repo, "in:comments"):
+        number = gh_pr_number(item)
+        comments = gh_ingest_pages(run_id, repo, f"repos/{repo}/issues/{number}/comments")
+        if any(run_id.casefold() in str(comment.get("body") or "").casefold()
+               for comment in comments if isinstance(comment, dict)):
+            return item
+    return None
+
+
+def gh_badge_counts(body):
+    text = str(body or "")
+    return {badge.lower(): len(re.findall(rf"\b{badge} Badge\b", text, re.I)) for badge in GH_INGEST_BADGES}
+
+
+def gh_review_findings(run_id, repo, number):
+    counts = {badge.lower(): 0 for badge in GH_INGEST_BADGES}
+    comments = gh_ingest_pages(run_id, repo, f"repos/{repo}/pulls/{number}/comments")
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+        login = str((comment.get("user") or {}).get("login") or "").casefold()
+        if login == "chatgpt-codex-connector[bot]":
+            badges = gh_badge_counts(comment.get("body"))
+            for badge in counts:
+                counts[badge] += badges[badge]
+    reviews = gh_ingest_pages(run_id, repo, f"repos/{repo}/pulls/{number}/reviews")
+    for review in reviews:
+        if not isinstance(review, dict):
+            continue
+        login = str((review.get("user") or {}).get("login") or "").casefold()
+        if login.split("[", 1)[0] == "norbiai":
+            badges = gh_badge_counts(review.get("body"))
+            for badge in counts:
+                counts[badge] += badges[badge]
+    return counts
+
+
+def issue_links_pr(issue, repo, number):
+    pr_url = f"https://github.com/{repo}/pull/{number}"
+    patterns = (re.escape(pr_url), rf"(?<![A-Za-z0-9_/])#{number}\b",
+                rf"\b{re.escape(repo)}#{number}\b")
+    text = "\n".join(str(issue.get(key) or "") for key in ("title", "body"))
+    return any(re.search(pattern, text, re.I) for pattern in patterns)
+
+
+def gh_has_defect_after_merge(run_id, repo, pr_number, merged_at):
+    merged_ts = to_epoch(merged_at)
+    if merged_ts is None:
+        return False
+    since = dt.datetime.fromtimestamp(merged_ts, dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    seen = set()
+    for label in ("bug", "defect"):
+        query = urllib.parse.urlencode({"state": "all", "labels": label, "since": since})
+        issues = gh_ingest_pages(run_id, repo, f"repos/{repo}/issues?{query}")
+        for issue in issues:
+            if not isinstance(issue, dict) or issue.get("pull_request"):
+                continue
+            number = gh_pr_number(issue)
+            created = to_epoch(issue.get("created_at"))
+            labels = {str(item.get("name") if isinstance(item, dict) else item).casefold()
+                      for item in issue.get("labels") or []}
+            if (number is None or number in seen or not labels.intersection({"bug", "defect"})
+                    or created is None or not merged_ts <= created <= merged_ts + 7 * 86400):
+                continue
+            seen.add(number)
+            if issue_links_pr(issue, repo, pr_number):
+                return True
+            comments = gh_ingest_pages(run_id, repo, f"repos/{repo}/issues/{number}/comments")
+            if any(issue_links_pr({"body": comment.get("body")}, repo, pr_number)
+                   for comment in comments if isinstance(comment, dict)):
+                return True
+    return False
+
+
+def ingest_ledger_entry(entry, repos):
+    run_id = str(entry.get("run_id") or entry.get("id") or "")
+    if not run_id:
+        return False
+    for repo in ledger_repo_candidates(entry, repos):
+        linked = linked_pr_for_run(entry, repo)
+        if not linked:
+            continue
+        number = gh_pr_number(linked)
+        detail = gh_ingest_api(run_id, repo, f"repos/{repo}/pulls/{number}")
+        if not isinstance(detail, dict):
+            detail = linked
+        merged_at = detail.get("merged_at")
+        merged = bool(detail.get("merged") or merged_at)
+        entry["pr"] = {"repo": repo, "number": number,
+                       "url": detail.get("html_url") or linked.get("html_url") or
+                       f"https://github.com/{repo}/pull/{number}"}
+        entry["review_findings"] = gh_review_findings(run_id, repo, number)
+        entry["merged"] = merged
+        entry["defect_within_7d"] = (gh_has_defect_after_merge(run_id, repo, number, merged_at)
+                                      if merged else None)
+        return True
+    return False
+
+
+def cmd_ledger_ingest(args):
+    if not math.isfinite(args.since) or args.since < 0:
+        raise ValueError("--since must be a finite non-negative number")
+    repos = list(dict.fromkeys(args.repo or []))
+    for repo in repos:
+        if not BUS_REPO_RE.fullmatch(repo):
+            raise ValueError(f"invalid repository: {repo}; expected owner/name")
+    path = fleet_ledger_path()
+    if not os.path.isfile(path):
+        raise ValueError("fleet ledger not found; run fleet ledger pull first")
+    threshold = NOW() - args.since * 86400
+    lock_path = path + ".lock"
+    updated = linked_count = 0
+    with open(lock_path, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with open(path, encoding="utf-8") as stream:
+            original_lines = stream.readlines()
+        lines = []
+        for raw in original_lines:
+            try:
+                entry = json.loads(raw)
+            except (ValueError, UnicodeError):
+                lines.append(raw)
+                continue
+            if not isinstance(entry, dict) or (to_epoch(entry.get("ts")) or 0) < threshold:
+                lines.append(raw)
+                continue
+            before = json.dumps(entry, ensure_ascii=False, sort_keys=True)
+            linked = ingest_ledger_entry(entry, repos)
+            linked_count += int(linked)
+            after = json.dumps(entry, ensure_ascii=False, sort_keys=True)
+            if after != before:
+                updated += 1
+                lines.append(json.dumps(entry, ensure_ascii=False) + "\n")
+            else:
+                lines.append(raw)
+        if updated:
+            mode = os.stat(path).st_mode & 0o777
+            fd, temporary = tempfile.mkstemp(prefix=os.path.basename(path) + ".tmp", dir=os.path.dirname(path))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    os.fchmod(stream.fileno(), mode)
+                    stream.writelines(lines)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+    print(f"ingested {linked_count} PR-linked runs; updated {updated} ledger entries in {path}")
+
+
 def host_openswarm(host, args):
     binary = host.get("openswarm") or (os.path.realpath(__file__) if host["kind"] == "local"
                                        else "~/.local/bin/openswarm")
@@ -6480,10 +6745,15 @@ def main():
     sp.add_argument("--five-hour-resets")
     sp.add_argument("--seven-day-resets")
 
-    sp = sub.add_parser("ledger")
+    sp = sub.add_parser("ledger", help="show recent runs or ingest GitHub PR results")
     sp.add_argument("-n", type=int, default=20)
     sp.add_argument("--json", action="store_true", help="print full ledger records as JSON")
     sp.add_argument("--fleet", action="store_true", help="read the merged fleet ledger")
+    ledger_sub = sp.add_subparsers(dest="ledger_cmd")
+    lp = ledger_sub.add_parser("ingest", help="ingest PR review and defect results into the fleet ledger")
+    lp.add_argument("--repo", action="append", help="GitHub repository owner/name; repeat for multiple repositories")
+    lp.add_argument("--since", type=float, default=30,
+                    help="only inspect runs from the last DAYS (default: 30)")
 
     a = ap.parse_args()
     policy = load_policy()
@@ -6566,14 +6836,21 @@ def main():
     elif a.cmd == "ingest-claude":
         ingest_claude(a)
     elif a.cmd == "ledger":
-        entries = recent_ledger(a.n, fleet_ledger_path() if a.fleet else None)
-        if a.json:
-            print(json.dumps(entries, indent=2, ensure_ascii=False))
+        if a.ledger_cmd == "ingest":
+            try:
+                cmd_ledger_ingest(a)
+            except (BusError, ValueError) as error:
+                print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False), file=sys.stderr)
+                sys.exit(2)
         else:
-            for e in entries:
-                print(f"{iso(e['ts'])}  {e.get('status'):<10} {e.get('backend') or '-':<8} {e.get('model') or '-':<20} "
-                      f"{e.get('effort') or '-':<7} {e.get('card_type') or '-':<16} {e.get('seconds', 0):>6}s  "
-                      f"{e.get('title', '')[:60]}")
+            entries = recent_ledger(a.n, fleet_ledger_path() if a.fleet else None)
+            if a.json:
+                print(json.dumps(entries, indent=2, ensure_ascii=False))
+            else:
+                for e in entries:
+                    print(f"{iso(e['ts'])}  {e.get('status'):<10} {e.get('backend') or '-':<8} {e.get('model') or '-':<20} "
+                          f"{e.get('effort') or '-':<7} {e.get('card_type') or '-':<16} {e.get('seconds', 0):>6}s  "
+                          f"{e.get('title', '')[:60]}")
 
 
 if __name__ == "__main__":

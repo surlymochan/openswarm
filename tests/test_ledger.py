@@ -7,6 +7,8 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import urllib.parse
+from unittest import mock
 
 import _load
 
@@ -17,15 +19,54 @@ class LedgerTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="openswarm-ledger-")
         self.root = Path(self.tmp.name)
-        self.constants = {key: getattr(xs, key) for key in ("DATA", "LEDGER", "RUNS")}
+        self.constants = {key: getattr(xs, key) for key in ("DATA", "LEDGER", "RUNS", "HOME")}
         xs.DATA = str(self.root / "data")
         xs.LEDGER = str(self.root / "data" / "ledger.jsonl")
         xs.RUNS = str(self.root / "data" / "runs")
+        xs.HOME = str(self.root / "home")
 
     def tearDown(self):
         for key, value in self.constants.items():
             setattr(xs, key, value)
         self.tmp.cleanup()
+
+    def make_gh(self, fixtures):
+        fake = self.root / "gh"
+        fixture_file = self.root / "gh-fixtures.json"
+        call_log = self.root / "gh-calls.txt"
+        fixture_file.write_text(json.dumps(fixtures))
+        fake.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, sys\n"
+            "endpoint = sys.argv[2]\n"
+            "with open(os.environ['GH_CALL_LOG'], 'a') as log: log.write(endpoint + '\\n')\n"
+            "with open(os.environ['GH_FIXTURES']) as source: fixtures = json.load(source)\n"
+            "if endpoint not in fixtures:\n"
+            "    print('missing fixture: ' + endpoint, file=sys.stderr)\n"
+            "    raise SystemExit(1)\n"
+            "print(json.dumps(fixtures[endpoint]))\n"
+        )
+        fake.chmod(0o755)
+        self.gh_env = {"OPENSWARM_GH_BIN": str(fake), "GH_FIXTURES": str(fixture_file),
+                       "GH_CALL_LOG": str(call_log)}
+        return call_log
+
+    def run_ingest(self, *args):
+        original_argv = sys.argv
+        try:
+            sys.argv = ["openswarm", "ledger", "ingest", *args]
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, self.gh_env), contextlib.redirect_stdout(output):
+                xs.main()
+            return output.getvalue()
+        finally:
+            sys.argv = original_argv
+
+    def put_fleet_ledger(self, *records):
+        path = Path(xs.DATA) / "ledger-fleet.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(record) + "\n" for record in records))
+        return path
 
     def test_old_records_remain_readable_and_json_returns_full_entries(self):
         old = {"id": "old-run", "ts": 1, "status": "done", "backend": "pi", "title": "old"}
@@ -81,6 +122,85 @@ class LedgerTests(unittest.TestCase):
         finally:
             sys.argv = original_argv
         self.assertEqual(json.loads(output.getvalue()), [record])
+
+    def test_ledger_ingest_links_by_sha_counts_badges_merged_defect_and_is_idempotent(self):
+        run_id, repo, sha, number = "sha-run-1", "octo/project", "a" * 40, 14
+        merged_at = "2026-10-20T12:00:00Z"
+        params = {"state": "all", "labels": "bug", "since": merged_at}
+        bug_endpoint = f"repos/{repo}/issues?{urllib.parse.urlencode(params)}&per_page=100&page=1"
+        defect_params = {"state": "all", "labels": "defect", "since": merged_at}
+        defect_endpoint = f"repos/{repo}/issues?{urllib.parse.urlencode(defect_params)}&per_page=100&page=1"
+        fixtures = {
+            f"repos/{repo}/commits/{sha}/pulls?per_page=100&page=1": [
+                {"number": number, "html_url": f"https://github.com/{repo}/pull/{number}"}],
+            f"repos/{repo}/pulls/{number}": {"number": number, "merged": True, "merged_at": merged_at,
+                                                   "html_url": f"https://github.com/{repo}/pull/{number}"},
+            f"repos/{repo}/pulls/{number}/comments?per_page=100&page=1": [
+                {"user": {"login": "chatgpt-codex-connector[bot]"},
+                 "body": "P0 Badge\nP1 Badge"},
+                {"user": {"login": "reviewer"}, "body": "P2 Badge"}],
+            f"repos/{repo}/pulls/{number}/reviews?per_page=100&page=1": [
+                {"user": {"login": "NorbiAI"}, "body": "P1 Badge\nP2 Badge"}],
+            bug_endpoint: [{"number": 99, "created_at": "2026-10-23T12:00:00Z",
+                            "labels": [{"name": "bug"}], "body": "Fixes #14"}],
+            defect_endpoint: [],
+        }
+        calls = self.make_gh(fixtures)
+        path = self.put_fleet_ledger({"id": run_id, "run_id": run_id, "ts": xs.NOW(), "commit": sha,
+                                      "future_field": {"kept": True}, "pr": None,
+                                      "review_findings": None, "merged": None, "defect_within_7d": None})
+
+        self.run_ingest("--repo", repo)
+        result = json.loads(path.read_text())
+        self.assertEqual(result["pr"], {"repo": repo, "number": number,
+                                        "url": f"https://github.com/{repo}/pull/{number}"})
+        self.assertEqual(result["review_findings"], {"p0": 1, "p1": 2, "p2": 1})
+        self.assertTrue(result["merged"])
+        self.assertTrue(result["defect_within_7d"])
+        self.assertEqual(result["future_field"], {"kept": True})
+
+        first_contents = path.read_bytes()
+        first_calls = calls.read_text().splitlines()
+        self.run_ingest("--repo", repo)
+        self.assertEqual(path.read_bytes(), first_contents)
+        self.assertEqual(calls.read_text().splitlines(), first_calls)
+
+    def test_ledger_ingest_links_by_branch(self):
+        repo, branch, run_id, number = "octo/project", "openswarm/branch-run", "branch-run", 22
+        query = urllib.parse.urlencode({"state": "all", "head": f"octo:{branch}"})
+        fixtures = {
+            f"repos/{repo}/pulls?{query}&per_page=100&page=1": [{"number": number}],
+            f"repos/{repo}/pulls/{number}": {"number": number, "merged": False},
+            f"repos/{repo}/pulls/{number}/comments?per_page=100&page=1": [],
+            f"repos/{repo}/pulls/{number}/reviews?per_page=100&page=1": [],
+        }
+        self.make_gh(fixtures)
+        path = self.put_fleet_ledger({"id": run_id, "ts": xs.NOW(), "branch": branch})
+        self.run_ingest("--repo", repo)
+        result = json.loads(path.read_text())
+        self.assertEqual(result["pr"]["number"], number)
+        self.assertEqual(result["review_findings"], {"p0": 0, "p1": 0, "p2": 0})
+        self.assertFalse(result["merged"])
+        self.assertIsNone(result["defect_within_7d"])
+
+    def test_ledger_ingest_links_by_run_id_in_issue_comment(self):
+        repo, run_id, number = "octo/project", "comment-run", 31
+        body_query = "repo:octo/project is:pr in:body comment-run"
+        comment_query = "repo:octo/project is:pr in:comments comment-run"
+        search_body = "search/issues?" + urllib.parse.urlencode({"q": body_query}) + "&per_page=100&page=1"
+        search_comment = "search/issues?" + urllib.parse.urlencode({"q": comment_query}) + "&per_page=100&page=1"
+        fixtures = {
+            search_body: {"items": []},
+            search_comment: {"items": [{"number": number, "pull_request": {"url": "fixture"}}]},
+            f"repos/{repo}/issues/{number}/comments?per_page=100&page=1": [{"body": f"Run {run_id}"}],
+            f"repos/{repo}/pulls/{number}": {"number": number, "merged": False},
+            f"repos/{repo}/pulls/{number}/comments?per_page=100&page=1": [],
+            f"repos/{repo}/pulls/{number}/reviews?per_page=100&page=1": [],
+        }
+        self.make_gh(fixtures)
+        path = self.put_fleet_ledger({"id": run_id, "ts": xs.NOW()})
+        self.run_ingest("--repo", repo)
+        self.assertEqual(json.loads(path.read_text())["pr"]["number"], number)
 
 
 if __name__ == "__main__":
