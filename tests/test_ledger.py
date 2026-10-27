@@ -110,6 +110,17 @@ class LedgerTests(unittest.TestCase):
         finally:
             sys.argv = original_argv
 
+    def run_ledger_command(self, *args):
+        original_argv = sys.argv
+        try:
+            sys.argv = ["openswarm", "ledger", *args]
+            output = io.StringIO()
+            with mock.patch.object(xs, "load_policy", return_value={}), contextlib.redirect_stdout(output):
+                xs.main()
+            return json.loads(output.getvalue())
+        finally:
+            sys.argv = original_argv
+
     def put_fleet_ledger(self, *records):
         path = Path(xs.DATA) / "ledger-fleet.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -159,6 +170,8 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(record["tokens"], {"input": 12, "output": 8, "total": 20})
         self.assertEqual(record["lessons_injected"], [])
         self.assertIsNone(record["merged"])
+        self.assertFalse(record["exec_pass"])
+        self.assertIsNone(record["accepted"])
         self.assertEqual(list(xs.ledger_entries()), [record])
 
         original_argv = sys.argv
@@ -170,6 +183,55 @@ class LedgerTests(unittest.TestCase):
         finally:
             sys.argv = original_argv
         self.assertEqual(json.loads(output.getvalue()), [record])
+
+    def test_exec_pass_uses_changes_and_verify_not_executor_status(self):
+        self.assertTrue(xs.exec_pass_value("partial", True, False, False, None))  # partial with a commit
+        self.assertFalse(xs.exec_pass_value("failed", False, False, False, None))
+        self.assertTrue(xs.exec_pass_value("failed", True, False, False, None))
+        self.assertFalse(xs.exec_pass_value("done", True, False, True, {"rc": 2}))
+        self.assertTrue(xs.exec_pass_value("done", False, True, False, None))  # read-only output file
+
+        output = self.root / "review.md"
+        output.write_text("review")
+        self.assertTrue(xs.read_only_output_exists(str(self.root), ["review.md"]))
+        self.assertFalse(xs.read_only_output_exists(str(self.root), ["missing.md"]))
+
+    def test_accept_reject_and_backfill_pass_cli(self):
+        Path(xs.LEDGER).parent.mkdir(parents=True)
+        Path(xs.LEDGER).write_text("".join(json.dumps(record) + "\n" for record in (
+            {"id": "accepted-run", "status": "done"},
+            {"id": "rejected-run", "status": "failed"},
+        )))
+        accepted = self.run_ledger_command("accept", "accepted-run", "--reason", "reviewed and merged")
+        rejected = self.run_ledger_command("accept", "rejected-run", "--reject", "--reason", "needs fixes")
+        rows = [json.loads(line) for line in Path(xs.LEDGER).read_text().splitlines()]
+        self.assertTrue(rows[0]["accepted"])
+        self.assertEqual(rows[0]["accepted_reason"], "reviewed and merged")
+        self.assertIsInstance(rows[0]["accepted_at"], (int, float))
+        self.assertFalse(rows[1]["accepted"])
+        self.assertEqual(accepted["run_id"], "accepted-run")
+        self.assertFalse(rejected["accepted"])
+
+        Path(xs.LEDGER).write_text("".join(json.dumps(record) + "\n" for record in (
+            {"id": "partial", "status": "partial", "commit": "abc"},
+            {"id": "failed", "status": "failed", "commit": "def"},
+            {"id": "verified-fail", "status": "done", "files_changed": ["x"],
+             "verify": {"rc": 2}},
+            {"id": "unverified", "status": "done", "files_changed": ["x"], "verify": None},
+        )))
+        result = self.run_ledger_command("backfill-pass")
+        rows = {record["id"]: record for record in
+                (json.loads(line) for line in Path(xs.LEDGER).read_text().splitlines())}
+        self.assertEqual(result["updated"], 3)
+        self.assertTrue(rows["partial"]["exec_pass"])
+        self.assertNotIn("exec_pass", rows["failed"])
+        self.assertFalse(rows["verified-fail"]["exec_pass"])
+        self.assertTrue(rows["unverified"]["exec_pass"])
+
+        fleet = self.put_fleet_ledger({"id": "fleet-run", "status": "done", "commit": "abc"})
+        fleet_result = self.run_ledger_command("backfill-pass", "--fleet")
+        self.assertEqual(fleet_result["updated"], 1)
+        self.assertTrue(json.loads(fleet.read_text())["exec_pass"])
 
     def pull_list_endpoint(self, repo, page=1):
         query = urllib.parse.urlencode({"state": "all", "sort": "updated", "direction": "desc",
@@ -183,7 +245,7 @@ class LedgerTests(unittest.TestCase):
 
     def pr_detail_fixtures(self, repo, number, merged=False):
         return {
-            f"repos/{repo}/pulls/{number}": {"number": number, "merged": merged},
+            f"repos/{repo}/pulls/{number}": {"number": number, "merged": merged, "state": "closed"},
             f"repos/{repo}/pulls/{number}/comments?per_page=100&page=1": [],
             f"repos/{repo}/pulls/{number}/reviews?per_page=100&page=1": [],
         }
@@ -210,6 +272,7 @@ class LedgerTests(unittest.TestCase):
 
         entries = [json.loads(line) for line in path.read_text().splitlines()]
         self.assertEqual([entry["pr"]["number"] for entry in entries], [14, 22, 31])
+        self.assertEqual([entry["accepted"] for entry in entries], [False, False, False])
         self.assertEqual(entries[0]["future_field"], {"kept": True})
         called = calls.read_text().splitlines()
         self.assertEqual(called.count(self.pull_list_endpoint(repo)), 1)
@@ -232,6 +295,7 @@ class LedgerTests(unittest.TestCase):
         fixtures = {
             self.pull_list_endpoint(repo): [pr],
             f"repos/{repo}/pulls/{number}": {"number": number, "merged": True, "merged_at": merged_at,
+                                                 "state": "closed",
                                                  "html_url": f"https://github.com/{repo}/pull/{number}"},
             f"repos/{repo}/pulls/{number}/comments?per_page=100&page=1": [
                 {"user": {"login": "chatgpt-codex-connector[bot]"}, "body": "P0 Badge\nP1 Badge"},
@@ -251,8 +315,32 @@ class LedgerTests(unittest.TestCase):
                                         "url": f"https://github.com/{repo}/pull/{number}"})
         self.assertEqual(result["review_findings"], {"p0": 1, "p1": 2, "p2": 1})
         self.assertTrue(result["merged"])
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["accepted_reason"], "PR merged")
         self.assertTrue(result["defect_within_7d"])
         self.assertEqual(result["future_field"], {"kept": True})
+
+    def test_ingest_preserves_manual_acceptance_and_leaves_open_pr_unset(self):
+        manual = {"id": "manual-run", "accepted": False, "accepted_reason": "manual rejection"}
+        opened = {"id": "open-run"}
+        pulls = {"octo/project": [
+            self.matched_pr("octo/project", 61, body="manual-run"),
+            self.matched_pr("octo/project", 62, body="open-run"),
+        ]}
+
+        def detail(run_id, _repo, _endpoint):
+            return {"merged": False, "state": "open" if run_id == "open-run" else "closed"}
+
+        with mock.patch.object(xs, "gh_ingest_api", side_effect=detail), \
+                mock.patch.object(xs, "gh_review_findings", return_value={}), \
+                mock.patch.object(xs, "gh_has_defect_after_merge", return_value=False):
+            xs.ingest_ledger_entry(manual, ["octo/project"], pulls)
+            xs.ingest_ledger_entry(opened, ["octo/project"], pulls)
+
+        self.assertFalse(manual["accepted"])
+        self.assertEqual(manual["accepted_reason"], "manual rejection")
+        self.assertIsNone(opened.get("accepted"))
+        self.assertEqual(opened["pr_state"], "open")
 
     def test_ledger_ingest_paginates_until_updated_at_crosses_since(self):
         repo = "octo/project"

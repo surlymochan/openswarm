@@ -37,16 +37,18 @@ class RoutingWeightsTests(unittest.TestCase):
 
     def test_fixture_ledger_computes_all_routing_metrics(self):
         rows = [
-            {"backend": "codex", "model": "m1", "card_type": "fix", "status": "done", "verify_rc": 0,
+            {"backend": "codex", "model": "m1", "card_type": "fix", "status": "done", "exec_pass": True,
              "attempts": [{}], "seconds": 1, "tokens": {"total": 100}, "review_findings": {"p0": 0, "p1": 1}},
-            {"backend": "codex", "model": "m1", "card_type": "fix", "status": "done", "verify_rc": 2,
+            {"backend": "codex", "model": "m1", "card_type": "fix", "status": "done", "exec_pass": False,
              "attempts": [{}, {}], "seconds": 2, "tokens": {"total": 200}, "review_findings": {"p0": 0, "p1": 0}},
-            {"backend": "codex", "model": "m1", "card_type": "fix", "status": "done",
+            {"backend": "codex", "model": "m1", "card_type": "fix", "status": "done", "exec_pass": True,
              "attempts": [{}], "seconds": 3, "tokens": {"total": 300}, "rework_of": "previous"},
-            {"backend": "codex", "model": "m1", "card_type": "fix", "status": "partial", "verify_rc": None,
+            {"backend": "codex", "model": "m1", "card_type": "fix", "status": "partial", "exec_pass": False,
              "attempts": [], "seconds": 4, "tokens": {"total": 400}, "review_findings": {"p0": 1, "p1": 0}},
-            {"backend": "ocgo", "model": "m2", "card_type": "fix", "status": "done", "attempts": [{}]},
-            {"backend": "ocgo", "model": "m2", "card_type": "fix", "status": "done", "attempts": [{}]},
+            {"backend": "ocgo", "model": "m2", "card_type": "fix", "status": "done", "exec_pass": True,
+             "attempts": [{}]},
+            {"backend": "ocgo", "model": "m2", "card_type": "fix", "status": "done", "exec_pass": True,
+             "attempts": [{}]},
         ]
 
         result = xs.compute_routing_weights(rows, min_samples=3)
@@ -54,6 +56,10 @@ class RoutingWeightsTests(unittest.TestCase):
         self.assertEqual(codex["backend"], "codex")
         self.assertEqual(codex["runs"], 4)
         self.assertEqual(codex["pass_rate"], 0.5)
+        self.assertEqual(codex["accepted_runs"], 0)
+        self.assertIsNone(codex["accepted_rate"])
+        self.assertEqual(codex["exec_pass_runs"], 4)
+        self.assertEqual(codex["exec_pass_rate"], 0.5)
         self.assertEqual(codex["first_try_rate"], 0.5)
         self.assertEqual(codex["rework_rate"], 0.25)
         self.assertEqual(codex["review_p1_rate"], 2 / 3)
@@ -61,8 +67,24 @@ class RoutingWeightsTests(unittest.TestCase):
         self.assertEqual(codex["median_seconds"], 2.5)
         self.assertTrue(codex["enough"])
         self.assertFalse(result["entries"][1]["enough"])
-        self.assertTrue(xs.routing_passed({"status": "done", "verify": None, "verify_rc": None}))
-        self.assertFalse(xs.routing_passed({"status": "done", "verify": {"rc": None}, "verify_rc": None}))
+        self.assertFalse(xs.routing_passed({"status": "done", "verify": None, "verify_rc": None}))
+        self.assertFalse(xs.routing_passed({"status": "done", "exec_pass": False}))
+        self.assertTrue(xs.routing_passed({"status": "partial", "exec_pass": True}))
+        self.assertFalse(xs.routing_passed({"accepted": False, "exec_pass": True}))
+
+    def test_acceptance_overrides_exec_pass_and_reports_both_rates(self):
+        rows = [
+            {"backend": "pi", "status": "failed", "accepted": True, "exec_pass": False},
+            {"backend": "pi", "status": "done", "accepted": False, "exec_pass": True},
+            {"backend": "pi", "status": "partial", "exec_pass": True},
+        ]
+        row = xs.compute_routing_weights(rows, min_samples=3)["entries"][0]
+        self.assertEqual(row["pass_rate"], 2 / 3)
+        self.assertEqual(row["accepted_rate"], 0.5)
+        self.assertEqual(row["accepted_runs"], 2)
+        self.assertEqual(row["exec_pass_rate"], 2 / 3)
+        self.assertEqual(row["exec_pass_runs"], 3)
+        self.assertEqual(row["scored_runs"], 3)
 
     def test_run_records_advice_without_changing_live_route(self):
         policy = copy.deepcopy(xs.load_policy())
@@ -76,9 +98,11 @@ class RoutingWeightsTests(unittest.TestCase):
         samples = []
         for i in range(2):
             samples.append({"id": f"c{i}", "backend": "codex", "model": expected["model"], "card_type": "fix",
-                            "status": "partial", "attempts": [{}, {}], "seconds": 10, "tokens": {"total": 200}})
+                            "status": "partial", "exec_pass": False, "attempts": [{}, {}], "seconds": 10,
+                            "tokens": {"total": 200}})
             samples.append({"id": f"o{i}", "backend": "ocgo", "model": ocgo["model"], "card_type": "fix",
-                            "status": "done", "attempts": [{}], "seconds": 5, "tokens": {"total": 100}})
+                            "status": "done", "exec_pass": True, "attempts": [{}], "seconds": 5,
+                            "tokens": {"total": 100}})
         self.write_ledger(samples)
 
         args = type("Args", (), {
@@ -100,10 +124,10 @@ class RoutingWeightsTests(unittest.TestCase):
                 mock.patch.object(xs, "run_workspace_prepare", return_value=None), \
                 mock.patch.object(xs, "add_lessons_to_prompt", return_value=("prompt", [])), \
                 mock.patch.object(xs, "run_executor_with_rate_limit",
-                                  return_value=([executor_attempt], {"status": "done", "summary": "ok",
+                                  return_value=([executor_attempt], {"status": "partial", "summary": "ok",
                                                                     "files_changed": []}, None)), \
                 mock.patch.object(xs, "probe", return_value=state), \
-                mock.patch.object(xs, "finalize_workspace", return_value={"branch": None, "commit": None,
+                mock.patch.object(xs, "finalize_workspace", return_value={"branch": None, "commit": "abc123",
                                                                            "diffstat": "", "patch": None,
                                                                            "worktree": None, "merge_hint": None}), \
                 mock.patch.object(xs, "cleanup_worktree"), \
@@ -111,13 +135,15 @@ class RoutingWeightsTests(unittest.TestCase):
                 contextlib.redirect_stdout(output):
             with self.assertRaises(SystemExit) as result:
                 xs.cmd_run(args, policy)
-        self.assertEqual(result.exception.code, 0)
+        self.assertEqual(result.exception.code, 1)
         run = json.loads(output.getvalue())
         self.assertEqual(run["backend"], expected["backend"])
         self.assertEqual(run["routing_advice"]["backend"], "ocgo")
         recorded = json.loads(self.ledger.read_text().splitlines()[-1])
         self.assertEqual(recorded["backend"], "codex")
         self.assertEqual(recorded["routing_advice"]["backend"], "ocgo")
+        self.assertTrue(recorded["exec_pass"])  # partial with a commit is an execution pass
+        self.assertIsNone(recorded["accepted"])
 
     def test_min_samples_blocks_advice_and_cli_writes_stable_weights(self):
         policy = copy.deepcopy(xs.load_policy())
@@ -164,7 +190,7 @@ class RoutingWeightsTests(unittest.TestCase):
     def test_compare_shows_actual_outcome_and_unrun_counterfactual(self):
         now = xs.NOW()
         self.write_ledger([{"id": "one", "ts": now, "card_type": "fix", "backend": "codex", "model": "c1",
-                            "status": "done", "verify": None, "verify_rc": None,
+                            "status": "done", "exec_pass": True, "verify": None, "verify_rc": None,
                             "routing_advice": {"backend": "ocgo", "model": "o1", "reason": "fixture"}}])
         output = io.StringIO()
         with contextlib.redirect_stdout(output):

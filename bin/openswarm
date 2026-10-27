@@ -448,7 +448,7 @@ def lesson_root_cause_class(text):
 def lesson_finding_title(body):
     """Return a short heading from a Codex inline comment, excluding its explanation."""
     for line in str(body or "").splitlines():
-        title = line.strip()
+        title = lesson_plain_text(line)
         if not title:
             continue
         title = re.sub(r"^#{1,6}\s*", "", title)
@@ -463,10 +463,30 @@ def lesson_finding_title(body):
             match = re.match(r"^(P[012])(?:\s+Badge)?\s*[:—-]\s*(.+)$", title, re.I)
             if match:
                 title = match.group(2).strip().strip("* `_~")
-        title = re.sub(r"\s+", " ", title)
         if title:
+            title = re.sub(r"\s+", " ", title).strip()
             return bus_redact(title[:240]).rstrip(" .!?;:")
     return "Review the affected code path"
+
+
+def lesson_plain_text(value):
+    """Remove badge and markdown/HTML decoration before storing a lesson rule."""
+    value = html.unescape(str(value or ""))
+    value = re.sub(r"!\[([^\]]*)\]\([^)]*\)",
+                   lambda match: "" if re.search(r"P[012]\s+Badge", match.group(1), re.I) else match.group(1), value)
+    value = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", value)
+    value = re.sub(r"<[^>]*>", " ", value)
+    value = re.sub(r"(?<!\w)(?:P[012]\s+Badge)(?!\w)", " ", value, flags=re.I)
+    value = re.sub(r"\*\*|(?<!\w)__|__(?!\w)|~~|`", "", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def lesson_rule_sentence(title):
+    title = lesson_plain_text(title)
+    # Keep the proposed rule to one sentence even when the review heading contains punctuation.
+    title = re.sub(r"[.!?]+(?=\s)", ";", title).rstrip(" .!?;:")
+    return bus_redact(f"Prevent recurrence of this finding: {title}.")
 
 
 def lesson_top_level_paths(entry):
@@ -694,7 +714,7 @@ def cmd_lessons_propose(args, policy):
             else:
                 lesson_id = f"L-{next_number:04d}"
                 next_number += 1
-                rule = bus_redact(f"Prevent recurrence of this finding: {candidate['title']}.")
+                rule = lesson_rule_sentence(candidate["title"])
                 proposal = {"kind": "new", "id": lesson_id, "date": date, "title": candidate["title"],
                             "root_cause_class": candidate["root_cause_class"], "recurrences": 1,
                             "rule": rule, "applies_to": {"card_types": candidate["card_types"],
@@ -1264,11 +1284,16 @@ def routing_tokens(entry):
     return None
 
 
+def routing_outcome(entry):
+    accepted = entry.get("accepted")
+    if isinstance(accepted, bool):
+        return accepted
+    exec_pass = entry.get("exec_pass")
+    return exec_pass if isinstance(exec_pass, bool) else None
+
+
 def routing_passed(entry):
-    verify = entry.get("verify") if isinstance(entry.get("verify"), dict) else {}
-    verify_rc = entry.get("verify_rc", verify.get("rc"))
-    has_verify = entry.get("verify") is not None or verify_rc is not None
-    return entry.get("status") == "done" and (not has_verify or verify_rc == 0)
+    return routing_outcome(entry) is True
 
 
 def compute_routing_weights(entries, min_samples=8):
@@ -1297,18 +1322,26 @@ def compute_routing_weights(entries, min_samples=8):
         seconds = [value for value in (entry.get("seconds") for entry in runs)
                    if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0]
         tokens = [value for value in (routing_tokens(entry) for entry in runs) if value is not None]
+        accepted_values = [entry["accepted"] for entry in runs if isinstance(entry.get("accepted"), bool)]
+        exec_pass_values = [entry["exec_pass"] for entry in runs if isinstance(entry.get("exec_pass"), bool)]
+        outcomes = [outcome for outcome in (routing_outcome(entry) for entry in runs) if outcome is not None]
         rows.append({
             "backend": backend,
             "model": model,
             "card_type": card_type,
             "runs": len(runs),
-            "pass_rate": sum(routing_passed(entry) for entry in runs) / len(runs),
+            "scored_runs": len(outcomes),
+            "pass_rate": sum(outcomes) / len(outcomes) if outcomes else None,
+            "accepted_runs": len(accepted_values),
+            "accepted_rate": sum(accepted_values) / len(accepted_values) if accepted_values else None,
+            "exec_pass_runs": len(exec_pass_values),
+            "exec_pass_rate": sum(exec_pass_values) / len(exec_pass_values) if exec_pass_values else None,
             "first_try_rate": sum(count == 1 for count in attempt_counts) / len(runs),
             "rework_rate": sum(bool(entry.get("rework_of")) for entry in runs) / len(runs),
             "review_p1_rate": sum(reviewed) / len(reviewed) if reviewed else None,
             "median_tokens": routing_median(tokens),
             "median_seconds": routing_median(seconds),
-            "enough": len(runs) >= min_samples,
+            "enough": len(outcomes) >= min_samples,
         })
     return {"min_samples": min_samples, "entries": rows}
 
@@ -1352,7 +1385,8 @@ def routing_advice(profile, card_type, st, policy, actual_decision):
                 continue
             if profile.get("model") and row["model"] != profile["model"]:
                 continue
-            quality = (row["pass_rate"], row["first_try_rate"], -row["rework_rate"],
+            quality = (row["pass_rate"] if row["pass_rate"] is not None else 0,
+                       row["first_try_rate"], -row["rework_rate"],
                        -(row["review_p1_rate"] if row["review_p1_rate"] is not None else 0))
             cost = (row["median_tokens"] if row["median_tokens"] is not None else math.inf,
                     row["median_seconds"] if row["median_seconds"] is not None else math.inf)
@@ -1382,7 +1416,8 @@ def cmd_routing_weights(args, policy):
 
 
 def outcome_label(entry):
-    return "pass" if routing_passed(entry) else f"fail/{entry.get('status') or 'unknown'}"
+    outcome = routing_outcome(entry)
+    return ("pass" if outcome else f"fail/{entry.get('status') or 'unknown'}") if outcome is not None else "unknown"
 
 
 def cmd_routing_compare(args, policy):
@@ -1431,6 +1466,46 @@ def changed_paths(repo, base, commit, fallback=None):
         if rc == 0:
             return [path for path in names.splitlines() if path]
     return list(fallback or [])
+
+
+READ_ONLY_CARD_TYPES = {"review", "research"}
+
+
+def read_only_output_exists(root, files):
+    root = os.path.realpath(root)
+    for path in files if isinstance(files, list) else []:
+        if not isinstance(path, str) or not path.strip():
+            continue
+        candidate = os.path.realpath(path if os.path.isabs(path) else os.path.join(root, path))
+        try:
+            inside_root = os.path.commonpath((root, candidate)) == root
+        except ValueError:
+            inside_root = False
+        if inside_root and os.path.isfile(candidate):
+            return True
+    return False
+
+
+def exec_pass_value(_executor_status, changed, read_only_output, verify_requested, verify):
+    """Compute execution success from change evidence and host verification, ignoring executor status."""
+    verify_passed = not verify_requested or (isinstance(verify, dict) and verify.get("rc") == 0)
+    return bool((changed or read_only_output) and verify_passed)
+
+
+def backfill_exec_pass(entry):
+    status = entry.get("status")
+    files = entry.get("files_changed")
+    has_files = isinstance(files, list) and any(isinstance(path, str) and path.strip() for path in files)
+    file_count = entry.get("files")
+    has_files = has_files or (isinstance(file_count, (int, float)) and not isinstance(file_count, bool)
+                              and file_count > 0)
+    if status not in ("done", "partial") or not (entry.get("commit") or has_files):
+        return None
+    verify = entry.get("verify")
+    verify = verify if isinstance(verify, dict) else None
+    verify_rc = entry.get("verify_rc", verify.get("rc") if verify else None)
+    verify_requested = entry.get("verify") is not None or verify_rc is not None
+    return not verify_requested or verify_rc == 0
 
 
 def budget_status(policy, date=None, entries=None):
@@ -3221,12 +3296,17 @@ def cmd_run(args, policy):
     set_status(rdir, state="finalizing")
     st_after = probe(policy) if decision["backend"] == "codex" else st
     attempts[-1]["quota_after"] = quota_used(st_after, decision)
-    changed = ws["mode"] == "worktree" and bool(git(["status", "--porcelain"], ws["root"])[1].strip())
+    workspace_changed = ws["mode"] == "worktree" and bool(git(["status", "--porcelain"], ws["root"])[1].strip())
     # Commit first and verify the committed tree: some suites (release builders) refuse dirty sources.
     fin = finalize_workspace(ws, title, decision["backend"], rdir, keep=True)
+    changed = changed_paths(ws.get("repo") or ws.get("path"), ws.get("base"), fin.get("commit"),
+                            (result or {}).get("files_changed"))
+    read_only = prof.get("type") in READ_ONLY_CARD_TYPES or card_type in READ_ONLY_CARD_TYPES
+    read_only_output = read_only and read_only_output_exists(ws.get("path"), (result or {}).get("files_changed"))
     verify = None
     prepare_error = None
-    if args.verify and not budget_denial and attempts[-1]["error_class"] not in ("risk_blocked", "rate_limit") and (result is not None or changed):
+    if args.verify and not budget_denial and attempts[-1]["error_class"] not in ("risk_blocked", "rate_limit") \
+            and (result is not None or workspace_changed or changed):
         if lockfiles_changed(ws):
             prepared = run_workspace_prepare(ws["repo"], ws["root"], "before_verify")
             if prepared:
@@ -3247,6 +3327,9 @@ def cmd_run(args, policy):
                 verify["rc_raw"], verify["rc"] = verify["rc"], 0
         else:
             verify["baseline"] = {"error": base.get("error")}
+    has_changes = bool(fin.get("commit") or workspace_changed or (changed and not read_only))
+    exec_pass = exec_pass_value((result or {}).get("status"), has_changes, read_only_output,
+                                bool(args.verify), verify)
     if not args.keep_worktree:
         cleanup_worktree(ws, fin.get("commit"))
         fin["worktree"] = None
@@ -3258,7 +3341,7 @@ def cmd_run(args, policy):
     elif attempts[-1]["error_class"] == "risk_blocked":
         status, verify_note = "stopped", None
     elif attempts[-1]["error_class"] == "rate_limit":
-        status, verify_note = ("partial" if fin.get("commit") or changed else "failed"), "rate limited"
+        status, verify_note = ("partial" if fin.get("commit") or workspace_changed or changed else "failed"), "rate limited"
     elif prepare_error:
         status, verify_note = "failed", "workspace prepare failed before verify"
     elif verify and verify["rc"] == 0 and result is None and status == "budget_exceeded":
@@ -3279,8 +3362,6 @@ def cmd_run(args, policy):
         "decision_reasons": decision.get("reasons"), "run_dir": rdir, **routing_fields,
     }
     jsave(f"{rdir}/result.json", out)
-    changed = changed_paths(ws.get("repo") or ws.get("path"), ws.get("base"), fin.get("commit"),
-                            (result or {}).get("files_changed"))
     append_ledger({"id": rid, "ts": NOW(), "title": title, "profile": prof, "status": status,
                    "backend": decision["backend"], "model": decision["model"], "effort": decision.get("effort"),
                    "tier": decision.get("tier"), "attempts": [{k: a[k] for k in a if k != "error_tail"} for a in attempts],
@@ -3288,6 +3369,7 @@ def cmd_run(args, policy):
                    "seconds": wall_seconds, "usage": usage,
                    "risk_blocks": out["risk_blocks"], "summary": (result or {}).get("summary"),
                    "commit": fin.get("commit"), "files": len((result or {}).get("files_changed") or []),
+                   "exec_pass": exec_pass,
                    "branch": fin.get("branch"), "verify": verify,
                    "files_changed": changed,
                    "card_type": card_type, "rework_of": rework_of,
@@ -3678,8 +3760,13 @@ def bus_finish_run(rid, rdir, title, root, remote, issue, result, executor, stat
     output = bus_sanitize(output)
     jsave(f"{rdir}/result.json", output)
     changed = changed_paths(root, task.get("base"), commit, (result or {}).get("files_changed"))
+    read_only = task.get("type") in READ_ONLY_CARD_TYPES or card_type in READ_ONLY_CARD_TYPES
+    read_only_output = read_only and read_only_output_exists(root, (result or {}).get("files_changed"))
+    exec_pass = exec_pass_value((result or {}).get("status"), bool(commit or (changed and not read_only)),
+                                read_only_output, bool(verify_command), verify)
     append_ledger(bus_sanitize({"id": rid, "ts": now, "title": title, "status": status, "backend": "github-issue",
                                 "seconds": elapsed, "summary": (result or {}).get("summary"), "commit": commit,
+                                "exec_pass": exec_pass,
                                 "files": len((result or {}).get("files_changed") or []), "bus": bus_info,
                                 "error_class": output["error_class"], "branch": branch, "verify": verify,
                                 "files_changed": changed,
@@ -5125,6 +5212,11 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
     jsave(os.path.join(rdir, "result.json"), out)
     changed = changed_paths(ws.get("repo") or ws.get("root"), ws.get("base"), fin.get("commit"),
                             (final or {}).get("files_changed"))
+    read_only = spec.get("card_type") in READ_ONLY_CARD_TYPES
+    read_only_output = read_only and read_only_output_exists(ws.get("path"), (final or {}).get("files_changed"))
+    exec_pass = exec_pass_value((final or {}).get("status"),
+                                bool(fin.get("commit") or (changed and not read_only)), read_only_output,
+                                bool(spec.get("verify")), verify)
     append_ledger({"id": rid, "ts": NOW(), "title": title, "status": status, "lane": lane["name"],
                    "backend": lane["backend"], "model": model, "effort": lane.get("effort"),
                    "attempts": attempts, "error_class": error_class,
@@ -5132,6 +5224,7 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
                    "usage": usage, "commit": fin.get("commit"),
                    "risk_blocks": out["risk_blocks"], "summary": (final or {}).get("summary"),
                    "files": len((final or {}).get("files_changed") or []),
+                   "exec_pass": exec_pass,
                    "branch": fin.get("branch"), "verify": verify,
                    "files_changed": changed,
                    "card_type": spec.get("card_type"), "rework_of": spec.get("rework_of"),
@@ -5985,11 +6078,19 @@ def ingest_ledger_entry(entry, repos, pull_requests=None, threshold=0):
             detail = linked
         merged_at = detail.get("merged_at")
         merged = bool(detail.get("merged") or merged_at)
+        pr_state = detail.get("state") or linked.get("state")
+        if merged:
+            pr_state = "closed"
         entry["pr"] = {"repo": repo, "number": number,
                        "url": detail.get("html_url") or linked.get("html_url") or
                        f"https://github.com/{repo}/pull/{number}"}
         entry["review_findings"] = gh_review_findings(run_id, repo, number)
         entry["merged"] = merged
+        entry["pr_state"] = pr_state
+        if not isinstance(entry.get("accepted"), bool) and (merged or pr_state == "closed"):
+            entry["accepted"] = merged
+            entry["accepted_reason"] = "PR merged" if merged else "PR closed without merge"
+            entry["accepted_at"] = NOW()
         entry["defect_within_7d"] = (gh_has_defect_after_merge(run_id, repo, number, merged_at)
                                       if merged else None)
         return True
@@ -5998,7 +6099,8 @@ def ingest_ledger_entry(entry, repos, pull_requests=None, threshold=0):
 
 def ledger_ingest_is_filled(entry):
     return (isinstance(entry.get("pr"), dict) and isinstance(entry.get("review_findings"), dict)
-            and isinstance(entry.get("merged"), bool) and "defect_within_7d" in entry)
+            and isinstance(entry.get("merged"), bool) and "defect_within_7d" in entry
+            and (isinstance(entry.get("accepted"), bool) or entry.get("pr_state") == "open"))
 
 
 def ledger_ingest_write(path, lines):
@@ -6114,6 +6216,72 @@ def cmd_ledger_ingest(args):
             ledger_ingest_write(path, lines)
     print(f"ingested {linked_count} PR-linked runs; {unlinked_count} unlinked; "
           f"updated {updated} ledger entries in {path}")
+
+
+def cmd_ledger_accept(args):
+    path = fleet_ledger_path() if args.fleet else LEDGER
+    if not os.path.isfile(path):
+        raise ValueError(f"ledger not found: {path}")
+    run_id = str(args.run_id)
+    accepted = not args.reject
+    reason = bus_redact((args.reason or "").strip())
+    if not reason:
+        reason = "manually accepted" if accepted else "manually rejected"
+    lock_path = path + ".lock"
+    with open(lock_path, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with open(path, encoding="utf-8") as stream:
+            lines = stream.readlines()
+        matches = []
+        for index, raw in enumerate(lines):
+            try:
+                entry = json.loads(raw)
+            except (ValueError, UnicodeError):
+                continue
+            if isinstance(entry, dict) and run_id in {str(entry.get("run_id") or ""),
+                                                       str(entry.get("id") or "")}:
+                matches.append((index, entry))
+        if not matches:
+            raise ValueError(f"run not found in ledger: {run_id}")
+        if len(matches) != 1:
+            raise ValueError(f"run id is ambiguous in ledger: {run_id}")
+        index, entry = matches[0]
+        entry["accepted"] = accepted
+        entry["accepted_reason"] = reason[:1000]
+        entry["accepted_at"] = NOW()
+        lines[index] = json.dumps(entry, ensure_ascii=False) + "\n"
+        ledger_ingest_write(path, lines)
+    print(json.dumps({"run_id": run_id, "accepted": accepted, "accepted_reason": reason[:1000],
+                      "accepted_at": entry["accepted_at"], "path": path}, ensure_ascii=False))
+
+
+def cmd_ledger_backfill_pass(args):
+    path = fleet_ledger_path() if args.fleet else LEDGER
+    if not os.path.isfile(path):
+        raise ValueError(f"ledger not found: {path}")
+    lock_path = path + ".lock"
+    updated = skipped = 0
+    with open(lock_path, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with open(path, encoding="utf-8") as stream:
+            lines = stream.readlines()
+        for index, raw in enumerate(lines):
+            try:
+                entry = json.loads(raw)
+            except (ValueError, UnicodeError):
+                continue
+            if not isinstance(entry, dict) or "exec_pass" in entry:
+                continue
+            value = backfill_exec_pass(entry)
+            if value is None:
+                skipped += 1
+                continue
+            entry["exec_pass"] = value
+            lines[index] = json.dumps(entry, ensure_ascii=False) + "\n"
+            updated += 1
+        if updated:
+            ledger_ingest_write(path, lines)
+    print(json.dumps({"updated": updated, "skipped": skipped, "path": path}, ensure_ascii=False))
 
 
 def host_openswarm(host, args):
@@ -7292,6 +7460,10 @@ def append_ledger(entry):
         "title": bus_redact(entry.get("title") or ""),
         "status": entry.get("status"),
         "error_class": entry.get("error_class"),
+        "exec_pass": entry.get("exec_pass") if isinstance(entry.get("exec_pass"), bool) else False,
+        "accepted": entry.get("accepted") if isinstance(entry.get("accepted"), bool) else None,
+        "accepted_reason": entry.get("accepted_reason"),
+        "accepted_at": entry.get("accepted_at"),
         "verify_rc": entry.get("verify_rc", verify.get("rc")),
         "attempts": attempts,
         "rework_of": entry.get("rework_of"),
@@ -7602,6 +7774,13 @@ def main():
     lp.add_argument("--since", type=float, default=30,
                     help="only inspect runs from the last DAYS (default: 30)")
     lp.add_argument("--refresh", action="store_true", help="re-ingest records that already have GitHub data")
+    lp = ledger_sub.add_parser("accept", help="accept or reject a completed run")
+    lp.add_argument("run_id")
+    lp.add_argument("--reject", action="store_true", help="mark the run rejected")
+    lp.add_argument("--reason", help="record a reason for the decision")
+    lp.add_argument("--fleet", action="store_true", help="update the merged fleet ledger")
+    lp = ledger_sub.add_parser("backfill-pass", help="compute exec_pass for older ledger records")
+    lp.add_argument("--fleet", action="store_true", help="update the merged fleet ledger")
 
     a = ap.parse_args()
     policy = load_policy()
@@ -7713,6 +7892,18 @@ def main():
             try:
                 cmd_ledger_ingest(a)
             except (BusError, ValueError) as error:
+                print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False), file=sys.stderr)
+                sys.exit(2)
+        elif a.ledger_cmd == "accept":
+            try:
+                cmd_ledger_accept(a)
+            except ValueError as error:
+                print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False), file=sys.stderr)
+                sys.exit(2)
+        elif a.ledger_cmd == "backfill-pass":
+            try:
+                cmd_ledger_backfill_pass(a)
+            except ValueError as error:
                 print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False), file=sys.stderr)
                 sys.exit(2)
         else:

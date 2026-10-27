@@ -192,8 +192,15 @@ tracks processed inline comment ids in `knowledge.repo/proposals/seen.json`; it 
 
 `openswarm routing weights` summarizes ledger runs by backend, model and card type. It writes
 `<knowledge.repo>/routing/weights.json` (default sample threshold: 8); use `--fleet` to read the merged fleet
-ledger or `--out PATH` to choose another output path. The report includes pass, first-try, rework and P1+ review
-rates plus median tokens and seconds. Groups below `routing.min_samples` are marked `enough: false`.
+ledger or `--out PATH` to choose another output path. The effective pass rate uses manual `accepted` decisions
+when present and otherwise uses `exec_pass`; the report also includes each source rate and its record count,
+first-try, rework and P1+ review rates, plus median tokens and seconds. Groups below `routing.min_samples` scored
+runs are marked `enough: false`.
+
+Review completed runs with `openswarm ledger accept <run_id> [--reject] [--reason TEXT] [--fleet]`. The decision,
+reason and timestamp are recorded atomically. `openswarm ledger ingest` sets acceptance from merged or closed
+without merge PRs unless a manual decision is already present. Use `openswarm ledger backfill-pass [--fleet]` to
+compute `exec_pass` for eligible older records.
 
 `openswarm route --card-type fix` and `openswarm run --card-type fix` attach `routing_advice` when enough historical
 samples exist for currently eligible backends. Advice ranks pass, first-try, rework and P1+ rates, then uses median

@@ -63,10 +63,10 @@ class LessonsTests(unittest.TestCase):
         return call_log
 
     def set_ledger_finding(self, comment_id=701, title="Validate the archive path before extraction",
-                           badge="P1", extra_comments=None, run_id="finding-run"):
+                           badge="P1", extra_comments=None, run_id="finding-run", body=None):
         repo, number = "octo/project", 14
         comments = [{"id": comment_id, "user": {"login": "chatgpt-codex-connector[bot]"},
-                     "body": f"**[{badge}] {title}**\n\nThe finding affects this code path.\n\n{badge} Badge"}]
+                     "body": body or f"**[{badge}] {title}**\n\nThe finding affects this code path.\n\n{badge} Badge"}]
         comments.extend(extra_comments or [])
         self.make_gh({f"repos/{repo}/pulls/{number}/comments?per_page=100&page=1": comments})
         path = Path(xs.LEDGER)
@@ -210,6 +210,17 @@ class LessonsTests(unittest.TestCase):
 
         proposal = self.root / "proposals" / xs.policy_day(self.policy)[0] / "L-0002.yaml"
         self.assertIn('root_cause_class: "other"', proposal.read_text(encoding="utf-8"))
+
+    def test_proposed_rule_strips_html_badge_markdown_and_bold(self):
+        self.set_ledger_finding(body=("**<sub><sub>![P1 Badge](https://example.invalid/badge.svg)</sub></sub> "
+                                      "Validate the archive path before extraction**"))
+
+        self.run_propose()
+
+        proposal = self.root / "proposals" / xs.policy_day(self.policy)[0] / "L-0001.yaml"
+        rule = xs.parse_lesson_yaml(proposal.read_text(encoding="utf-8"))["rule"]
+        self.assertEqual(rule, "Prevent recurrence of this finding: Validate the archive path before extraction.")
+        self.assertNotRegex(rule, r"<sub>|!\[|\*\*|P1 Badge")
 
     def test_comment_id_is_never_proposed_twice(self):
         ledger = self.set_ledger_finding()
