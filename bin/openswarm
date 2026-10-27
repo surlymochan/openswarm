@@ -3414,9 +3414,79 @@ def shell_invocations(command, cwd, depth=0):
                     break
 
 
-def rm_outside_worktree(command, worktree):
-    root = os.path.realpath(worktree)
-    for words, cwd in shell_invocations(command, root):
+def executor_worktree_root(path):
+    path = os.path.realpath(path)
+    try:
+        rc, root, _ = git(["rev-parse", "--show-toplevel"], path)
+        if rc == 0:
+            return os.path.realpath(root.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return path
+
+
+def configure_executor_environment(worktree, env=None):
+    """Create and locally exclude the executor temp directory, returning its path and environment."""
+    root = executor_worktree_root(worktree)
+    tmpdir = os.path.join(root, ".openswarm-tmp")
+    if os.path.lexists(tmpdir) and (os.path.islink(tmpdir) or not os.path.isdir(tmpdir)):
+        if os.path.isdir(tmpdir) and not os.path.islink(tmpdir):
+            shutil.rmtree(tmpdir)
+        else:
+            os.unlink(tmpdir)
+    os.makedirs(tmpdir, exist_ok=True)
+
+    try:
+        rc, exclude, _ = git(["rev-parse", "--git-path", "info/exclude"], root)
+        if rc == 0:
+            exclude = exclude.strip()
+            if not os.path.isabs(exclude):
+                exclude = os.path.join(root, exclude)
+            os.makedirs(os.path.dirname(exclude), exist_ok=True)
+            if os.path.exists(exclude):
+                with open(exclude, encoding="utf-8") as stream:
+                    lines = stream.read().splitlines()
+            else:
+                lines = []
+            if not any(line.strip().lstrip("/") == ".openswarm-tmp/" for line in lines):
+                with open(exclude, "a", encoding="utf-8") as stream:
+                    stream.write("/.openswarm-tmp/\n")
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    executor_env = dict(os.environ if env is None else env)
+    for name in ("TMPDIR", "TMP", "TEMP"):
+        executor_env[name] = tmpdir
+    return tmpdir, executor_env
+
+
+def cleanup_executor_tmp(worktree):
+    tmpdir = os.path.join(executor_worktree_root(worktree), ".openswarm-tmp")
+    if os.path.islink(tmpdir):
+        os.unlink(tmpdir)
+    else:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def rm_target_path_class(target, cwd, root):
+    """Classify an rm operand without retaining or exposing its path."""
+    tmpdir = os.path.join(root, ".openswarm-tmp")
+    for name in ("TMPDIR", "TMP", "TEMP"):
+        target = re.sub(rf"\$\{{{name}\}}|\${name}\b", lambda _match: tmpdir, target)
+    target = os.path.expanduser(target)
+    target = os.path.expandvars(target)
+    if "$" in target:
+        return "outside"
+    path = os.path.realpath(os.path.join(cwd, target))
+    if os.path.commonpath([tmpdir, path]) == tmpdir:
+        return "tmp"
+    return "inside" if os.path.commonpath([root, path]) == root else "outside"
+
+
+def rm_outside_worktree_class(command, worktree):
+    workdir = os.path.realpath(worktree)
+    root = executor_worktree_root(workdir)
+    for words, cwd in shell_invocations(command, workdir):
         if os.path.basename(words[0]) != "rm":
             continue
         operands = iter(words[1:])
@@ -3430,11 +3500,14 @@ def rm_outside_worktree(command, worktree):
                 continue
             if options and target.startswith("-"):
                 continue
-            target = os.path.expandvars(os.path.expanduser(target))
-            path = os.path.realpath(os.path.join(cwd, target))
-            if "$" in target or os.path.commonpath([root, path]) != root:
-                return True
-    return False
+            path_class = rm_target_path_class(target, cwd, root)
+            if path_class == "outside":
+                return path_class
+    return None
+
+
+def rm_outside_worktree(command, worktree):
+    return rm_outside_worktree_class(command, worktree) == "outside"
 
 
 def redact_command(command):
@@ -3470,12 +3543,23 @@ def enforced_risk(event, policy, worktree):
             for regex, name in rules:
                 if name in enabled and (name not in operations or op in operations[name]) and re.search(regex, shell_text, re.I):
                     return {"risk": name, "command": redact_command(command)}
-        if "rm outside worktree" in enabled and rm_outside_worktree(command, worktree):
-            return {"risk": "rm outside worktree", "command": redact_command(command)}
+        if "rm outside worktree" in enabled:
+            path_class = rm_outside_worktree_class(command, worktree)
+            if path_class:
+                return {"risk": "rm outside worktree", "path_class": path_class,
+                        "command": redact_command(command)}
     return None
 
 
 def run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
+    _tmpdir, env = configure_executor_environment(cwd, env)
+    try:
+        return _run_proc(cmd, cwd, env, timeout, out_path, abort_re)
+    finally:
+        cleanup_executor_tmp(cwd)
+
+
+def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
     """Run an executor. abort_re: pattern that, once seen in stderr, means the executor will only retry
     silently (e.g. opencode on a plan usage limit) — kill it early and return 75 so the caller can fall back."""
     rdir = os.path.dirname(out_path)
@@ -5959,6 +6043,7 @@ def lane_prepare_workspace(lane, rid, base_rev=None):
                 for rel in linked:
                     if "/" + rel not in have:
                         f.write("/" + rel + "\n")
+    configure_executor_environment(wt)
     return {"mode": "worktree", "path": wt, "root": wt, "repo": repo, "branch": f"openswarm/{rid}",
             "base": base, "base_dirty": False, "linked": linked, "lane": lane["name"],
             "workspace_note": workspace_note(repo)}
@@ -5967,6 +6052,7 @@ def lane_prepare_workspace(lane, rid, base_rev=None):
 class LaneChild:
     def __init__(self, lane, cwd, policy):
         self.lane, self.cwd = lane, cwd
+        _tmpdir, self.env = configure_executor_environment(cwd)
         self.events = queue.Queue()
         self.backlog = []
         self.write_lock = threading.Lock()
@@ -5991,7 +6077,7 @@ class LaneChild:
             if not binary:
                 raise RuntimeError("cursor-agent binary not found; set lane binary or install cursor-agent")
             cmd = [binary, "acp"]
-        self.proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        self.proc = subprocess.Popen(cmd, cwd=cwd, env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.DEVNULL, text=True, bufsize=1, start_new_session=True)
         self.reader = threading.Thread(target=self._read, daemon=True)
         self.reader.start()
@@ -6102,6 +6188,7 @@ class AgyChild:
 
     def __init__(self, lane, cwd, policy):
         self.lane, self.cwd = lane, cwd
+        _tmpdir, self.env = configure_executor_environment(cwd)
         self.proc = None
         self.events = queue.Queue()
         self.stderr_lines = []
@@ -6114,7 +6201,7 @@ class AgyChild:
         cfg = load_policy().get("agy") or {}
         cmd = agy_command(binary, model or self.lane["model"], prompt, effort or self.lane.get("effort"),
                           conversation, cfg)
-        proc = subprocess.Popen(cmd, cwd=self.cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        proc = subprocess.Popen(cmd, cwd=self.cwd, env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, bufsize=1, start_new_session=True)
         events, stderr_lines = queue.Queue(), []
         self.proc, self.events, self.stderr_lines = proc, events, stderr_lines
@@ -6844,6 +6931,7 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
                    "lessons_injected": spec.get("lessons_injected", []),
                    "patterns_injected": spec.get("patterns_injected", [])})
     set_status(rdir, state="finished", status=status, finished=NOW(), commit=fin.get("commit"), lane=lane["name"])
+    cleanup_executor_tmp(ws.get("root") or ws["path"])
     return out
 
 
@@ -7093,6 +7181,7 @@ def cmd_lane_serve(lane, policy):
                 shutdown = True
     if child:
         child.close()
+    cleanup_executor_tmp(os.path.join(lane_root(name), "wt"))
     lane_write_state(name, state="idle", child_pid=None, supervisor_pid=None, current_run=None,
                      turn_state=None, concurrency_keys=[], stopped=NOW(), last_error=None)
     server.close()
