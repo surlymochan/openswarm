@@ -209,6 +209,17 @@ backend or model; `routing.weighted` remains false and reserved for future routi
 with actual outcomes using `openswarm routing compare --days 30`. An advice outcome is shown as `not run` when the
 actual route used a different backend or model, because that counterfactual was not executed.
 
+Run the weekly fleet retrospective in one command:
+
+```bash
+openswarm retro [--days 7] [--out DIR] [--repos owner/name ...] [--no-pull]
+```
+
+By default it pulls fleet ledgers, ingests GitHub PR data for the selected repositories, backfills `exec_pass`,
+updates routing weights, and proposes lessons (plus escalation proposals when that subcommand is available). It writes
+`<knowledge.repo>/retro/<YYYY>-W<ww>.md` and prints a JSON summary. `--no-pull` reuses the current fleet ledger;
+`--out` changes the report directory. A GitHub rate limit is recorded in the report and does not stop the remaining steps.
+
 ## Resident lanes
 
 Use lanes when you want a persistent Codex app-server, Cursor Agent ACP, or Pi RPC process that accepts one task at a time and can be
@@ -398,7 +409,7 @@ Cursor CLI is a fourth executor, opt-in only (`--backend cursor`).
 
 | Path | What |
 | --- | --- |
-| `bin/openswarm` | The CLI: `probe`, `status`, `route`, `run`, `lessons`, `lane`, `fleet`, `batch`, `verify-remote`, `watch`, `runs`, `report`, `stop`, `ingest-claude`, `ledger` |
+| `bin/openswarm` | The CLI: `probe`, `status`, `route`, `run`, `lessons`, `lane`, `fleet`, `batch`, `verify-remote`, `watch`, `runs`, `report`, `retro`, `stop`, `ingest-claude`, `ledger` |
 | `SKILL.md` | Claude Code skill: the planner's operating manual |
 | `policy.json` | Defaults: thresholds, difficulty map, model caps, local data sources |
 | `backends/*.json` | One manifest per executor: invocation, quota source, data boundary |

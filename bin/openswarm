@@ -20,6 +20,7 @@ Subcommands:
   bus-worker       run the reference GitHub issue bus executor
   watch            stream actionable events (progress, risk, stalls) for one or more runs
   runs / report    snapshot of recent runs / compact scheduled check-in
+  retro            weekly fleet retrospective (Markdown report + JSON summary)
   stop             terminate a run (partial work is still committed to its branch)
   ingest-claude    record Claude plan usage (from statusline JSON on stdin, or flags)
   ledger           show recent runs or ingest GitHub PR results
@@ -29,6 +30,7 @@ Nothing that reads another tool's login/auth file is enabled by default.
 """
 import argparse
 import base64
+import contextlib
 import datetime as dt
 import glob
 import fnmatch
@@ -1424,7 +1426,8 @@ def cmd_routing_compare(args, policy):
     if args.days < 0:
         raise ValueError("--days must be non-negative")
     cutoff = NOW() - args.days * 86400
-    entries = [entry for entry in ledger_entries()
+    path = fleet_ledger_path() if getattr(args, "fleet", False) else LEDGER
+    entries = [entry for entry in ledger_entries_from(path)
                if (to_epoch(entry.get("ts")) or 0) >= cutoff and isinstance(entry.get("routing_advice"), dict)]
     print(f"{'date':<20} {'card_type':<16} {'advice':<28} {'advice outcome':<16} {'actual':<28} actual outcome")
     print("-" * 126)
@@ -1440,6 +1443,306 @@ def cmd_routing_compare(args, policy):
         date = dt.datetime.fromtimestamp(ts).astimezone().strftime("%Y-%m-%d %H:%M") if ts else "unknown"
         print(f"{date:<20} {(entry.get('card_type') or '-'):<16} {advised:<28} {advice_outcome:<16} "
               f"{actual:<28} {outcome_label(entry)}")
+
+
+# ---------------------------------------------------------------- weekly retro
+
+def retro_safe(value, limit=240):
+    text = bus_redact(str(value or "-")).replace("\r", " ").replace("\n", " ")
+    text = text.replace("\\", "\\\\").replace("`", "\\`").replace("|", "\\|")
+    text = text.replace("<", "&lt;").replace(">", "&gt;").replace("[", "\\[").replace("]", "\\]")
+    return text[:limit]
+
+
+def retro_ratio(entries, field):
+    values = [entry[field] for entry in entries if isinstance(entry.get(field), bool)]
+    if not values:
+        return "— (0/0)"
+    passed = sum(values)
+    return f"{passed}/{len(values)} ({passed / len(values):.0%})"
+
+
+def retro_groups(entries):
+    groups = {}
+    for entry in entries:
+        key = (str(entry.get("backend") or "unknown"), str(entry.get("model") or "unknown"),
+               str(entry.get("card_type") or "unknown"))
+        groups.setdefault(key, []).append(entry)
+    return [(key, groups[key]) for key in sorted(groups, key=lambda item: tuple(value.casefold() for value in item))]
+
+
+def retro_failure_counts(entries):
+    counts = {}
+    for entry in entries:
+        if not retro_is_failure(entry):
+            continue
+        error_class = entry.get("error_class")
+        if not error_class:
+            attempts = entry.get("attempts")
+            if isinstance(attempts, list):
+                error_class = next((attempt.get("error_class") for attempt in reversed(attempts)
+                                   if isinstance(attempt, dict) and attempt.get("error_class")), None)
+        if error_class:
+            name = retro_safe(error_class)
+            counts[name] = counts.get(name, 0) + 1
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0].casefold()))
+
+
+def retro_is_failure(entry):
+    return entry.get("exec_pass") is False or entry.get("status") in ("failed", "rejected")
+
+
+def retro_rejected(entries):
+    return [entry for entry in entries if entry.get("accepted") is False or entry.get("status") == "rejected"]
+
+
+def retro_routing_rows(entries, cutoff, end=None):
+    rows = [entry for entry in entries if (to_epoch(entry.get("ts")) or 0) >= cutoff
+            and (end is None or (to_epoch(entry.get("ts")) or 0) <= end)
+            and isinstance(entry.get("routing_advice"), dict)]
+    output = []
+    for entry in sorted(rows, key=lambda row: (to_epoch(row.get("ts")) or 0,
+                                                str(row.get("run_id") or row.get("id") or "")), reverse=True):
+        advice = entry["routing_advice"]
+        advised = (advice.get("backend") or "-", advice.get("model") or "-")
+        actual = (entry.get("backend") or "-", entry.get("model") or "-")
+        advice_outcome = outcome_label(entry) if advised == actual else "not run"
+        timestamp = to_epoch(entry.get("ts")) or 0
+        date = dt.datetime.fromtimestamp(timestamp).astimezone().strftime("%Y-%m-%d %H:%M") if timestamp else "unknown"
+        output.append((date, entry.get("card_type") or "-", advised, advice_outcome, actual,
+                       outcome_label(entry), advised != actual, entry))
+    return output
+
+
+def retro_snapshot_proposals(repo):
+    snapshot = {}
+    for directory, subdirs, files in os.walk(repo):
+        subdirs[:] = [name for name in subdirs if name != ".git"]
+        for name in files:
+            path = os.path.join(directory, name)
+            relative = os.path.relpath(path, repo).replace(os.sep, "/")
+            if "proposal" not in relative.casefold() and "guard" not in relative.casefold():
+                continue
+            try:
+                stat = os.stat(path)
+            except OSError:
+                continue
+            snapshot[relative] = (stat.st_mtime_ns, stat.st_size)
+    return snapshot
+
+
+def retro_proposal_changes(before, after):
+    changed = [path for path, signature in after.items() if before.get(path) != signature]
+    lessons = [path for path in changed if "guard" not in path.casefold()
+               and path.casefold().endswith((".yaml", ".yml"))]
+    guards = [path for path in changed if "guard" in path.casefold()]
+    return lessons, guards
+
+
+def retro_step(name, args, policy):
+    """Run one existing command implementation so tests can stub the pipeline."""
+    if name == "fleet ledger pull":
+        cmd_fleet_ledger_pull(args)
+    elif name == "ledger ingest":
+        cmd_ledger_ingest(args)
+    elif name == "ledger backfill-pass":
+        cmd_ledger_backfill_pass(args)
+    elif name == "routing weights":
+        cmd_routing_weights(args, policy)
+    elif name == "routing compare":
+        cmd_routing_compare(args, policy)
+    elif name == "lessons propose":
+        cmd_lessons_propose(args, policy)
+    elif name == "lessons escalate":
+        handler = globals().get("cmd_lessons_escalate")
+        if not callable(handler):
+            return False
+        result = subprocess.run([sys.executable, os.path.realpath(__file__), "lessons", "escalate"],
+                                capture_output=True, text=True)
+        if result.returncode:
+            detail = bus_redact((result.stderr or "").strip())
+            raise RuntimeError(f"lessons escalate failed (rc={result.returncode})"
+                               + (f": {detail}" if detail else ""))
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.stderr:
+            print(result.stderr, end="", file=sys.stderr)
+    else:
+        raise ValueError(f"unknown retro step: {name}")
+    return True
+
+
+def retro_capture_step(name, args, policy):
+    output, error = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+            completed = retro_step(name, args, policy)
+    except BusError as exc:
+        if name == "ledger ingest" and gh_ingest_is_rate_limited(exc):
+            return {"ok": False, "rate_limited": True, "output": output.getvalue(),
+                    "error": error.getvalue() + str(exc)}
+        raise
+    return {"ok": True, "skipped": completed is False, "output": output.getvalue(), "error": error.getvalue()}
+
+
+def retro_report_text(entries, start, end, days, policy, notes, lesson_paths, guard_paths, compare_rows):
+    groups = retro_groups(entries)
+    failures = retro_failure_counts(entries)
+    rejected = retro_rejected(entries)
+    lines = ["# Weekly retrospective", "", f"Window: {start} to {end} ({days} days)", "",
+             "## Runs by backend/model/card_type", "",
+             "| Backend | Model | Card type | Runs | exec_pass | accepted |",
+             "| --- | --- | --- | ---: | ---: | ---: |"]
+    if groups:
+        for (backend, model, card_type), runs in groups:
+            lines.append(f"| {retro_safe(backend)} | {retro_safe(model)} | {retro_safe(card_type)} | {len(runs)} "
+                         f"| {retro_ratio(runs, 'exec_pass')} | {retro_ratio(runs, 'accepted')} |")
+    else:
+        lines.append("| — | — | — | 0 | — (0/0) | — (0/0) |")
+
+    lines.extend(["", "## Top failure error_classes", "", "| error_class | Runs |", "| --- | ---: |"])
+    lines.extend([f"| {retro_safe(name)} | {count} |" for name, count in failures] or ["| None recorded | 0 |"])
+
+    lines.extend(["", "## Rejected runs", "", "| Run | Date | Backend | Card type | Reason | Evidence |",
+                  "| --- | --- | --- | --- | --- | --- |"])
+    for entry in rejected:
+        timestamp = to_epoch(entry.get("ts")) or 0
+        date = dt.datetime.fromtimestamp(timestamp).astimezone().strftime("%Y-%m-%d") if timestamp else "unknown"
+        run_id = retro_safe(entry.get("run_id") or entry.get("id"))
+        reason = (entry.get("accepted_reason") or entry.get("rejection_reason") or entry.get("reason")
+                  or entry.get("error") or "No rejection reason recorded")
+        lines.append(f"| `{run_id}` | {date} | {retro_safe(entry.get('backend'))} | "
+                     f"{retro_safe(entry.get('card_type'))} | {retro_safe(reason)} | [ledger run](#rejected-runs) |")
+    if not rejected:
+        lines.append("| — | — | — | — | None recorded | — |")
+
+    lines.extend(["", "## New lesson and guard proposals", "", "| Type | Proposal | Link |",
+                  "| --- | --- | --- |"])
+    proposals = [("Lesson", path) for path in lesson_paths] + [("Guard", path) for path in guard_paths]
+    # The final relative links are recomputed by cmd_retro for --out destinations.
+    for kind, path in proposals:
+        lines.append(f"| {kind} | `{retro_safe(os.path.basename(path))}` | `{retro_safe(path)}` |")
+    if not proposals:
+        lines.append("| — | No new proposals | — |")
+
+    lines.extend(["", "## Routing advice vs actual (`routing compare --days`)", "",
+                  "| Date | Card type | Advice | Advice outcome | Actual | Actual outcome |",
+                  "| --- | --- | --- | --- | --- | --- |"])
+    for date, card_type, advised, advice_outcome, actual, actual_outcome, _, _ in compare_rows:
+        lines.append(f"| {retro_safe(date)} | {retro_safe(card_type)} | "
+                     f"{retro_safe(advised[0])} / {retro_safe(advised[1])} | {retro_safe(advice_outcome)} | "
+                     f"{retro_safe(actual[0])} / {retro_safe(actual[1])} | {retro_safe(actual_outcome)} |")
+    if not compare_rows:
+        lines.append("| — | — | — | — | — | No routing advice recorded |")
+
+    lines.extend(["", "## Proposed changes", ""])
+    proposed = []
+    if failures:
+        proposed.append(f"Investigate `{retro_safe(failures[0][0])}` failures ({failures[0][1]} runs) [failure evidence](#top-failure-error_classes).")
+    if rejected:
+        proposed.append(f"Review {len(rejected)} rejected run(s) and recorded reasons [rejection evidence](#rejected-runs).")
+    if len(proposals) <= 3:
+        for kind, path in proposals:
+            proposed.append(f"Review the {kind.lower()} proposal `{retro_safe(os.path.basename(path))}` [proposal evidence](#new-lesson-and-guard-proposals).")
+    elif proposals:
+        proposed.append(f"Review {len(proposals)} new lesson and guard proposals [proposal evidence](#new-lesson-and-guard-proposals).")
+    routing_mismatches = {}
+    for row in compare_rows:
+        if row[6]:
+            pair = (row[2], row[4])
+            routing_mismatches[pair] = routing_mismatches.get(pair, 0) + 1
+    for (advised, actual), count in sorted(routing_mismatches.items(), key=lambda item: (-item[1], item[0]))[:3]:
+        proposed.append(f"Review routing advice `{retro_safe(advised[0])} / {retro_safe(advised[1])}` against actual "
+                        f"`{retro_safe(actual[0])} / {retro_safe(actual[1])}` ({count} runs) "
+                        "[routing evidence](#routing-advice-vs-actual-routing-compare-days).")
+    if len(routing_mismatches) > 3:
+        proposed.append(f"Review {len(routing_mismatches) - 3} additional routing mismatch group(s) "
+                        "[routing evidence](#routing-advice-vs-actual-routing-compare-days).")
+    lines.extend(proposed or ["No changes proposed from this window's recorded evidence [run summary](#runs-by-backend-model-card_type)."])
+    lines.extend(["", "## Run notes", ""])
+    lines.extend([f"- {retro_safe(note)}" for note in notes] or ["- All available retro steps completed."])
+    return "\n".join(lines) + "\n"
+
+
+def cmd_retro(args, policy):
+    if args.days < 0:
+        raise ValueError("--days must be non-negative")
+    configured_repo = (policy.get("knowledge") or {}).get("repo")
+    repo = os.path.abspath(os.path.expanduser(str(configured_repo or DEFAULT_KNOWLEDGE_REPO)))
+    if not os.path.isdir(repo):
+        raise ValueError(f"knowledge repo not found: {repo}")
+    output_dir = os.path.abspath(os.path.expanduser(args.out)) if args.out else os.path.join(repo, "retro")
+    os.makedirs(output_dir, exist_ok=True)
+
+    now = NOW()
+    cutoff = now - args.days * 86400
+    zone_name = (policy.get("budget") or {}).get("timezone") or policy.get("timezone")
+    zone = ZoneInfo(zone_name) if zone_name else dt.datetime.now().astimezone().tzinfo
+    start = dt.datetime.fromtimestamp(cutoff, zone).isoformat(timespec="seconds")
+    end = dt.datetime.fromtimestamp(now, zone).isoformat(timespec="seconds")
+    today = dt.datetime.fromtimestamp(now, zone).date()
+    iso_year, iso_week, _ = today.isocalendar()
+    report_path = os.path.join(output_dir, f"{iso_year}-W{iso_week:02d}.md")
+    proposal_snapshot = retro_snapshot_proposals(repo)
+    notes = []
+    steps = {}
+
+    if not args.no_pull:
+        steps["fleet ledger pull"] = retro_capture_step("fleet ledger pull",
+                                                         argparse.Namespace(hosts=None, into=None), policy)
+    else:
+        notes.append("Skipped fleet ledger pull (--no-pull).")
+
+    steps["ledger ingest"] = retro_capture_step("ledger ingest",
+                                                 argparse.Namespace(repo=args.repos or [], since=args.days,
+                                                                    refresh=False), policy)
+    if steps["ledger ingest"].get("rate_limited"):
+        notes.append("Ledger ingest hit the GitHub rate limit; saved progress is included and retro continued.")
+    steps["ledger backfill-pass"] = retro_capture_step("ledger backfill-pass",
+                                                        argparse.Namespace(fleet=True), policy)
+    steps["routing weights"] = retro_capture_step("routing weights",
+                                                   argparse.Namespace(fleet=True, out=None), policy)
+    steps["lessons propose"] = retro_capture_step("lessons propose",
+                                                  argparse.Namespace(fleet=True, since=args.days,
+                                                                     out=None, dry_run=False), policy)
+    escalation = retro_capture_step("lessons escalate",
+                                    argparse.Namespace(fleet=True, since=args.days, out=None, dry_run=False), policy)
+    steps["lessons escalate"] = escalation
+    if escalation.get("skipped"):
+        notes.append("Skipped lessons escalate: subcommand is not available in this build.")
+
+    compare = retro_capture_step("routing compare", argparse.Namespace(days=args.days, fleet=True), policy)
+    steps["routing compare"] = compare
+    if compare.get("error"):
+        notes.append("routing compare reported: " + retro_safe(compare["error"]))
+
+    entries = [entry for entry in ledger_entries_from(fleet_ledger_path())
+               if cutoff <= (to_epoch(entry.get("ts")) or 0) <= now]
+    failures = retro_failure_counts(entries)
+    rejected = retro_rejected(entries)
+    compare_rows = retro_routing_rows(ledger_entries_from(fleet_ledger_path()), cutoff, now)
+    proposal_snapshot_after = retro_snapshot_proposals(repo)
+    lesson_paths, guard_paths = retro_proposal_changes(proposal_snapshot, proposal_snapshot_after)
+    text = retro_report_text(entries, start, end, args.days, policy, notes,
+                             lesson_paths, guard_paths, compare_rows)
+    # Proposal links are relative to the report location and therefore work with --out too.
+    for path in lesson_paths + guard_paths:
+        target = urllib.parse.quote(os.path.relpath(os.path.join(repo, path), output_dir).replace(os.sep, "/"),
+                                    safe="/-_.~")
+        text = text.replace(f"`{retro_safe(path)}`", f"[{retro_safe(os.path.basename(path))}]({target})")
+    with open(report_path, "w", encoding="utf-8") as stream:
+        stream.write(text)
+    summary = {"paths": {"report": report_path, "ledger": fleet_ledger_path(),
+                         "routing_weights": routing_weights_path(policy)},
+               "counts": {"runs": len(entries), "groups": len(retro_groups(entries)),
+                          "failures": sum(retro_is_failure(entry) for entry in entries), "rejected": len(rejected),
+                          "lesson_proposals": len(lesson_paths), "guard_proposals": len(guard_paths),
+                          "routing_comparisons": len(compare_rows)},
+               "steps": {name: {"ok": result.get("ok", False), "skipped": result.get("skipped", False),
+                                "rate_limited": result.get("rate_limited", False)}
+                         for name, result in steps.items()},
+               "notes": notes}
+    print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
 
 
 def policy_day(policy, date=None):
@@ -7626,6 +7929,7 @@ def main():
     rp.add_argument("--out", help="write the JSON weights file to this path")
     rp = routing_sub.add_parser("compare", help="compare recorded advice with actual run outcomes")
     rp.add_argument("--days", type=int, default=30, help="include advice records from the last N days")
+    rp.add_argument("--fleet", action="store_true", help="read the merged fleet ledger")
 
     sp = sub.add_parser("watch", help="stream actionable events of a run (for Claude's Monitor tool)")
     sp.add_argument("run_id", nargs="+", help="one or more run ids; several ids are watched together")
@@ -7648,6 +7952,12 @@ def main():
     sp.add_argument("--date", help="daily report date (YYYY-MM-DD; policy timezone)")
     sp.add_argument("--html", help="write a self-contained daily HTML report")
     sp.add_argument("--json", action="store_true", help="daily report as JSON")
+
+    sp = sub.add_parser("retro", help="run the weekly fleet retrospective")
+    sp.add_argument("--days", type=int, default=7, help="include runs from the last N days")
+    sp.add_argument("--out", help="report output directory (default: knowledge.repo/retro)")
+    sp.add_argument("--repos", nargs="+", help="GitHub repositories to inspect during ledger ingest")
+    sp.add_argument("--no-pull", action="store_true", help="skip fleet ledger pull")
 
     sp = sub.add_parser("budget", help="daily executor budget usage")
     bp = sp.add_subparsers(dest="budget_cmd", required=True)
@@ -7833,6 +8143,12 @@ def main():
         cmd_runs(a, policy)
     elif a.cmd == "report":
         cmd_report(a, policy)
+    elif a.cmd == "retro":
+        try:
+            cmd_retro(a, policy)
+        except (BusError, ValueError, OSError, RuntimeError) as error:
+            print(json.dumps({"ok": False, "error": bus_redact(str(error))}, ensure_ascii=False), file=sys.stderr)
+            sys.exit(2)
     elif a.cmd == "stop":
         cmd_stop(a, policy)
     elif a.cmd == "bus":
