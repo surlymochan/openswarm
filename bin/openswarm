@@ -5354,44 +5354,54 @@ def gh_pr_number(pr):
         return None
 
 
-def gh_search_items(run_id, repo, qualifier):
-    query = f"repo:{repo} is:pr {qualifier} {run_id}"
-    endpoint = "search/issues?" + urllib.parse.urlencode({"q": query})
-    items = []
-    for item in gh_ingest_pages(run_id, repo, endpoint):
-        if isinstance(item, dict) and item.get("pull_request") and gh_pr_number(item):
-            items.append(item)
-    return items
+def gh_repo_pull_requests(run_id, repo, threshold=0):
+    """List recent PRs once and stop paging after the --since update window."""
+    rows, page = [], 1
+    while True:
+        query = urllib.parse.urlencode({"state": "all", "sort": "updated", "direction": "desc",
+                                        "per_page": 100, "page": page})
+        endpoint = f"repos/{repo}/pulls?{query}"
+        result = gh_ingest_api(run_id, repo, endpoint)
+        if isinstance(result, dict) and isinstance(result.get("items"), list):
+            result = result["items"]
+        if not isinstance(result, list):
+            return rows
+        reached_threshold = False
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+            updated = to_epoch(item.get("updated_at"))
+            if updated is not None and updated < threshold:
+                reached_threshold = True
+                continue
+            rows.append(item)
+        if reached_threshold or len(result) < 100:
+            return rows
+        page += 1
 
 
-def linked_pr_for_run(entry, repo):
+def linked_pr_for_run(entry, repo, pull_requests=None, threshold=0):
     run_id = str(entry.get("run_id") or entry.get("id") or "")
-    branch = entry.get("branch")
-    commit = entry.get("commit")
-    candidates = []
-    if isinstance(branch, str) and branch:
-        owner = repo.split("/", 1)[0]
-        head = urllib.parse.urlencode({"state": "all", "head": f"{owner}:{branch}"})
-        endpoint = f"repos/{repo}/pulls?{head}"
-        candidates.extend(gh_ingest_pages(run_id, repo, endpoint, allow_unlinked=True))
-    if isinstance(commit, str) and BUS_SHA_RE.fullmatch(commit):
-        endpoint = f"repos/{repo}/commits/{commit}/pulls"
-        candidates.extend(gh_ingest_pages(run_id, repo, endpoint, allow_unlinked=True))
-    candidates = [item for item in candidates if gh_pr_number(item)]
-    if candidates:
-        return candidates[0]
-
     if not run_id:
         return None
-    for item in gh_search_items(run_id, repo, "in:body"):
-        if run_id.casefold() in str(item.get("body") or "").casefold():
-            return item
-    for item in gh_search_items(run_id, repo, "in:comments"):
-        number = gh_pr_number(item)
-        comments = gh_ingest_pages(run_id, repo, f"repos/{repo}/issues/{number}/comments")
-        if any(run_id.casefold() in str(comment.get("body") or "").casefold()
-               for comment in comments if isinstance(comment, dict)):
-            return item
+    pulls = (gh_repo_pull_requests("__repo_pr_list__", repo, threshold)
+             if pull_requests is None else pull_requests)
+    branch = entry.get("branch")
+    if isinstance(branch, str):
+        branch = branch.removeprefix("refs/heads/")
+    commit = entry.get("commit")
+    if isinstance(commit, str) and not BUS_SHA_RE.fullmatch(commit):
+        commit = None
+    for matcher in (
+            lambda pr: run_id.casefold() in str(pr.get("body") or "").casefold(),
+            lambda pr: isinstance(branch, str) and bool(branch) and isinstance(pr.get("head"), dict)
+            and (pr["head"].get("ref") == branch or pr["head"].get("label") == f"{repo.split('/', 1)[0]}:{branch}"),
+            lambda pr: isinstance(commit, str) and isinstance(pr.get("head"), dict)
+            and str(pr["head"].get("sha") or "").casefold() == commit.casefold(),
+    ):
+        for item in pulls:
+            if isinstance(item, dict) and gh_pr_number(item) and matcher(item):
+                return item
     return None
 
 
@@ -5460,12 +5470,12 @@ def gh_has_defect_after_merge(run_id, repo, pr_number, merged_at):
     return False
 
 
-def ingest_ledger_entry(entry, repos):
+def ingest_ledger_entry(entry, repos, pull_requests=None, threshold=0):
     run_id = str(entry.get("run_id") or entry.get("id") or "")
     if not run_id:
         return False
     for repo in ledger_repo_candidates(entry, repos):
-        linked = linked_pr_for_run(entry, repo)
+        linked = linked_pr_for_run(entry, repo, (pull_requests or {}).get(repo), threshold)
         if not linked:
             continue
         number = gh_pr_number(linked)
@@ -5485,6 +5495,56 @@ def ingest_ledger_entry(entry, repos):
     return False
 
 
+def ledger_ingest_is_filled(entry):
+    return (isinstance(entry.get("pr"), dict) and isinstance(entry.get("review_findings"), dict)
+            and isinstance(entry.get("merged"), bool) and "defect_within_7d" in entry)
+
+
+def ledger_ingest_write(path, lines):
+    mode = os.stat(path).st_mode & 0o777
+    fd, temporary = tempfile.mkstemp(prefix=os.path.basename(path) + ".tmp", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), mode)
+            stream.writelines(lines)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def gh_ingest_is_rate_limited(error):
+    detail = str(error)
+    return (bool(re.search(r"\bHTTP\s+429\b", detail, re.I))
+            or bool(re.search(r"\bHTTP\s+403\b", detail, re.I)
+                    and re.search(r"rate.?limit|secondary rate", detail, re.I)))
+
+
+def gh_ingest_rate_limit_reset():
+    try:
+        response = gh_transport("rate_limit")
+    except BusError:
+        return "unknown (gh api rate_limit did not report a reset time)"
+    resources = response.get("resources", {}) if isinstance(response, dict) else {}
+    values = [item for item in resources.values() if isinstance(item, dict)] if isinstance(resources, dict) else []
+    exhausted = [item for item in values if item.get("remaining") == 0 and item.get("reset")]
+    core = resources.get("core") if isinstance(resources, dict) else None
+    if isinstance(core, dict) and core.get("reset") and core.get("remaining") == 0:
+        candidates = [core]
+    else:
+        candidates = exhausted or ([core] if isinstance(core, dict) and core.get("reset")
+                                   else [item for item in values if item.get("reset")])
+    if not candidates:
+        return "unknown (gh api rate_limit did not report a reset time)"
+    reset = min((item.get("reset") for item in candidates if isinstance(item.get("reset"), (int, float))),
+                default=None)
+    if reset is None:
+        return "unknown (gh api rate_limit did not report a reset time)"
+    return dt.datetime.fromtimestamp(reset, dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
 def cmd_ledger_ingest(args):
     if not math.isfinite(args.since) or args.since < 0:
         raise ValueError("--since must be a finite non-negative number")
@@ -5497,44 +5557,60 @@ def cmd_ledger_ingest(args):
         raise ValueError("fleet ledger not found; run fleet ledger pull first")
     threshold = NOW() - args.since * 86400
     lock_path = path + ".lock"
-    updated = linked_count = unlinked_count = 0
+    updated = linked_count = unlinked_count = completed = 0
     with open(lock_path, "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         with open(path, encoding="utf-8") as stream:
             original_lines = stream.readlines()
         lines = []
-        for raw in original_lines:
+        pending = []
+        filled_indices = set()
+        for index, raw in enumerate(original_lines):
             try:
                 entry = json.loads(raw)
             except (ValueError, UnicodeError):
-                lines.append(raw)
                 continue
             if not isinstance(entry, dict) or (to_epoch(entry.get("ts")) or 0) < threshold:
-                lines.append(raw)
                 continue
-            before = json.dumps(entry, ensure_ascii=False, sort_keys=True)
-            linked = ingest_ledger_entry(entry, repos)
-            linked_count += int(linked)
-            unlinked_count += int(not linked)
-            after = json.dumps(entry, ensure_ascii=False, sort_keys=True)
-            if after != before:
-                updated += 1
-                lines.append(json.dumps(entry, ensure_ascii=False) + "\n")
-            else:
-                lines.append(raw)
+            if ledger_ingest_is_filled(entry) and not args.refresh:
+                linked_count += 1
+                filled_indices.add(index)
+                continue
+            candidates = ledger_repo_candidates(entry, repos)
+            pending.append((index, raw, entry, candidates))
+
+        pull_requests = {}
+        try:
+            for repo in dict.fromkeys(repo for _, _, _, candidates in pending for repo in candidates):
+                pull_requests[repo] = gh_repo_pull_requests("__repo_pr_list__", repo, threshold)
+            pending_by_index = {index: (raw, entry, candidates) for index, raw, entry, candidates in pending}
+            for index, raw in enumerate(original_lines):
+                if index not in pending_by_index:
+                    lines.append(raw)
+                    completed += int(index in filled_indices)
+                    continue
+                _, entry, candidates = pending_by_index[index]
+                before = json.dumps(entry, ensure_ascii=False, sort_keys=True)
+                linked = ingest_ledger_entry(entry, candidates, pull_requests, threshold)
+                linked_count += int(linked)
+                unlinked_count += int(not linked)
+                completed += 1
+                after = json.dumps(entry, ensure_ascii=False, sort_keys=True)
+                if after != before:
+                    updated += 1
+                    lines.append(json.dumps(entry, ensure_ascii=False) + "\n")
+                else:
+                    lines.append(raw)
+        except BusError as error:
+            if gh_ingest_is_rate_limited(error):
+                if updated:
+                    ledger_ingest_write(path, lines + original_lines[len(lines):])
+                reset = gh_ingest_rate_limit_reset()
+                print(f"ledger ingest stopped by GitHub rate limit after {completed} runs; resets at {reset}. "
+                      f"Progress saved to {path}; rerun the command to continue.", file=sys.stderr)
+            raise
         if updated:
-            mode = os.stat(path).st_mode & 0o777
-            fd, temporary = tempfile.mkstemp(prefix=os.path.basename(path) + ".tmp", dir=os.path.dirname(path))
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                    os.fchmod(stream.fileno(), mode)
-                    stream.writelines(lines)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temporary, path)
-            finally:
-                if os.path.exists(temporary):
-                    os.unlink(temporary)
+            ledger_ingest_write(path, lines)
     print(f"ingested {linked_count} PR-linked runs; {unlinked_count} unlinked; "
           f"updated {updated} ledger entries in {path}")
 
@@ -7010,6 +7086,7 @@ def main():
     lp.add_argument("--repo", action="append", help="GitHub repository owner/name; repeat for multiple repositories")
     lp.add_argument("--since", type=float, default=30,
                     help="only inspect runs from the last DAYS (default: 30)")
+    lp.add_argument("--refresh", action="store_true", help="re-ingest records that already have GitHub data")
 
     a = ap.parse_args()
     policy = load_policy()
