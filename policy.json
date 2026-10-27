@@ -68,9 +68,7 @@
       "audit"
     ],
     "default_order": [
-      "codex",
-      "ocgo",
-      "deepseek"
+      "codex"
     ],
     "large_context_tokens": 220000,
     "min_samples": 8,

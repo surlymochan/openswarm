@@ -1,0 +1,50 @@
+usage: openswarm run [-h] [--type TYPE] [--difficulty DIFFICULTY]
+                     [--context-tokens CONTEXT_TOKENS]
+                     [--backend {codex,ocgo,deepseek,cursor,agy,gemini,pi,github-issue}]
+                     [--model MODEL] [--effort EFFORT] [--card-type CARD_TYPE]
+                     [--rework-of REWORK_OF] [--paths PATHS [PATHS ...]]
+                     [--prompt PROMPT] [--task-file TASK_FILE] [--title TITLE]
+                     [--cwd CWD] [--base BASE] [--no-worktree]
+                     [--verify-baseline] [--verify VERIFY] [--keep-worktree]
+                     [--no-fallback] [--budget-minutes BUDGET_MINUTES]
+                     [--detach] [--dry-run] [--executor EXECUTOR]
+
+options:
+  -h, --help            show this help message and exit
+  --type TYPE           impl|refactor|debug|test|docs|mechanical|review|resear
+                        ch|migration|format|rename
+  --difficulty DIFFICULTY
+                        1 (trivial) .. 5 (hardest)
+  --context-tokens CONTEXT_TOKENS
+                        approx context the executor must read
+  --backend {codex,ocgo,deepseek,cursor,agy,gemini,pi,github-issue}
+                        force a backend. cursor, agy (alias gemini) and pi are
+                        opt-in and are not chosen unless named here or listed
+                        in routing
+  --model MODEL
+  --effort EFFORT
+  --card-type CARD_TYPE
+                        optional task card type from knowledge/card-types.yaml
+  --rework-of REWORK_OF
+                        run id this task is reworking
+  --paths PATHS [PATHS ...]
+                        path hints for matching applicable lessons
+  --prompt PROMPT
+  --task-file TASK_FILE
+  --title TITLE
+  --cwd CWD
+  --base BASE           base commit for an isolated worktree; defaults to HEAD
+  --no-worktree
+  --verify-baseline     when verify fails, rerun it on the base commit and
+                        pass if no failures are new
+  --verify VERIFY       acceptance command run on the host in the worktree
+                        after the executor finishes; its exit code overrides a
+                        sandbox-limited partial/done
+  --keep-worktree
+  --no-fallback
+  --budget-minutes BUDGET_MINUTES
+                        hard wall-clock budget; executor is killed when
+                        exceeded
+  --detach              run in background; monitor with `openswarm watch <id>`
+  --dry-run
+  --executor EXECUTOR   optional GitHub bus executor routing label

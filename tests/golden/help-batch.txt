@@ -1,0 +1,32 @@
+usage: openswarm batch [-h] [--repo REPO] [--cards CARDS] [--hosts HOSTS]
+                       [--per-host PER_HOST]
+                       [--backend {codex,ocgo,deepseek,cursor,agy,pi}]
+                       [--model MODEL] [--effort EFFORT] [--verify VERIFY]
+                       [--budget-minutes BUDGET_MINUTES] [--base BASE]
+                       [--detach] [--card-type CARD_TYPE]
+                       [--rework-of REWORK_OF] [--paths PATHS [PATHS ...]]
+                       [{status}] [id]
+
+positional arguments:
+  {status}
+  id
+
+options:
+  -h, --help            show this help message and exit
+  --repo REPO
+  --cards CARDS
+  --hosts HOSTS
+  --per-host PER_HOST
+  --backend {codex,ocgo,deepseek,cursor,agy,pi}
+  --model MODEL
+  --effort EFFORT
+  --verify VERIFY
+  --budget-minutes BUDGET_MINUTES
+  --base BASE
+  --detach
+  --card-type CARD_TYPE
+                        optional task card type from knowledge/card-types.yaml
+  --rework-of REWORK_OF
+                        run id this batch reworks
+  --paths PATHS [PATHS ...]
+                        path hints for matching applicable lessons

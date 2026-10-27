@@ -100,6 +100,7 @@ class RoutingWeightsTests(unittest.TestCase):
     def test_run_records_advice_without_changing_live_route(self):
         policy = copy.deepcopy(xs.load_policy())
         policy["routing"]["min_samples"] = 2
+        policy["routing"]["default_order"] = ["codex", "ocgo"]
         profile = {"type": "impl", "difficulty": 3}
         state = copy.deepcopy(BASE_STATE)
         expected = xs.route(profile, state, policy)

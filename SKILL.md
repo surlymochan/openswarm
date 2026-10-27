@@ -6,7 +6,7 @@ description: Claude plans, executors write the code — Codex, Pi (e.g. MiniMax)
 # openswarm
 
 **Division of labour:** Claude decomposes work, writes acceptance criteria, reviews, and integrates.
-Executors write code: **Codex** (main), **OpenCode Go** (cheap/mechanical, non-GPT second opinions, overflow, >272k context), and **DeepSeek** (metered last resort). **Pi** (any provider it is configured for, such as MiniMax) and **Cursor Agent** are opt-in, as one-shot backends or resident lanes.
+Executors write code: **Codex** is the only backend in the default automatic routing order. **OpenCode Go** and **DeepSeek** are opt-in through `--backend` or by adding them to `routing.default_order`; when enabled, OpenCode Go handles cheap/mechanical work, non-GPT second opinions, overflow and large context, while DeepSeek is metered. **Pi** (any provider it is configured for, such as MiniMax) and **Cursor Agent** are opt-in, as one-shot backends or resident lanes.
 Claude Pro is the tightest quota here, so keep Claude's own tokens for planning and review and send the typing to executors.
 
 CLI: `~/.claude/skills/openswarm/bin/openswarm` (alias it as `XS` in your commands). Runtime data lives in `~/.claude/openswarm/`.
@@ -28,7 +28,7 @@ For each unit of work, write a self-contained prompt with goal, files or areas, 
 
 | field | values | guidance |
 |---|---|---|
-| `--type` | impl, refactor, debug, test, docs, mechanical, migration, format, rename, review, research | review/audit routes to a non-GPT family for an independent opinion |
+| `--type` | impl, refactor, debug, test, docs, mechanical, migration, format, rename, review, research | when enabled, review/audit prefers a non-GPT family for an independent opinion |
 | `--difficulty` | 1–5 | 1 rename or format · 2 small, well-specified · 3 normal feature · 4 cross-module or tricky · 5 hardest debugging or design-heavy |
 | `--context-tokens` | approx | >220k makes the router prefer 1M-context backends |
 | `--budget-minutes` | wall clock | **hard stop**; the executor's whole process tree is killed when it runs out. Default 40 |
@@ -219,19 +219,20 @@ In a team, make teammates **thin openswarm dispatchers**: each teammate owns a s
 
 ## 7. Routing rules (what `route` does)
 
-- Order by type: review/audit → ocgo, then codex, then deepseek. Mechanical work at difficulty ≤2 → ocgo first. Everything else → codex, then ocgo, then deepseek.
+- Automatic candidates come from `routing.default_order`, which defaults to `codex`. Add `ocgo` or `deepseek` there to enable automatic selection; `--backend ocgo` and `--backend deepseek` force them for an individual run.
+- Among enabled candidates, review/audit prefers ocgo, then codex, then deepseek. Mechanical work at difficulty ≤2 prefers ocgo first. Other profiles follow the configured order.
 - Difficulty sets tier and effort: 1 fast/low · 2 fast/medium · 3 balanced/medium · 4 balanced/high · 5 deep/high.
   - Codex tiers come from the live model descriptions: frontier = deep, workhorse = balanced, fast/affordable = fast. Legacy models are deprioritised.
   - OpenCode Go tiers are price terciles; within a tier the newest model wins.
 - Quota adjustments:
   - Any window ≥95%: that backend is skipped.
-  - ≥85%: difficulty ≤3 spills to other backends; harder tasks stay with effort −1.
+  - ≥85%: difficulty ≤3 spills to other enabled backends; harder tasks stay with effort −1.
   - Burn pace >1.25× of an even rate: effort −1.
   - Window resets within 24h with <60% used: effort +1, to use the quota before it expires.
 - Codex `ultra` effort is never used. It self-delegates and blows budgets.
 - Visible 429s from Pi, Codex and Cursor retry in the same session and open a 30-minute breaker; after retries, the run is partial if it has work or failed otherwise. Other fallback-eligible rate limits and unavailable models can move to the next backend in the same worktree. Fallback is disabled when you force `--backend`.
 - OpenCode Go: plan auto-detected (Go unless spend proves Plus). Per-model caps come from the docs table in `policy.json` (5h = 20%, 7d = 50%, 30d = 100% of the monthly cap). It only sees `opencode run` spend, not OpenCode Go traffic that goes through other clients or proxies.
-- DeepSeek is used only when its balance is above the floor (¥10).
+- DeepSeek is used only when enabled for routing or explicitly forced, and its balance is above the floor (¥10).
 - `cursor` is opt-in. Routing never selects it unless `routing.default_order` lists `cursor`, or the run passes `--backend cursor`. The model is `--model` or `cursor.default_model` (`grok-4.7-high`). The run's `result.json` and ledger entry record `usage` (`inputTokens`, `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`) and wall-clock `seconds`. Quota for Cursor is unknown, so it does not affect the other backends' windows.
 - `pi` is opt-in the same way (`--backend pi`, or list `pi` in `routing.default_order`). It runs `pi -p --mode json --tools read,bash,edit,write,grep,find,ls` in the worktree; `OPENSWARM_PI_BIN` may name a wrapper with the same flags. `--model` or `pi.default_model` picks the model, otherwise Pi's own default. `usage` (`input`, `output`, `cacheRead`, `cacheWrite`) is summed from Pi's `message_end` events. Quota is unknown.
 
