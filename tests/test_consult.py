@@ -41,7 +41,10 @@ if os.environ.get("FAKE_CONSULT_SLEEP_SECONDS"):
     time.sleep(float(os.environ["FAKE_CONSULT_SLEEP_SECONDS"]))
 body = {"opinion": "Keep the current contract", "confidence": "high",
         "evidence": ["README.md:10"], "risks": []}
-if os.environ.get("FAKE_CONSULT_MALFORMED_BACKEND") == backend:
+repair_requested = any("Return only JSON" in value for value in argv)
+if os.environ.get("FAKE_CONSULT_REPAIR_BACKEND") == backend and not repair_requested:
+    body = {"opinion": 4, "confidence": "certain", "evidence": "README.md", "risks": []}
+elif os.environ.get("FAKE_CONSULT_MALFORMED_BACKEND") == backend:
     body = {"opinion": 4, "confidence": "certain", "evidence": "README.md", "risks": []}
 text = json.dumps(body)
 if backend == "codex":
@@ -49,7 +52,7 @@ if backend == "codex":
     with open(output, "w") as stream:
         stream.write(text)
 elif backend == "agy":
-    print(json.dumps({"type": "result", "status": "SUCCESS", "response": text}))
+    print(json.dumps({"response": text, "model": "agy-test"}))
 else:
     print(json.dumps({"type": "message_end", "message": {"role": "assistant",
         "content": [{"type": "text", "text": text}]}}))
@@ -78,11 +81,13 @@ class ConsultTests(unittest.TestCase):
         }
         self.policy = xs.deep_merge(POLICY, {"concurrency": {"codex": 2, "agy": 2, "pi": 2, "total": 8}})
         self.env_keys = ("FAKE_CONSULT_LOG_DIR", "FAKE_CONSULT_BARRIER", "FAKE_CONSULT_TIMEOUT_BACKEND",
-                         "FAKE_CONSULT_MALFORMED_BACKEND", "FAKE_CONSULT_SLEEP_SECONDS")
+                         "FAKE_CONSULT_MALFORMED_BACKEND", "FAKE_CONSULT_REPAIR_BACKEND",
+                         "FAKE_CONSULT_SLEEP_SECONDS")
         self.old_env = {key: os.environ.get(key) for key in self.env_keys}
         os.environ["FAKE_CONSULT_LOG_DIR"] = self.logs
         os.environ.pop("FAKE_CONSULT_TIMEOUT_BACKEND", None)
         os.environ.pop("FAKE_CONSULT_MALFORMED_BACKEND", None)
+        os.environ.pop("FAKE_CONSULT_REPAIR_BACKEND", None)
         os.environ.pop("FAKE_CONSULT_SLEEP_SECONDS", None)
         os.environ.pop("FAKE_CONSULT_BARRIER", None)
         self.cwd_patch = mock.patch("openswarm_consult.os.getcwd", return_value=self.repo)
@@ -135,6 +140,9 @@ class ConsultTests(unittest.TestCase):
         self.assertEqual(codex[codex.index("-s") + 1], "read-only")
         self.assertEqual(codex[codex.index("-C") + 1], self.repo)
         self.assertEqual(agy[agy.index("--mode") + 1], "plan")
+        self.assertEqual(agy[agy.index("--output-format") + 1], "json")
+        self.assertIn("--json-schema", agy)
+        self.assertTrue(os.path.isfile(agy[agy.index("--json-schema") + 1]))
         self.assertNotIn("--dangerously-skip-permissions", agy)
         self.assertEqual(pi[pi.index("--tools") + 1], consult.READ_ONLY_PI_TOOLS)
         self.assertNotIn("bash", pi[pi.index("--tools") + 1])
@@ -209,6 +217,34 @@ class ConsultTests(unittest.TestCase):
         for value in ("nan", "inf", "0"):
             with self.assertRaises(argparse.ArgumentTypeError):
                 consult.positive_minutes(value)
+
+    def test_parser_extracts_envelope_fenced_and_prose_wrapped_answers(self):
+        answer = {"opinion": "Keep it", "confidence": "high", "evidence": ["README.md:10"], "risks": []}
+        encoded = json.dumps(answer)
+        cases = (
+            json.dumps({"response": encoded, "model": "agy-test"}),
+            f"```json\n{encoded}\n```",
+            f"Analysis first: {{\"note\": true}}\n{encoded}\nDone.",
+        )
+        for raw in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(consult.parse_answer(raw), (answer, None))
+        self.assertIn("Do not invoke tools or commands", consult.make_prompt("question", []))
+
+    def test_agy_permission_denial_is_not_treated_as_a_format_retry(self):
+        raw = json.dumps({"response": "", "denied_actions": [{"action": "command"}]})
+        self.assertIn("tool action was denied", consult._agy_execution_error(
+            raw, "agy: no output produced; command permission denied"))
+
+    def test_invalid_agy_answer_retries_and_preserves_both_raw_responses(self):
+        os.environ["FAKE_CONSULT_REPAIR_BACKEND"] = "agy"
+        code, result = self.run_consult(["agy", "pi"])
+        self.assertEqual(code, 0)
+        agy_answer, = [row for row in result["answers"] if row["backend"] == "agy"]
+        self.assertTrue(agy_answer["valid"])
+        self.assertIn("attempt 1", agy_answer["raw"])
+        self.assertIn("attempt 2", agy_answer["raw"])
+        self.assertIn("opinion", agy_answer["raw"])
 
     def test_context_file_is_included_in_the_shared_prompt(self):
         path = os.path.join(self.tmp, "context.md")
