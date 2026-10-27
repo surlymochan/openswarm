@@ -93,6 +93,19 @@ class FakeFleetFixture:
 
 
 class BatchTests(FakeFleetFixture, unittest.TestCase):
+    def test_batch_launch_passes_path_hints_to_remote_run(self):
+        card = self.cards / "one.md"
+        card.write_text("Update src/widget.py")
+        spec = {"hosts": {"b1": self.hosts["b1"]}, "repos": {"b1": str(self.repo)},
+                "base": self.base, "paths": ["src/widget.py"], "card_type": "fix"}
+        row = {"host": "b1", "path": str(card), "run_id": "run1"}
+        with mock.patch.object(xs, "host_python", side_effect=[b"remote-card.md", b""]), \
+                mock.patch.object(xs, "host_require", side_effect=lambda host, output, context: output), \
+                mock.patch.object(xs, "host_json", return_value={"id": "run1"}) as host_json:
+            self.assertEqual(xs.batch_launch(spec, row), "run1")
+        remote_args = host_json.call_args.args[1]
+        self.assertEqual(remote_args[remote_args.index("--paths") + 1:], ["src/widget.py"])
+
     def test_budget_refuses_batch_before_launch(self):
         (self.cards / "one.md").write_text("one")
         policy = xs.deep_merge(xs.load_policy(), {"budget": {"daily_executor_minutes": 0}})

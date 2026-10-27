@@ -18,4 +18,5 @@ def load():
     spec = importlib.util.spec_from_loader("openswarm", loader)
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
+    mod.DEFAULT_KNOWLEDGE_REPO = os.path.join(_home, "agent-knowledge")
     return mod

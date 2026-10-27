@@ -165,6 +165,19 @@ Codex events keep their existing behavior. `--quiet` keeps only `DONE`, `EXITED`
 summary (including lane worktrees), and the last completed message truncated to 200 characters. The watch window
 still expires with `--quiet`; re-arm with `--from-end` if needed.
 
+## Executor lessons
+
+Dispatches read `lessons/*.yaml` from `policy.knowledge.repo` (default `~/work/agent-knowledge`). Matching L2
+lessons and L3 reminders are added to the executor prompt, with at most 12 entries and 3,000 characters. A missing
+repository adds no block. Use `--paths src/file.py` on `run`, `lane assign`, `batch`, or `bus-worker` to provide
+path hints alongside paths named in the task card. Preview a selection with:
+
+```bash
+openswarm lessons preview --card-type fix --backend codex --paths src/file.py
+```
+
+Injected lesson ids are recorded in the run ledger's `lessons_injected` field.
+
 ## Resident lanes
 
 Use lanes when you want a persistent Codex app-server, Cursor Agent ACP, or Pi RPC process that accepts one task at a time and can be
@@ -354,7 +367,7 @@ Cursor CLI is a fourth executor, opt-in only (`--backend cursor`).
 
 | Path | What |
 | --- | --- |
-| `bin/openswarm` | The CLI: `probe`, `status`, `route`, `run`, `lane`, `fleet`, `batch`, `verify-remote`, `watch`, `runs`, `report`, `stop`, `ingest-claude`, `ledger` |
+| `bin/openswarm` | The CLI: `probe`, `status`, `route`, `run`, `lessons`, `lane`, `fleet`, `batch`, `verify-remote`, `watch`, `runs`, `report`, `stop`, `ingest-claude`, `ledger` |
 | `SKILL.md` | Claude Code skill: the planner's operating manual |
 | `policy.json` | Defaults: thresholds, difficulty map, model caps, local data sources |
 | `backends/*.json` | One manifest per executor: invocation, quota source, data boundary |
