@@ -247,8 +247,145 @@ Override anything in `~/.claude/openswarm/policy.local.json`, deep-merged over `
 - Do not put secrets in task prompts. Prompts and diffs go to the executor's model provider. Each backend's data boundary is listed in `backends/*.json`.
 - `$XS stop <id>` kills the executor's process tree. The runner still finalizes, so partial work is committed and can be inspected.
 
+## 9. Command reference
+
+Grouped by what the command does. `openswarm <command> --help` lists every flag.
+
+### Execute
+
+| Command | Purpose | Example |
+|---|---|---|
+| `route` | Pick backend, model, and effort for a task profile without running anything. | `$XS route --type impl --difficulty 3 --card-type fix` |
+| `run` | Route, execute in an isolated worktree, verify on the host, record the ledger entry. | `$XS run --cwd ~/code/myrepo --type impl --difficulty 2 --budget-minutes 15 --verify 'pytest -q' --task-file /tmp/task.md` |
+| `run --detach` | Run in the background and print the run id to watch. | `$XS run --detach --cwd ~/code/myrepo --verify 'pytest -q' --task-file /tmp/task.md` |
+| `run --rework-of` | Resume an earlier run's task as a rework, linked in the ledger as `rework_of`. | `$XS run --rework-of <run-id> --cwd ~/code/myrepo --task-file /tmp/task.md` |
+| `stop` | Kill a running executor; partial work stays on its branch. | `$XS stop <run-id>` |
+| `lane up` | Start the configured lane supervisors. | `$XS lane up C1 K1` |
+| `lane assign` | Give one task to an idle lane; returns the run id. | `$XS lane assign C1 --task-file /tmp/task.md --title "Parser fix" --verify 'pytest -q' --budget-minutes 30` |
+| `lane steer` | Send a correction to the lane's active turn. | `$XS lane steer C1 --text "Add a regression test before finishing"` |
+| `lane abort` | Abort the lane's active turn. | `$XS lane abort C1` |
+| `lane status` | Show the configured lane state. | `$XS lane status` |
+| `lane down` | Stop lane turns, children, and supervisors. | `$XS lane down C1 K1` |
+| `lane launchd-plist` | Print an uninstalled LaunchAgent plist for a lane. | `$XS lane launchd-plist C1` |
+| `lane systemd-unit` | Print an uninstalled systemd unit for a lane. | `$XS lane systemd-unit K1` |
+| `batch` | Queue task cards across fleet hosts and collect their branches. | `$XS batch --repo project --cards ./cards --hosts worker,sandbox --per-host 1 --backend pi --budget-minutes 20 --detach` |
+| `batch status` | Show the state of one batch. | `$XS batch status <batch-id>` |
+| `bus init` | Create the bus labels, issue template, and protocol README. | `$XS bus init acme/openswarm-bus` |
+| `bus status` | Show open bus issues with their executor and age. | `$XS bus status --json` |
+| `bus-worker` | Run the reference bus executor; `--once` claims at most one queued issue. | `$XS bus-worker --bus acme/openswarm-bus --name runner-1 --backend codex --once` |
+| `verify-remote` | Verify a fleet run's commit in a temporary worktree on another host. | `$XS verify-remote --from worker --run <run-id> --on local --verify 'pytest -q'` |
+
+### Observe
+
+| Command | Purpose | Example |
+|---|---|---|
+| `watch` | Stream one line per actionable event for one or more runs. | `$XS watch <run-id> --label parser-fix` |
+| `watch --quiet` | Keep only terminal, risk, stall, error, budget, attempt, and heartbeat events. | `$XS watch <run-id> --quiet` |
+| `watch --from-end` | Resume a watch whose window expired; events already written are skipped. | `$XS watch <run-id> --from-end` |
+| `status` | Show plans, quota windows, models, breakers, and recommended concurrency. | `$XS status --refresh` |
+| `probe` | Discover models, plans, and quotas into `$OPENSWARM_HOME/state.json`. | `$XS probe --quiet` |
+| `runs` | Snapshot recent or active runs. | `$XS runs --active --json` |
+| `report` | One-screen check-in for scheduled updates: quotas, active runs, recently finished. | `$XS report --since-minutes 60` |
+| `budget status` | Show today's executor budget usage. | `$XS budget status --json` |
+| `ingest-claude` | Record Claude plan usage from the statusline hook or from flags. | `$XS ingest-claude --five-hour 80 --seven-day 40` |
+| `fleet status` | Show reachability, paused hosts, lanes, and active runs. | `$XS fleet status --json` |
+| `fleet exec` | Run an openswarm command on another host; stdout and the exit code are forwarded. | `$XS fleet exec worker -- lane status` |
+| `fleet ledger pull` | Merge the host ledgers into one fleet ledger file. | `$XS fleet ledger pull --hosts worker,sandbox` |
+
+### Learn
+
+| Command | Purpose | Example |
+|---|---|---|
+| `ledger` | List recent ledger records. | `$XS ledger -n 20 --json` |
+| `ledger --fleet` | List the merged fleet ledger. | `$XS ledger --fleet -n 50` |
+| `ledger ingest` | Link GitHub PR reviews and defect results into the fleet ledger. | `$XS ledger ingest --repo acme/project --since 30` |
+| `ledger accept` | Record a manual accept or reject decision for a finished run. | `$XS ledger accept <run-id> --reason "Verified on host"` |
+| `ledger backfill-pass` | Compute `exec_pass` for older ledger records. | `$XS ledger backfill-pass --fleet --recompute` |
+| `lessons preview` | Print the lesson and pattern block a dispatch would inject. | `$XS lessons preview --card-type fix --backend codex --paths src/file.py` |
+| `lessons propose` | Draft lessons from linked P0/P1 findings of recent runs. | `$XS lessons propose --fleet --since 30 --dry-run` |
+| `lessons escalate` | Draft L3 guard proposals for recurring lessons. | `$XS lessons escalate --dry-run` |
+| `patterns propose` | Draft patterns from compare winners and repeated peer-review findings. | `$XS patterns propose --since 30` |
+| `patterns retire-check` | Propose retirement when active patterns do not improve outcomes. | `$XS patterns retire-check` |
+| `routing weights` | Compute per-backend routing metrics and write the weights file. | `$XS routing weights --fleet` |
+| `routing compare` | Compare recorded routing advice with the actual run outcomes. | `$XS routing compare --days 30 --fleet` |
+| `retro` | Run the weekly retrospective: pull, ingest, backfill, weights, proposals, report. | `$XS retro --days 7 --repos acme/project` |
+| `regress run` | Run the regression card suite on a backend, a lane, or a routing mode. | `$XS regress run --backend codex --cards card-a,card-b --label nightly --parallel 2` |
+| `regress compare` | Compare two regression result files card by card. | `$XS regress compare before.json after.json` |
+
+A ledger record carries the outcome and what the next run learns from it: `exec_pass` and `exec_pass_reason`
+(change evidence plus host verification decide the pass, not the executor's own report), `accepted`,
+`accepted_reason`, `accepted_at`, `verify_rc`, `tokens`, `lessons_injected`, `patterns_injected`,
+`routing_advice`, `peer_review`, `rework_of`, `host`, and `lane`. After `ledger ingest` it also carries `pr`,
+`review_findings`, `merged`, and `defect_within_7d`.
+
+### Peer
+
+| Command | Purpose | Example |
+|---|---|---|
+| `consult` | Ask several executors the same question in read-only mode and compare the answers. | `$XS consult --question "Which parser change is safest?" --ask codex --ask pi --json` |
+| `review` | Review a finished run's branch with a read-only executor from another model family. | `$XS review <run-id> --by codex --json` |
+| `compare` | Run one card on two executor families and record the best-of-two comparison. | `$XS compare --task-file /tmp/task.md --title "Parser fix" --a codex --b pi --verify 'pytest -q'` |
+
+## 10. Learning loop
+
+The loop turns finished runs into better next runs. The curation commands write reviewable drafts; they never edit
+the lesson or pattern catalog.
+
+1. **Record.** Every run appends a ledger entry. Merge the host ledgers, link GitHub PR data, and record the
+   accept or reject decision.
+
+   ```bash
+   $XS fleet ledger pull --hosts worker,sandbox
+   $XS ledger ingest --repo acme/project --since 30
+   $XS ledger accept <run-id> --reason "Verified on host"
+   ```
+
+2. **Inject.** `run`, `lane assign`, `batch`, and `bus-worker` add matching L2 lessons and L3 reminders to the
+   executor prompt, plus up to three active patterns. Preview the block before dispatching.
+
+   ```bash
+   $XS lessons preview --card-type fix --backend codex --paths src/file.py
+   ```
+
+3. **Review.** Let a second executor look at the finished branch.
+
+   ```bash
+   $XS review <run-id> --by codex --json
+   $XS compare --task-file /tmp/task.md --title "Parser fix" --a codex --b pi
+   $XS consult --question "Is this retry safe?" --ask codex --ask pi
+   ```
+
+4. **Lessons.** Turn review findings into lesson, guard, and pattern drafts.
+
+   ```bash
+   $XS lessons propose --fleet --since 30
+   $XS lessons escalate --dry-run
+   $XS patterns propose --since 30
+   $XS patterns retire-check
+   ```
+
+5. **Weekly retro.** One command runs the loop over the last week and writes the report.
+
+   ```bash
+   $XS retro --days 7 --repos acme/project
+   $XS routing weights --fleet
+   $XS routing compare --days 30 --fleet
+   ```
+
+   Measure a fixed card suite the same way when an executor or a prompt changes.
+
+   ```bash
+   $XS regress run --backend codex --label nightly
+   $XS regress compare before.json after.json
+   ```
+
+Drafts land in `<knowledge.repo>/proposals/<date>/`, the retro report in `<knowledge.repo>/retro/<YYYY>-W<ww>.md`,
+and the regression results in `<knowledge.repo>/regression/results/`. Copy a reviewed lesson into
+`<knowledge.repo>/lessons/` and a reviewed pattern into `<knowledge.repo>/skills/` to make the next dispatch
+inject it.
+
 ## Files
 
-- `bin/openswarm`: CLI (probe, status, route, run, lane, fleet, batch, verify-remote, bus, bus-worker, watch, runs, report, stop, ingest-claude, ledger)
+- `bin/openswarm`: CLI (probe, status, route, run, lane, batch, bus, bus-worker, verify-remote, watch, runs, report, budget, stop, fleet, consult, review, compare, regress, routing, lessons, patterns, retro, ingest-claude, ledger)
 - `policy.json`: defaults · `backends/*.json`: harness manifests (x-agents style) · `templates/openswarm-workflow.js`: Workflow template · `tests/test_route.py`: routing scenarios
 - `$OPENSWARM_HOME/`: state, quota, ledger, breakers; `lanes.json`, `lanes/<name>/`; `fleet.json`, `batches/<id>/`, `remote-results/<id>.json`; `runs/<id>/` (task, events, result, patch), `worktrees/`
