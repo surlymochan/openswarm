@@ -121,7 +121,12 @@ class PiBackend(unittest.TestCase):
         self.assertIsNone(xs.pi_bin())
 
     def test_success_parses_result_and_records_usage(self):
-        code = self.dispatch()
+        knowledge = os.path.join(self.tmp, "knowledge")
+        os.makedirs(knowledge)
+        with open(os.path.join(knowledge, "card-types.yaml"), "w") as stream:
+            stream.write("card_types:\n  - feature\n")
+        policy = xs.deep_merge(POLICY, {"knowledge": {"repo": knowledge}})
+        code = self.dispatch(policy=policy, card_type="feature", rework_of="previous-run")
         self.assertEqual(code, 0)
         entry, result = self.last_result()
         self.assertEqual(result["status"], "done")
@@ -130,6 +135,20 @@ class PiBackend(unittest.TestCase):
         self.assertEqual(result["usage"], usage)
         self.assertEqual(result["result"]["files_changed"], ["add.py"])
         self.assertEqual(entry["usage"], usage)
+        self.assertEqual(entry["card_type"], "feature")
+        self.assertEqual(entry["rework_of"], "previous-run")
+        self.assertEqual(entry["run_id"], entry["id"])
+        self.assertEqual(entry["area"], ["add.py"])
+        self.assertEqual(entry["tokens"], {"input": 120, "output": 45, "total": 165})
+        for key in ("host", "lane", "backend", "model", "effort", "status", "error_class",
+                    "verify_rc", "attempts", "seconds", "branch", "commit", "pr",
+                    "review_findings", "merged", "defect_within_7d", "lessons_injected"):
+            self.assertIn(key, entry)
+        self.assertIsNone(entry["pr"])
+        self.assertIsNone(entry["review_findings"])
+        self.assertIsNone(entry["merged"])
+        self.assertIsNone(entry["defect_within_7d"])
+        self.assertEqual(entry["lessons_injected"], [])
         with open(self.log) as fh:
             argv = json.load(fh)
         self.assertEqual(argv[argv.index("--mode") + 1], "json")

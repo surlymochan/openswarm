@@ -120,6 +120,82 @@ def load_policy():
     return deep_merge(base, local)
 
 
+def configured_card_types(policy):
+    """Return the configured card types, or None when no list is available."""
+    repo = os.path.expanduser(str((policy.get("knowledge") or {}).get("repo") or "~/work/agent-knowledge"))
+    path = os.path.join(repo, "card-types.yaml")
+    try:
+        with open(path, encoding="utf-8") as stream:
+            lines = stream.read().splitlines()
+    except FileNotFoundError:
+        return None
+
+    def scalar(value):
+        value = value.split(" #", 1)[0].strip().rstrip(",")
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        return value.strip()
+
+    def list_value(value):
+        value = scalar(value)
+        if value.startswith(("name:", "id:", "type:")):
+            value = scalar(value.split(":", 1)[1])
+        return value
+
+    values, root_keys, section_indent, in_section, recognized = set(), set(), None, False, False
+    section_keys = {"card_types", "card-types", "types"}
+    for line in lines:
+        content = line.split(" #", 1)[0].rstrip()
+        if not content.strip() or content.lstrip().startswith("#"):
+            continue
+        indent = len(content) - len(content.lstrip())
+        stripped = content.strip()
+        if indent == 0 and stripped.startswith("-"):
+            recognized = True
+            value = list_value(stripped[1:])
+            if value:
+                values.add(value)
+            continue
+        match = re.match(r"^([A-Za-z0-9_-]+):(?:\s*(.*))?$", stripped)
+        if match:
+            key, rest = match.group(1), (match.group(2) or "").strip()
+            if indent == 0 and key in section_keys:
+                in_section, recognized, section_indent = True, True, indent
+                if rest.startswith("[") and rest.endswith("]"):
+                    values.update(v for v in (scalar(item) for item in rest[1:-1].split(",")) if v)
+                elif rest:
+                    value = scalar(rest)
+                    if value:
+                        values.add(value)
+                continue
+            if indent == 0:
+                root_keys.add(key)
+            if in_section and indent > (section_indent or 0):
+                # Mapping-form type definitions use their keys as the allowed values.
+                if not rest or rest.startswith("{"):
+                    values.add(key)
+                elif key in ("name", "id", "type"):
+                    value = scalar(rest)
+                    if value:
+                        values.add(value)
+                continue
+            if indent == 0:
+                in_section = False
+        if in_section and stripped.startswith("-"):
+            value = list_value(stripped[1:])
+            if value:
+                values.add(value)
+    return values if recognized else root_keys
+
+
+def validate_card_type(policy, card_type):
+    if card_type is None:
+        return
+    known = configured_card_types(policy)
+    if known is not None and card_type not in known:
+        raise ValueError(f"unknown card type: {card_type}")
+
+
 def source_enabled(policy, name):
     """Opt-in switches for reading other tools' local files (policy.local_sources.<name>)."""
     return bool((policy.get("local_sources") or {}).get(name, False))
@@ -627,6 +703,14 @@ def executor_seconds(entry):
         return [(a.get("backend") or entry.get("backend") or "unknown", max(0, a.get("seconds") or 0))
                 for a in attempts]
     return [(entry.get("backend") or "unknown", max(0, entry.get("seconds") or 0))]
+
+
+def changed_paths(repo, base, commit, fallback=None):
+    if repo and base and commit:
+        rc, names, _ = git(["diff", "--name-only", base, commit], repo)
+        if rc == 0:
+            return [path for path in names.splitlines() if path]
+    return list(fallback or [])
 
 
 def budget_status(policy, date=None, entries=None):
@@ -2237,6 +2321,9 @@ def new_run_id():
 
 
 def cmd_run(args, policy):
+    card_type = getattr(args, "card_type", None)
+    rework_of = getattr(args, "rework_of", None)
+    validate_card_type(policy, card_type)
     if args.run_id:  # detached child: task already stored
         rid = args.run_id
         rdir = f"{RUNS}/{rid}"
@@ -2270,7 +2357,8 @@ def cmd_run(args, policy):
                                                 "pr_url": None}, "run_dir": rdir}
             jsave(f"{rdir}/result.json", output)
             append_ledger({"id": rid, "ts": NOW(), "title": title, "status": "failed",
-                           "backend": "github-issue", "error_class": "bus_error", "summary": bus_redact(str(error))[:300]})
+                           "backend": "github-issue", "error_class": "bus_error", "summary": bus_redact(str(error))[:300],
+                           "card_type": card_type, "rework_of": rework_of})
             set_status(rdir, state="finished", status="failed", finished=NOW(), error_class="bus_error")
             print(json.dumps(output, indent=2, ensure_ascii=False), file=sys.stderr)
             raise SystemExit(2)
@@ -2280,7 +2368,8 @@ def cmd_run(args, policy):
     if not decision["ok"]:
         out = {"id": rid, "status": "unroutable", "decision": decision}
         set_status(rdir, state="unroutable")
-        append_ledger({"id": rid, "ts": NOW(), "title": title, "status": "unroutable", "decision": decision})
+        append_ledger({"id": rid, "ts": NOW(), "title": title, "status": "unroutable", "decision": decision,
+                       "card_type": card_type, "rework_of": rework_of})
         jsave(f"{rdir}/result.json", out)
         print(json.dumps(out, indent=2, ensure_ascii=False))
         sys.exit(2)
@@ -2300,6 +2389,10 @@ def cmd_run(args, policy):
         child = [sys.executable, os.path.realpath(__file__), "run", "--run-id", rid,
                  "--cwd", os.path.abspath(args.cwd), "--title", title, "--budget-minutes", str(budget_min)]
         for flag in ("type", "difficulty", "context_tokens", "backend", "model", "effort"):
+            v = getattr(args, flag, None)
+            if v:
+                child += [f"--{flag.replace('_', '-')}", str(v)]
+        for flag in ("card_type", "rework_of"):
             v = getattr(args, flag, None)
             if v:
                 child += [f"--{flag.replace('_', '-')}", str(v)]
@@ -2344,7 +2437,8 @@ def cmd_run(args, policy):
             jsave(f"{rdir}/result.json", out)
             append_ledger({"id": rid, "ts": NOW(), "title": title, "profile": prof, "status": "failed",
                            "backend": decision["backend"], "model": decision["model"],
-                           "error_class": "prepare_failed", "seconds": prepared["seconds"]})
+                           "error_class": "prepare_failed", "seconds": prepared["seconds"],
+                           "card_type": card_type, "rework_of": rework_of})
             set_status(rdir, state="finished", status="failed", error_class="prepare_failed", finished=NOW())
             print(json.dumps(out, indent=2, ensure_ascii=False))
             sys.exit(1)
@@ -2458,6 +2552,8 @@ def cmd_run(args, policy):
         "decision_reasons": decision.get("reasons"), "run_dir": rdir,
     }
     jsave(f"{rdir}/result.json", out)
+    changed = changed_paths(ws.get("repo") or ws.get("path"), ws.get("base"), fin.get("commit"),
+                            (result or {}).get("files_changed"))
     append_ledger({"id": rid, "ts": NOW(), "title": title, "profile": prof, "status": status,
                    "backend": decision["backend"], "model": decision["model"], "effort": decision.get("effort"),
                    "tier": decision.get("tier"), "attempts": [{k: a[k] for k in a if k != "error_tail"} for a in attempts],
@@ -2465,6 +2561,9 @@ def cmd_run(args, policy):
                    "seconds": wall_seconds, "usage": usage,
                    "risk_blocks": out["risk_blocks"], "summary": (result or {}).get("summary"),
                    "commit": fin.get("commit"), "files": len((result or {}).get("files_changed") or []),
+                   "branch": fin.get("branch"), "verify": verify,
+                   "files_changed": changed,
+                   "card_type": card_type, "rework_of": rework_of,
                    "reasons": decision.get("reasons")})
     set_status(rdir, state="finished", status=status, finished=NOW(), commit=fin.get("commit"))
     print(json.dumps(out, indent=2, ensure_ascii=False))
@@ -2635,6 +2734,10 @@ def bus_task_metadata(run_id, target_repo, base, args, budget_min):
                 "report_schema": RESULT_SCHEMA}
     if args.verify:
         metadata["verify"] = args.verify
+    if getattr(args, "card_type", None):
+        metadata["card_type"] = args.card_type
+    if getattr(args, "rework_of", None):
+        metadata["rework_of"] = args.rework_of
     return metadata
 
 
@@ -2803,7 +2906,8 @@ def bus_verify(root, commit, command, timeout):
 
 # ---------------------------------------------------------------- GitHub bus run lifecycle
 
-def bus_finish_run(rid, rdir, title, root, remote, issue, result, executor, status, started, verify_command=None):
+def bus_finish_run(rid, rdir, title, root, remote, issue, result, executor, status, started,
+                   verify_command=None, card_type=None, rework_of=None):
     now = NOW()
     elapsed = round(now - started, 3)
     verify = None
@@ -2845,10 +2949,13 @@ def bus_finish_run(rid, rdir, title, root, remote, issue, result, executor, stat
         output["error"] = bus_redact(error)
     output = bus_sanitize(output)
     jsave(f"{rdir}/result.json", output)
+    changed = changed_paths(root, task.get("base"), commit, (result or {}).get("files_changed"))
     append_ledger(bus_sanitize({"id": rid, "ts": now, "title": title, "status": status, "backend": "github-issue",
                                 "seconds": elapsed, "summary": (result or {}).get("summary"), "commit": commit,
                                 "files": len((result or {}).get("files_changed") or []), "bus": bus_info,
-                                "error_class": output["error_class"]}))
+                                "error_class": output["error_class"], "branch": branch, "verify": verify,
+                                "files_changed": changed,
+                                "card_type": card_type, "rework_of": rework_of}))
     set_status(rdir, state="finished", status=status, finished=now, commit=commit, bus=bus_info)
     print(json.dumps(output, indent=2, ensure_ascii=False))
     raise SystemExit(0 if status == "done" else 1)
@@ -2869,6 +2976,10 @@ def cmd_bus_run(args, policy, rid, rdir, task, title, budget_min):
                 "report_schema": RESULT_SCHEMA}
     if args.verify:
         metadata["verify"] = args.verify
+    if getattr(args, "card_type", None):
+        metadata["card_type"] = args.card_type
+    if getattr(args, "rework_of", None):
+        metadata["rework_of"] = args.rework_of
     if args.dry_run:
         set_status(rdir, id=rid, state="dry-run", title=title, backend="github-issue", bus_repo=cfg["repo"])
         print(json.dumps({"id": rid, "dry_run": True, "backend": "github-issue", "bus_repo": cfg["repo"],
@@ -2883,6 +2994,10 @@ def cmd_bus_run(args, policy, rid, rdir, task, title, budget_min):
         child = [sys.executable, os.path.realpath(__file__), "run", "--run-id", rid, "--cwd", root,
                  "--title", title, "--budget-minutes", str(budget_min), "--backend", "github-issue"]
         for flag in ("base", "verify", "executor"):
+            value = getattr(args, flag, None)
+            if value:
+                child += [f"--{flag.replace('_', '-')}", str(value)]
+        for flag in ("card_type", "rework_of"):
             value = getattr(args, flag, None)
             if value:
                 child += [f"--{flag.replace('_', '-')}", str(value)]
@@ -2904,7 +3019,8 @@ def cmd_bus_run(args, policy, rid, rdir, task, title, budget_min):
                deadline=deadline, backend="github-issue", events=event_path, cwd=root, bus_repo=cfg["repo"],
                bus_target_repo=target_repo, bus_base=base)
     if (jload(f"{rdir}/status.json", {}) or {}).get("stop_requested"):
-        bus_finish_run(rid, rdir, title, root, remote, None, None, None, "stopped", started)
+        bus_finish_run(rid, rdir, title, root, remote, None, None, None, "stopped", started,
+                       card_type=getattr(args, "card_type", None), rework_of=getattr(args, "rework_of", None))
     issue = bus_create_issue(cfg["repo"], cfg, title, task, metadata, getattr(args, "executor", None))
     number = issue.get("number")
     if not number:
@@ -2953,7 +3069,8 @@ def cmd_bus_run(args, policy, rid, rdir, task, title, budget_min):
             break
         time.sleep(min(cfg["poll_seconds"], max(0.01, deadline - NOW())))
     bus_finish_run(rid, rdir, title, root, remote, issue, result, executor, final_status or "failed", started,
-                   getattr(args, "verify", None))
+                   getattr(args, "verify", None), getattr(args, "card_type", None),
+                   getattr(args, "rework_of", None))
 
 
 def cmd_bus_init(args, policy):
@@ -3070,6 +3187,9 @@ def bus_worker_run(issue, cfg, args, policy):
     task, task_card = bus_issue_task(issue)
     if not task:
         return False
+    card_type = getattr(args, "card_type", None) or task.get("card_type")
+    rework_of = getattr(args, "rework_of", None) or task.get("rework_of")
+    validate_card_type(policy, card_type)
     allowed_repos = bus_worker_repos(args, policy)
     if task["repo"] not in allowed_repos:
         return False
@@ -3109,6 +3229,10 @@ def bus_worker_run(issue, cfg, args, policy):
                    "--cwd", repo_path, "--base", task["base"], "--title", issue.get("title", "openswarm task"),
                    "--budget-minutes", str(worker_budget),
                    "--backend", args.backend]
+        if card_type:
+            command += ["--card-type", card_type]
+        if rework_of:
+            command += ["--rework-of", rework_of]
         if args.model:
             command += ["--model", args.model]
         verify_allow = (policy.get("bus") or {}).get("worker_verify_allow") or []
@@ -3177,6 +3301,7 @@ def bus_worker_run(issue, cfg, args, policy):
 
 
 def cmd_bus_worker(args, policy):
+    validate_card_type(policy, getattr(args, "card_type", None))
     cfg = bus_config(policy, args.bus)
     while True:
         for issue in gh_pages(f"repos/{cfg['repo']}/issues?state=open"):
@@ -3668,13 +3793,15 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                         budget = req.get("budget_minutes")
                         if budget is None:
                             budget = load_policy()["run"]["timeout_seconds"] / 60
+                        validate_card_type(load_policy(), req.get("card_type"))
                         admit_budget(load_policy(), lane["backend"], float(budget), rdir, id=rid,
                                      state="queued", started=NOW(), runner_pid=os.getpid(), lane=lane["name"])
                         os.makedirs(rdir, exist_ok=True)
                         task = str(req.get("task") or "")
                         with open(os.path.join(rdir, "task.md"), "w") as f:
                             f.write(task)
-                        spec = {k: req.get(k) for k in ("title", "verify", "verify_baseline", "budget_minutes", "base")}
+                        spec = {k: req.get(k) for k in ("title", "verify", "verify_baseline", "budget_minutes", "base",
+                                                        "card_type", "rework_of")}
                         provider = execution_provider(lane["backend"], policy=load_policy(), lane=lane)
                         spec.update({"run_id": rid, "task": task, "started": NOW(), "provider": provider})
                         spec["_event_file"] = os.path.join(rdir, f"events.1.{lane['backend']}.jsonl")
@@ -4266,13 +4393,18 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
            {k: v for k, v in ws.items() if k in ("mode", "path", "repo", "base", "note", "lane")},
            **fin, "attempts": attempts, "run_dir": rdir}
     jsave(os.path.join(rdir, "result.json"), out)
+    changed = changed_paths(ws.get("repo") or ws.get("root"), ws.get("base"), fin.get("commit"),
+                            (final or {}).get("files_changed"))
     append_ledger({"id": rid, "ts": NOW(), "title": title, "status": status, "lane": lane["name"],
                    "backend": lane["backend"], "model": model, "effort": lane.get("effort"),
                    "attempts": attempts, "error_class": error_class,
                    "seconds": round(sum(attempt["seconds"] for attempt in attempts), 3),
                    "usage": usage, "commit": fin.get("commit"),
                    "risk_blocks": out["risk_blocks"], "summary": (final or {}).get("summary"),
-                   "files": len((final or {}).get("files_changed") or [])})
+                   "files": len((final or {}).get("files_changed") or []),
+                   "branch": fin.get("branch"), "verify": verify,
+                   "files_changed": changed,
+                   "card_type": spec.get("card_type"), "rework_of": spec.get("rework_of")})
     set_status(rdir, state="finished", status=status, finished=NOW(), commit=fin.get("commit"), lane=lane["name"])
     return out
 
@@ -4409,7 +4541,8 @@ def lane_do_run(lane, spec, child, server, current):
                        last_error=short(e, 500))
             append_ledger({"id": rid, "ts": NOW(), "title": spec.get("title"), "status": "failed",
                            "lane": lane["name"], "backend": lane["backend"], "model": lane["model"],
-                           "error_class": error_class})
+                           "error_class": error_class, "card_type": spec.get("card_type"),
+                           "rework_of": spec.get("rework_of")})
             return status
         return lane_finalize_run(lane, spec, ws, None, {}, error_class, 1, evp)
 
@@ -4637,6 +4770,7 @@ def cmd_lane_status():
 
 
 def cmd_lane_assign(args):
+    validate_card_type(load_policy(), getattr(args, "card_type", None))
     lane = lanes_by_name([args.name])[0]
     task = args.prompt if args.prompt is not None else open(args.task_file).read()
     if not task.strip():
@@ -4654,7 +4788,9 @@ def cmd_lane_assign(args):
         budget_error(error)
     response = lane_call(lane["name"], {"op": "assign", "run_id": rid, "task": task, "title": title,
                                          "verify": args.verify, "verify_baseline": args.verify_baseline,
-                                         "budget_minutes": budget, "base": args.base})
+                                         "budget_minutes": budget, "base": args.base,
+                                         "card_type": getattr(args, "card_type", None),
+                                         "rework_of": getattr(args, "rework_of", None)})
     if response.get("ok"):
         response.update({"lane": lane["name"], "watch": f"openswarm watch {rid}",
                          "result": os.path.join(RUNS, rid, "result.json")})
@@ -5000,7 +5136,7 @@ def batch_launch(spec, row):
     path = host_require(host, host_python(host, source, input=card), "card copy").decode().strip()
     try:
         args = ["run", "--detach", "--cwd", spec["repos"][row["host"]], "--task-file", path, "--base", spec["base"]]
-        for key in ("backend", "model", "effort", "verify", "budget_minutes"):
+        for key in ("backend", "model", "effort", "verify", "budget_minutes", "card_type", "rework_of"):
             if spec.get(key) is not None:
                 args += ["--" + key.replace("_", "-"), str(spec[key])]
         reply = host_json(host, args)
@@ -5054,6 +5190,7 @@ def batch_provider_slot_available(spec, row):
 
 
 def execute_batch(spec, summary):
+    validate_card_type(load_policy(), spec.get("card_type"))
     summary.update(state="running", runner_pid=os.getpid())
     blocked_hosts = set()
     batch_save(summary)
@@ -5155,9 +5292,11 @@ def cmd_batch(args, policy):
         spec, summary = jload(os.path.join(directory, "spec.json")), jload(os.path.join(directory, "summary.json"))
         if not spec or not summary:
             raise ValueError("no such batch")
+        validate_card_type(policy, spec.get("card_type"))
         raise SystemExit(execute_batch(spec, summary))
     if not args.repo or not args.cards or not args.hosts:
         raise ValueError("batch requires --repo, --cards and --hosts")
+    validate_card_type(policy, getattr(args, "card_type", None))
     if args.per_host < 1 or args.poll_seconds <= 0 or (args.budget_minutes is not None and args.budget_minutes <= 0):
         raise ValueError("batch concurrency, budget and poll interval must be positive")
     hosts = fleet_config()
@@ -5191,6 +5330,7 @@ def cmd_batch(args, policy):
             "repos": {name: host_repo(host, args.repo, local=host["kind"] == "local") for name, host in chosen.items()},
             "per_host": args.per_host, "backend": backend, "provider": execution_provider(backend, decision, policy),
             "concurrency": concurrency_caps, "model": args.model, "effort": args.effort,
+            "card_type": getattr(args, "card_type", None), "rework_of": getattr(args, "rework_of", None),
             "verify": args.verify, "budget_minutes": args.budget_minutes or round(policy["run"]["timeout_seconds"] / 60),
             "poll_seconds": args.poll_seconds}
     summary = {"id": bid, "repo": args.repo, "base": base, "state": "queued", "started": NOW(), "cards": [
@@ -5882,12 +6022,82 @@ def cmd_stop(args, policy):
 
 
 def append_ledger(entry):
+    entry = dict(entry or {})
+
+    def count(usage, aliases):
+        if not isinstance(usage, dict):
+            return None
+        for key in aliases:
+            value = usage.get(key)
+            if isinstance(value, (int, float)) and value >= 0:
+                return int(value)
+        return None
+
+    def token_pair(usage):
+        return (count(usage, ("input", "input_tokens", "inputTokens", "prompt_tokens")),
+                count(usage, ("output", "output_tokens", "outputTokens", "completion_tokens")))
+
+    attempts = entry.get("attempts") if isinstance(entry.get("attempts"), list) else []
+    attempt_usages = [(attempt.get("meta") or {}).get("usage") for attempt in attempts
+                      if isinstance(attempt, dict) and isinstance((attempt.get("meta") or {}).get("usage"), dict)]
+    pairs = [token_pair(usage) for usage in attempt_usages]
+    if not pairs:
+        pairs = [token_pair(entry.get("usage"))]
+    input_tokens = sum(pair[0] or 0 for pair in pairs) if any(pair[0] is not None for pair in pairs) else None
+    output_tokens = sum(pair[1] or 0 for pair in pairs) if any(pair[1] is not None for pair in pairs) else None
+    attempt_totals = [count(usage, ("total", "total_tokens", "totalTokens")) for usage in attempt_usages]
+    explicit_total = (sum(value for value in attempt_totals if value is not None)
+                      if any(value is not None for value in attempt_totals)
+                      else count(entry.get("usage"), ("total", "total_tokens", "totalTokens")))
+    total_tokens = (explicit_total if explicit_total is not None else
+                    ((input_tokens or 0) + (output_tokens or 0)
+                     if input_tokens is not None or output_tokens is not None else None))
+
+    files = entry.get("files_changed") or entry.get("area") or []
+    if isinstance(files, str):
+        files = [files]
+    areas = set()
+    for path in files if isinstance(files, list) else []:
+        if not isinstance(path, str) or not path.strip():
+            continue
+        normalized = path.strip().replace("\\", "/").lstrip("./")
+        if normalized:
+            areas.add(normalized.split("/", 1)[0])
+    verify = entry.get("verify") if isinstance(entry.get("verify"), dict) else {}
+    record = {
+        **entry,
+        "id": entry.get("id") or entry.get("run_id"),
+        "run_id": entry.get("run_id") or entry.get("id"),
+        "host": entry.get("host") or socket.gethostname(),
+        "lane": entry.get("lane"),
+        "backend": entry.get("backend"),
+        "model": entry.get("model"),
+        "effort": entry.get("effort"),
+        "card_type": entry.get("card_type"),
+        "area": sorted(areas)[:10],
+        "title": bus_redact(entry.get("title") or ""),
+        "status": entry.get("status"),
+        "error_class": entry.get("error_class"),
+        "verify_rc": entry.get("verify_rc", verify.get("rc")),
+        "attempts": attempts,
+        "rework_of": entry.get("rework_of"),
+        "tokens": {"input": input_tokens, "output": output_tokens, "total": total_tokens},
+        "seconds": entry.get("seconds", 0),
+        "branch": entry.get("branch"),
+        "commit": entry.get("commit"),
+        "pr": None,
+        "review_findings": None,
+        "merged": None,
+        "defect_within_7d": None,
+        "lessons_injected": entry.get("lessons_injected") if isinstance(entry.get("lessons_injected"), list) else [],
+    }
+    record = bus_sanitize(record)
     os.makedirs(DATA, exist_ok=True)
     # Serialize completion writes with admissions so their ledger/reservation snapshot is coherent.
     with open(os.path.join(DATA, "budget.lock"), "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         with open(LEDGER, "a") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 # ---------------------------------------------------------------- CLI
@@ -5989,6 +6199,8 @@ def main():
 
     sp = sub.add_parser("run")
     add_profile(sp, include_bus=True)
+    sp.add_argument("--card-type", help="optional task card type from knowledge/card-types.yaml")
+    sp.add_argument("--rework-of", help="run id this task is reworking")
     sp.add_argument("--prompt")
     sp.add_argument("--task-file")
     sp.add_argument("--title")
@@ -6067,6 +6279,8 @@ def main():
     sp.add_argument("--budget-minutes", type=int)
     sp.add_argument("--base")
     sp.add_argument("--detach", action="store_true")
+    sp.add_argument("--card-type", help="optional task card type from knowledge/card-types.yaml")
+    sp.add_argument("--rework-of", help="run id this batch reworks")
     sp.add_argument("--batch-id", help=argparse.SUPPRESS)
     sp.add_argument("--poll-seconds", type=float, default=2, help=argparse.SUPPRESS)
 
@@ -6093,6 +6307,8 @@ def main():
     sp.add_argument("--budget-minutes", type=float, default=40)
     sp.add_argument("--repos", help="worker-local owner/repo allowlist, comma-separated")
     sp.add_argument("--verify", help="worker-owned verify command")
+    sp.add_argument("--card-type", help="default card type for bus tasks")
+    sp.add_argument("--rework-of", help="run id this task reworks")
     sp.add_argument("--once", action="store_true", help="claim at most one queued issue, then exit")
 
     sp = sub.add_parser("lane", help="manage resident executor lanes")
@@ -6112,6 +6328,8 @@ def main():
     lp.add_argument("--verify-baseline", action="store_true")
     lp.add_argument("--budget-minutes", type=float)
     lp.add_argument("--base")
+    lp.add_argument("--card-type", help="optional task card type from knowledge/card-types.yaml")
+    lp.add_argument("--rework-of", help="run id this task is reworking")
     lp = lane_sub.add_parser("steer", help="steer the active turn")
     lp.add_argument("name")
     lp.add_argument("--text", required=True)
@@ -6132,6 +6350,7 @@ def main():
 
     sp = sub.add_parser("ledger")
     sp.add_argument("-n", type=int, default=20)
+    sp.add_argument("--json", action="store_true", help="print full ledger records as JSON")
 
     a = ap.parse_args()
     policy = load_policy()
@@ -6146,7 +6365,11 @@ def main():
         st = get_state(policy, a.refresh)
         print(json.dumps(route(profile_from_args(a), st, policy), indent=2, ensure_ascii=False))
     elif a.cmd == "run":
-        cmd_run(a, policy)
+        try:
+            cmd_run(a, policy)
+        except ValueError as error:
+            print(f"openswarm: {error}", file=sys.stderr)
+            sys.exit(2)
     elif a.cmd == "budget":
         cmd_budget(a, policy)
     elif a.cmd == "watch":
@@ -6210,9 +6433,14 @@ def main():
     elif a.cmd == "ingest-claude":
         ingest_claude(a)
     elif a.cmd == "ledger":
-        for e in recent_ledger(a.n):
-            print(f"{iso(e['ts'])}  {e.get('status'):<10} {e.get('backend') or '-':<8} {e.get('model') or '-':<20} "
-                  f"{e.get('effort') or '-':<7} {e.get('seconds', 0):>6}s  {e.get('title', '')[:60]}")
+        entries = recent_ledger(a.n)
+        if a.json:
+            print(json.dumps(entries, indent=2, ensure_ascii=False))
+        else:
+            for e in entries:
+                print(f"{iso(e['ts'])}  {e.get('status'):<10} {e.get('backend') or '-':<8} {e.get('model') or '-':<20} "
+                      f"{e.get('effort') or '-':<7} {e.get('card_type') or '-':<16} {e.get('seconds', 0):>6}s  "
+                      f"{e.get('title', '')[:60]}")
 
 
 if __name__ == "__main__":

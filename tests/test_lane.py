@@ -115,14 +115,23 @@ class LaneTests(unittest.TestCase):
 
     def test_assign_commits_and_writes_normal_result(self):
         self.set_config("pi")
+        knowledge = self.root / "knowledge"
+        knowledge.mkdir()
+        (knowledge / "card-types.yaml").write_text("card_types:\n  - feature\n")
+        (self.data / "policy.local.json").write_text(json.dumps({"knowledge": {"repo": str(knowledge)}}))
         self.start_lane()
-        run_id = self.assign("add the fixture change")
+        run_id = self.assign("add the fixture change", "--card-type", "feature", "--rework-of", "parent-run")
         state = self.wait_run(run_id)
         result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
         self.assertEqual(state["status"], "done")
         self.assertEqual(result["lane"], self.lane_name)
         self.assertTrue(result["commit"])
         self.assertEqual(result["branch"], f"openswarm/{run_id}")
+        ledger = [json.loads(line) for line in (self.data / "ledger.jsonl").read_text().splitlines()]
+        entry = next(row for row in ledger if row["id"] == run_id)
+        self.assertEqual(entry["card_type"], "feature")
+        self.assertEqual(entry["rework_of"], "parent-run")
+        self.assertEqual(entry["area"], ["lane_result.txt"])
         self.assertEqual((self.data / "lanes" / self.lane_name / "wt" / "lane_result.txt").read_text(), "completed")
         self.assertEqual(self.git("show", f"openswarm/{run_id}:lane_result.txt"), "completed")
         self.assertFalse((self.repo / "lane_result.txt").exists())
