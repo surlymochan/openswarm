@@ -909,6 +909,185 @@ def ledger_entries():
         return
 
 
+def routing_min_samples(policy):
+    value = (policy.get("routing") or {}).get("min_samples", 8)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("routing.min_samples must be a positive integer")
+    return value
+
+
+def routing_median(values):
+    values = sorted(values)
+    if not values:
+        return None
+    middle = len(values) // 2
+    if len(values) % 2:
+        return values[middle]
+    return (values[middle - 1] + values[middle]) / 2
+
+
+def routing_tokens(entry):
+    tokens = entry.get("tokens")
+    if isinstance(tokens, dict):
+        total = tokens.get("total")
+        if isinstance(total, (int, float)) and math.isfinite(total) and total >= 0:
+            return total
+    usage = entry.get("usage")
+    if isinstance(usage, dict):
+        total = usage.get("total", usage.get("total_tokens"))
+        if isinstance(total, (int, float)) and math.isfinite(total) and total >= 0:
+            return total
+        inputs = usage.get("input", usage.get("input_tokens", usage.get("prompt_tokens")))
+        outputs = usage.get("output", usage.get("output_tokens", usage.get("completion_tokens")))
+        if all(isinstance(value, (int, float)) and math.isfinite(value) and value >= 0
+               for value in (inputs, outputs)):
+            return inputs + outputs
+    return None
+
+
+def routing_passed(entry):
+    verify = entry.get("verify") if isinstance(entry.get("verify"), dict) else {}
+    verify_rc = entry.get("verify_rc", verify.get("rc"))
+    has_verify = entry.get("verify") is not None or verify_rc is not None
+    return entry.get("status") == "done" and (not has_verify or verify_rc == 0)
+
+
+def compute_routing_weights(entries, min_samples=8):
+    groups = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or not entry.get("backend"):
+            continue
+        key = (entry.get("backend"), entry.get("model"), entry.get("card_type"))
+        groups.setdefault(key, []).append(entry)
+
+    rows = []
+    for (backend, model, card_type), runs in sorted(
+            groups.items(), key=lambda item: tuple((value is not None, str(value).casefold(), str(value))
+                                                   for value in item[0])):
+        reviewed = []
+        for entry in runs:
+            findings = entry.get("review_findings")
+            if not isinstance(findings, dict):
+                continue
+            p0 = findings.get("p0", 0)
+            p1 = findings.get("p1", 0)
+            reviewed.append(bool((isinstance(p0, (int, float)) and p0 > 0) or
+                                 (isinstance(p1, (int, float)) and p1 > 0)))
+        attempt_counts = [len(value) if isinstance(value, list) else 0
+                          for value in (entry.get("attempts") for entry in runs)]
+        seconds = [value for value in (entry.get("seconds") for entry in runs)
+                   if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0]
+        tokens = [value for value in (routing_tokens(entry) for entry in runs) if value is not None]
+        rows.append({
+            "backend": backend,
+            "model": model,
+            "card_type": card_type,
+            "runs": len(runs),
+            "pass_rate": sum(routing_passed(entry) for entry in runs) / len(runs),
+            "first_try_rate": sum(count == 1 for count in attempt_counts) / len(runs),
+            "rework_rate": sum(bool(entry.get("rework_of")) for entry in runs) / len(runs),
+            "review_p1_rate": sum(reviewed) / len(reviewed) if reviewed else None,
+            "median_tokens": routing_median(tokens),
+            "median_seconds": routing_median(seconds),
+            "enough": len(runs) >= min_samples,
+        })
+    return {"min_samples": min_samples, "entries": rows}
+
+
+def routing_weights_path(policy):
+    repo = os.path.expanduser(str((policy.get("knowledge") or {}).get("repo") or DEFAULT_KNOWLEDGE_REPO))
+    return os.path.join(repo, "routing", "weights.json")
+
+
+def ledger_entries_from(path):
+    try:
+        with open(path, encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict):
+                    yield entry
+    except FileNotFoundError:
+        return
+
+
+def routing_advice(profile, card_type, st, policy, actual_decision):
+    """Return record-only advice from enough-sample groups eligible for this live state."""
+    if profile.get("backend") or not actual_decision.get("ok"):
+        return None
+    weights = compute_routing_weights(ledger_entries(), routing_min_samples(policy))
+    candidates = []
+    possible = list(dict.fromkeys([actual_decision.get("backend")] +
+                                  (actual_decision.get("fallbacks") or [])))
+    for backend in possible:
+        if not backend:
+            continue
+        planner = PLANNERS.get(backend)
+        eligible, _ = planner({**profile, "backend": backend}, st, policy, True, []) if planner else (None, None)
+        if not eligible:
+            continue
+        for row in weights["entries"]:
+            if row["backend"] != backend or row["card_type"] != card_type or not row["enough"]:
+                continue
+            if profile.get("model") and row["model"] != profile["model"]:
+                continue
+            quality = (row["pass_rate"], row["first_try_rate"], -row["rework_rate"],
+                       -(row["review_p1_rate"] if row["review_p1_rate"] is not None else 0))
+            cost = (row["median_tokens"] if row["median_tokens"] is not None else math.inf,
+                    row["median_seconds"] if row["median_seconds"] is not None else math.inf)
+            candidates.append((quality, cost, row))
+    if not candidates:
+        return {"backend": None, "model": None,
+                "reason": f"no eligible {card_type or 'untyped'} routing samples meet min_samples="
+                          f"{weights['min_samples']}"}
+    candidates.sort(key=lambda item: (-item[0][0], -item[0][1], -item[0][2], -item[0][3],
+                                     item[1][0], item[1][1], item[2]["backend"],
+                                     str(item[2]["model"] or "")))
+    row = candidates[0][2]
+    return {"backend": row["backend"], "model": row["model"],
+            "reason": (f"best observed pass, first-try, rework, and P1+ rates among {row['runs']} "
+                       "eligible samples; ties use median tokens then seconds; actual routing unchanged")}
+
+
+def cmd_routing_weights(args, policy):
+    path = fleet_ledger_path() if args.fleet else LEDGER
+    weights = compute_routing_weights(ledger_entries_from(path), routing_min_samples(policy))
+    output_path = os.path.expanduser(args.out) if args.out else routing_weights_path(policy)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as stream:
+        json.dump(weights, stream, ensure_ascii=False, indent=2, sort_keys=True)
+        stream.write("\n")
+    print(json.dumps({"path": output_path, **weights}, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def outcome_label(entry):
+    return "pass" if routing_passed(entry) else f"fail/{entry.get('status') or 'unknown'}"
+
+
+def cmd_routing_compare(args, policy):
+    if args.days < 0:
+        raise ValueError("--days must be non-negative")
+    cutoff = NOW() - args.days * 86400
+    entries = [entry for entry in ledger_entries()
+               if (to_epoch(entry.get("ts")) or 0) >= cutoff and isinstance(entry.get("routing_advice"), dict)]
+    print(f"{'date':<20} {'card_type':<16} {'advice':<28} {'advice outcome':<16} {'actual':<28} actual outcome")
+    print("-" * 126)
+    for entry in sorted(entries, key=lambda row: (to_epoch(row.get("ts")) or 0, str(row.get("id") or "")),
+                        reverse=True):
+        advice = entry["routing_advice"]
+        advised = f"{advice.get('backend') or '-'} / {advice.get('model') or '-'}"
+        actual_backend, actual_model = entry.get("backend") or "-", entry.get("model") or "-"
+        actual = f"{actual_backend} / {actual_model}"
+        advice_outcome = outcome_label(entry) if (advice.get("backend"), advice.get("model")) == (
+            actual_backend, actual_model) else "not run"
+        ts = to_epoch(entry.get("ts")) or 0
+        date = dt.datetime.fromtimestamp(ts).astimezone().strftime("%Y-%m-%d %H:%M") if ts else "unknown"
+        print(f"{date:<20} {(entry.get('card_type') or '-'):<16} {advised:<28} {advice_outcome:<16} "
+              f"{actual:<28} {outcome_label(entry)}")
+
+
 def policy_day(policy, date=None):
     name = (policy.get("budget") or {}).get("timezone") or policy.get("timezone")
     tz = ZoneInfo(name) if name else None
@@ -2595,9 +2774,12 @@ def cmd_run(args, policy):
         jsave(f"{rdir}/result.json", out)
         print(json.dumps(out, indent=2, ensure_ascii=False))
         sys.exit(2)
+    advice = routing_advice(prof, card_type, st, policy, decision)
+    routing_fields = {"routing_advice": advice} if advice is not None else {}
     if args.dry_run:
         set_status(rdir, state="dry-run")
-        print(json.dumps({"id": rid, "dry_run": True, "decision": decision}, indent=2, ensure_ascii=False))
+        print(json.dumps({"id": rid, "dry_run": True, "decision": decision,
+                          **routing_fields}, indent=2, ensure_ascii=False))
         return
     try:
         admit_budget(policy, decision["backend"], budget_min, rdir, id=rid, state="queued", title=title,
@@ -2662,7 +2844,7 @@ def cmd_run(args, policy):
             append_ledger({"id": rid, "ts": NOW(), "title": title, "profile": prof, "status": "failed",
                            "backend": decision["backend"], "model": decision["model"],
                            "error_class": "prepare_failed", "seconds": prepared["seconds"],
-                           "card_type": card_type, "rework_of": rework_of})
+                           "card_type": card_type, "rework_of": rework_of, **routing_fields})
             set_status(rdir, state="finished", status="failed", error_class="prepare_failed", finished=NOW())
             print(json.dumps(out, indent=2, ensure_ascii=False))
             sys.exit(1)
@@ -2775,7 +2957,7 @@ def cmd_run(args, policy):
         "risk_blocks": (jload(f"{rdir}/status.json", {}) or {}).get("risk_blocks", []),
         "result": result, "workspace": {k: v for k, v in ws.items() if k in ("mode", "path", "repo", "base", "note")},
         **fin, "attempts": attempts, "claude_review": decision.get("claude_review"),
-        "decision_reasons": decision.get("reasons"), "run_dir": rdir,
+        "decision_reasons": decision.get("reasons"), "run_dir": rdir, **routing_fields,
     }
     jsave(f"{rdir}/result.json", out)
     changed = changed_paths(ws.get("repo") or ws.get("path"), ws.get("base"), fin.get("commit"),
@@ -2791,7 +2973,7 @@ def cmd_run(args, policy):
                    "files_changed": changed,
                    "card_type": card_type, "rework_of": rework_of,
                    "lessons_injected": lessons_injected,
-                   "reasons": decision.get("reasons")})
+                   "reasons": decision.get("reasons"), **routing_fields})
     set_status(rdir, state="finished", status=status, finished=NOW(), commit=fin.get("commit"))
     print(json.dumps(out, indent=2, ensure_ascii=False))
     sys.exit(3 if budget_denial else 0 if status == "done" else 1)
@@ -6915,6 +7097,7 @@ def main():
 
     sp = sub.add_parser("route")
     add_profile(sp)
+    sp.add_argument("--card-type", help="optional task card type used for record-only routing advice")
     sp.add_argument("--refresh", action="store_true")
 
     sp = sub.add_parser("run")
@@ -6939,6 +7122,14 @@ def main():
     sp.add_argument("--run-id", help=argparse.SUPPRESS)
     sp.add_argument("--dry-run", action="store_true")
     sp.add_argument("--executor", help="optional GitHub bus executor routing label")
+
+    sp = sub.add_parser("routing", help="inspect record-only routing weights and advice")
+    routing_sub = sp.add_subparsers(dest="routing_cmd", required=True)
+    rp = routing_sub.add_parser("weights", help="compute per-backend routing metrics from the ledger")
+    rp.add_argument("--fleet", action="store_true", help="read the merged fleet ledger")
+    rp.add_argument("--out", help="write the JSON weights file to this path")
+    rp = routing_sub.add_parser("compare", help="compare recorded advice with actual run outcomes")
+    rp.add_argument("--days", type=int, default=30, help="include advice records from the last N days")
 
     sp = sub.add_parser("watch", help="stream actionable events of a run (for Claude's Monitor tool)")
     sp.add_argument("run_id", nargs="+", help="one or more run ids; several ids are watched together")
@@ -7102,11 +7293,25 @@ def main():
         if block:
             print(block)
     elif a.cmd == "route":
+        validate_card_type(policy, a.card_type)
         st = get_state(policy, a.refresh)
-        print(json.dumps(route(profile_from_args(a), st, policy), indent=2, ensure_ascii=False))
+        profile = profile_from_args(a)
+        decision = route(profile, st, policy)
+        advice = routing_advice(profile, a.card_type, st, policy, decision)
+        print(json.dumps({**decision, **({"routing_advice": advice} if advice is not None else {})},
+                         indent=2, ensure_ascii=False))
     elif a.cmd == "run":
         try:
             cmd_run(a, policy)
+        except ValueError as error:
+            print(f"openswarm: {error}", file=sys.stderr)
+            sys.exit(2)
+    elif a.cmd == "routing":
+        try:
+            if a.routing_cmd == "weights":
+                cmd_routing_weights(a, policy)
+            else:
+                cmd_routing_compare(a, policy)
         except ValueError as error:
             print(f"openswarm: {error}", file=sys.stderr)
             sys.exit(2)

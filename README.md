@@ -178,6 +178,20 @@ openswarm lessons preview --card-type fix --backend codex --paths src/file.py
 
 Injected lesson ids are recorded in the run ledger's `lessons_injected` field.
 
+## Routing weights (record-only)
+
+`openswarm routing weights` summarizes ledger runs by backend, model and card type. It writes
+`<knowledge.repo>/routing/weights.json` (default sample threshold: 8); use `--fleet` to read the merged fleet
+ledger or `--out PATH` to choose another output path. The report includes pass, first-try, rework and P1+ review
+rates plus median tokens and seconds. Groups below `routing.min_samples` are marked `enough: false`.
+
+`openswarm route --card-type fix` and `openswarm run --card-type fix` attach `routing_advice` when enough historical
+samples exist for currently eligible backends. Advice ranks pass, first-try, rework and P1+ rates, then uses median
+tokens and seconds as cost tie-breakers. It is recorded alongside the real route and does not change the selected
+backend or model; `routing.weighted` remains false and reserved for future routing behavior. Compare recorded advice
+with actual outcomes using `openswarm routing compare --days 30`. An advice outcome is shown as `not run` when the
+actual route used a different backend or model, because that counterfactual was not executed.
+
 ## Resident lanes
 
 Use lanes when you want a persistent Codex app-server, Cursor Agent ACP, or Pi RPC process that accepts one task at a time and can be

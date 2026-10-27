@@ -72,7 +72,9 @@
       "ocgo",
       "deepseek"
     ],
-    "large_context_tokens": 220000
+    "large_context_tokens": 220000,
+    "min_samples": 8,
+    "weighted": false
   },
   "codex": {
     "binary_candidates": [
