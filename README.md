@@ -208,6 +208,13 @@ when present and otherwise uses `exec_pass`; the report also includes each sourc
 first-try, rework and P1+ review rates, plus median tokens and seconds. Groups below `routing.min_samples` scored
 runs are marked `enough: false`.
 
+Run `openswarm review <run_id> [--by BACKEND[:MODEL]] [--json]` to review a finished run's branch against its base
+with a read-only executor from another model family. Review output is saved to `runs/<id>/review.json`; the ledger
+stores its reviewer, verdict, and P0/P1/P2 counts under `peer_review`, separate from GitHub's `review_findings`.
+The default `review.auto_card_types` (`feature`, `fix`, `review-fix`, `migration`) starts reviews asynchronously
+after a committed run. `review.prefer` selects the first available reviewer; `review.max_concurrent` bounds
+automatic review jobs, while `review.timeout_seconds` and `review.max_diff_chars` cap review work.
+
 Review completed runs with `openswarm ledger accept <run_id> [--reject] [--reason TEXT] [--fleet]`. The decision,
 reason and timestamp are recorded atomically. `openswarm ledger ingest` sets acceptance from merged or closed
 without merge PRs unless a manual decision is already present. Use `openswarm ledger backfill-pass [--fleet]` to
@@ -420,7 +427,7 @@ Cursor CLI is a fourth executor, opt-in only (`--backend cursor`).
 
 | Path | What |
 | --- | --- |
-| `bin/openswarm` | The CLI: `probe`, `status`, `route`, `run`, `lessons`, `lane`, `fleet`, `batch`, `verify-remote`, `watch`, `runs`, `report`, `retro`, `stop`, `ingest-claude`, `ledger` |
+| `bin/openswarm` | The CLI: `probe`, `status`, `route`, `run`, `review`, `lessons`, `lane`, `fleet`, `batch`, `verify-remote`, `watch`, `runs`, `report`, `retro`, `stop`, `ingest-claude`, `ledger` |
 | `SKILL.md` | Claude Code skill: the planner's operating manual |
 | `policy.json` | Defaults: thresholds, difficulty map, model caps, local data sources |
 | `backends/*.json` | One manifest per executor: invocation, quota source, data boundary |

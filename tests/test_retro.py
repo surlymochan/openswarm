@@ -31,9 +31,11 @@ class RetroTests(unittest.TestCase):
         self.write_ledger(
             {"id": "pass-1", "ts": self.now - 100, "status": "done", "backend": "codex",
              "model": "gpt-test", "card_type": "fix", "exec_pass": True, "accepted": True,
+             "peer_review": {"by": "pi:test", "verdict": "approve", "p0": 0, "p1": 0, "p2": 0},
              "routing_advice": {"backend": "codex", "model": "gpt-test"}},
             {"id": "reject-2", "ts": self.now - 200, "status": "failed", "backend": "codex",
              "model": "gpt-test", "card_type": "fix", "exec_pass": False, "accepted": False,
+             "peer_review": {"by": "pi:test", "verdict": "changes", "p0": 0, "p1": 1, "p2": 0},
              "accepted_reason": "tests failed", "error_class": "exec_error",
              "routing_advice": {"backend": "pi", "model": "pi-test"}},
             {"id": "run-3", "ts": self.now - 300, "status": "done", "backend": "pi",
@@ -100,6 +102,8 @@ class RetroTests(unittest.TestCase):
             self.assertIn(heading, report)
         self.assertIn("1/2 (50%)", report)
         self.assertIn("null=1", report)
+        self.assertIn("peer review P1+", report)
+        self.assertIn("1/2 (50%)", report)
         self.assertIn("exec_error", report)
         self.assertIn("tests failed", report)
         self.assertIn("Skipped fleet ledger pull (--no-pull).", report)

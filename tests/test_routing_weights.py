@@ -38,11 +38,14 @@ class RoutingWeightsTests(unittest.TestCase):
     def test_fixture_ledger_computes_all_routing_metrics(self):
         rows = [
             {"backend": "codex", "model": "m1", "card_type": "fix", "status": "done", "exec_pass": True,
-             "attempts": [{}], "seconds": 1, "tokens": {"total": 100}, "review_findings": {"p0": 0, "p1": 1}},
+             "attempts": [{}], "seconds": 1, "tokens": {"total": 100}, "review_findings": {"p0": 0, "p1": 1},
+             "peer_review": {"p0": 0, "p1": 0, "p2": 1}},
             {"backend": "codex", "model": "m1", "card_type": "fix", "status": "done", "exec_pass": False,
-             "attempts": [{}, {}], "seconds": 2, "tokens": {"total": 200}, "review_findings": {"p0": 0, "p1": 0}},
+             "attempts": [{}, {}], "seconds": 2, "tokens": {"total": 200}, "review_findings": {"p0": 0, "p1": 0},
+             "peer_review": {"p0": 1, "p1": 0, "p2": 0}},
             {"backend": "codex", "model": "m1", "card_type": "fix", "status": "done", "exec_pass": True,
-             "attempts": [{}], "seconds": 3, "tokens": {"total": 300}, "rework_of": "previous"},
+             "attempts": [{}], "seconds": 3, "tokens": {"total": 300}, "rework_of": "previous",
+             "peer_review": {"p0": 0, "p1": 0, "p2": 0}},
             {"backend": "codex", "model": "m1", "card_type": "fix", "status": "partial", "exec_pass": False,
              "attempts": [], "seconds": 4, "tokens": {"total": 400}, "review_findings": {"p0": 1, "p1": 0}},
             {"backend": "ocgo", "model": "m2", "card_type": "fix", "status": "done", "exec_pass": True,
@@ -66,6 +69,8 @@ class RoutingWeightsTests(unittest.TestCase):
         self.assertEqual(codex["first_try_rate"], 0.5)
         self.assertEqual(codex["rework_rate"], 0.25)
         self.assertEqual(codex["review_p1_rate"], 2 / 3)
+        self.assertEqual(codex["peer_reviewed_runs"], 3)
+        self.assertEqual(codex["peer_review_p1_rate"], 1 / 3)
         self.assertEqual(codex["median_tokens"], 250)
         self.assertEqual(codex["median_seconds"], 2.5)
         self.assertTrue(codex["enough"])

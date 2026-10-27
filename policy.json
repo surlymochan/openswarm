@@ -250,6 +250,14 @@
     "timeout_seconds": 2400,
     "fallback": true
   },
+  "review": {
+    "_doc": "Cross-family peer review uses read-only reviewer modes; automatic reviews run asynchronously within the concurrency, time, and diff-size caps.",
+    "prefer": ["codex", "agy", "pi", "cursor"],
+    "auto_card_types": ["feature", "fix", "review-fix", "migration"],
+    "max_concurrent": 2,
+    "timeout_seconds": 900,
+    "max_diff_chars": 120000
+  },
   "bus": {
     "_doc": "GitHub issue bus for executors outside the controlled fleet. Configure bus.repo, allowed_executors, and allowed_planners in policy.local.json; allowed_planners must include the planner login.",
     "repo": null,
