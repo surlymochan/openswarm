@@ -86,7 +86,7 @@ class PeerReviewTests(unittest.TestCase):
         policy = {"pi": {"provider": "fixture"}}
         cases = {
             "codex": ("codex", ["--sandbox", "read-only"]),
-            "agy": ("agy", ["--mode", "plan"]),
+            "agy": ("agy", ["--mode", "plan", "--json-schema"]),
             "pi": ("pi", ["--tools", "read,grep,find,ls"]),
             "cursor": ("cursor", ["--mode=ask"]),
         }
@@ -98,6 +98,8 @@ class PeerReviewTests(unittest.TestCase):
                                         str(self.repo), str(scratch), policy)
             for token in required:
                 self.assertIn(token, command)
+            if backend == "agy":
+                self.assertEqual(command[command.index("--output-format") + 1], "json")
             if backend == "pi":
                 self.assertNotIn("bash", command)
                 self.assertNotIn("edit", command)
@@ -139,6 +141,64 @@ class PeerReviewTests(unittest.TestCase):
                 contextlib.redirect_stdout(output):
             xs.cmd_review(type("Args", (), {"run_id": "run-1", "by": None, "json": True})(), {})
         self.assertEqual(json.loads(output.getvalue()), payload)
+
+    def test_review_parser_extracts_first_schema_object_from_common_wrappers(self):
+        payload = {"findings": [], "verdict": "approve"}
+        encoded = json.dumps(payload)
+        cases = (
+            json.dumps({"response": encoded, "model": "agy-test"}),
+            f"```json\n{encoded}\n```",
+            f"Review complete. {{\"note\": \"not a findings object\"}}\n{encoded}",
+        )
+        for raw in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(xs.review_payload_from_text(raw), payload)
+
+    def test_invalid_review_response_retries_and_saves_redacted_raw_output(self):
+        invalid = "I could not format JSON. ghp_12345678901234567890"
+        valid = json.dumps({"conversation_id": "b71c8819-baae-4a9a-ab6a-fd65e1932b43",
+                            "response": "```json\n{\"findings\": [], \"verdict\": \"approve\"}\n```"})
+        completed = [
+            subprocess.CompletedProcess([], 0, invalid, ""),
+            subprocess.CompletedProcess([], 0, valid, ""),
+        ]
+        with mock.patch.object(xs.subprocess, "run", side_effect=completed) as run:
+            payload = xs.invoke_reviewer({"backend": "agy", "binary": "/fake/agy", "model": "test"},
+                                         "review the diff", str(self.repo), str(self.run_dir), {})
+        self.assertEqual(payload, {"findings": [], "verdict": "approve"})
+        self.assertEqual(run.call_count, 2)
+        self.assertIn("Return only JSON", run.call_args_list[1].args[0][run.call_args_list[1].args[0].index("-p") + 1])
+        raw = (self.run_dir / "review.raw.txt").read_text(encoding="utf-8")
+        self.assertIn("attempt 1", raw)
+        self.assertIn("attempt 2", raw)
+        self.assertIn("[REDACTED]", raw)
+        self.assertNotIn("ghp_12345678901234567890", raw)
+        self.assertNotIn("b71c8819-baae-4a9a-ab6a-fd65e1932b43", raw)
+
+    def test_failed_review_still_saves_raw_output(self):
+        completed = [
+            subprocess.CompletedProcess([], 0, "not json", ""),
+            subprocess.CompletedProcess([], 0, "still not json", ""),
+        ]
+        with mock.patch.object(xs.subprocess, "run", side_effect=completed):
+            with self.assertRaisesRegex(RuntimeError, "after repair retry"):
+                xs.invoke_reviewer({"backend": "agy", "binary": "/fake/agy"}, "review", str(self.repo),
+                                   str(self.run_dir), {})
+        raw = (self.run_dir / "review.raw.txt").read_text(encoding="utf-8")
+        self.assertIn("not json", raw)
+        self.assertIn("still not json", raw)
+
+    def test_agy_permission_denial_is_reported_without_a_paid_format_retry(self):
+        output = json.dumps({"response": "", "denied_actions": [{"action": "command"}]})
+        completed = subprocess.CompletedProcess([], 0, output, "agy: no output produced; command permission denied")
+        with mock.patch.object(xs.subprocess, "run", return_value=completed) as run:
+            with self.assertRaisesRegex(RuntimeError, "tool action was denied"):
+                xs.invoke_reviewer({"backend": "agy", "binary": "/fake/agy"}, "review", str(self.repo),
+                                   str(self.run_dir), {})
+        self.assertEqual(run.call_count, 1)
+        raw = (self.run_dir / "review.raw.txt").read_text(encoding="utf-8")
+        self.assertIn("denied_actions", raw)
+        self.assertIn("permission denied", raw)
 
 
 if __name__ == "__main__":
