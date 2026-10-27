@@ -1,6 +1,6 @@
 usage: openswarm batch [-h] [--repo REPO] [--cards CARDS] [--hosts HOSTS]
                        [--per-host PER_HOST]
-                       [--backend {codex,ocgo,deepseek,cursor,agy,pi}]
+                       [--backend {codex,ocgo,deepseek,cursor,agy,pi,hermes}]
                        [--model MODEL] [--effort EFFORT] [--verify VERIFY]
                        [--budget-minutes BUDGET_MINUTES] [--base BASE]
                        [--detach] [--card-type CARD_TYPE]
@@ -17,7 +17,7 @@ options:
   --cards CARDS
   --hosts HOSTS
   --per-host PER_HOST
-  --backend {codex,ocgo,deepseek,cursor,agy,pi}
+  --backend {codex,ocgo,deepseek,cursor,agy,pi,hermes}
   --model MODEL
   --effort EFFORT
   --verify VERIFY
