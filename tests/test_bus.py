@@ -337,7 +337,15 @@ print(json.dumps({'type':'message_end','message':message}), flush=True)
 """)
         fake_pi.chmod(fake_pi.stat().st_mode | stat.S_IEXEC)
         os.environ["OPENSWARM_PI_BIN"] = str(fake_pi)
-        local_policy = {"bus": {"repo": "org/bus", "allowed_executors": ["executor"], "poll_seconds": 0.02}}
+        knowledge = self.root / "knowledge"
+        (knowledge / "lessons").mkdir(parents=True)
+        (knowledge / "card-types.yaml").write_text("types:\n  - fix\n")
+        (knowledge / "lessons" / "L-0300.yaml").write_text(
+            "id: L-0300\nrule: Validate worker edits with a focused test.\nguard_level: L2\n"
+            "applies_to:\n  card_types: [fix]\n  paths: [src/*.py]\n  backends: [pi]\n")
+        self.policy = xs.deep_merge(self.policy, {"knowledge": {"repo": str(knowledge)}})
+        local_policy = {"knowledge": {"repo": str(knowledge)},
+                        "bus": {"repo": "org/bus", "allowed_executors": ["executor"], "poll_seconds": 0.02}}
         (self.data / "policy.local.json").write_text(json.dumps(local_policy))
         run_id = "worker-e2e"
         metadata = {"run_id": run_id, "repo": "org/target", "base": self.base,
@@ -346,7 +354,8 @@ print(json.dumps({'type':'message_end','message':message}), flush=True)
                     "report_schema": xs.RESULT_SCHEMA}
         issue = xs.bus_create_issue("org/bus", self.cfg, "worker e2e", "write worker.txt", metadata)
         worker_args = argparse.Namespace(bus="org/bus", name="external-agent", backend="pi", model=None,
-                                         budget_minutes=1, once=True, repos="org/target", verify=None)
+                                         budget_minutes=1, once=True, repos="org/target", verify=None,
+                                         card_type="fix", paths=["src/worker.py"])
         os.environ["OPENSWARM_FAKE_GH_LOGIN"] = "executor"
         xs.cmd_bus_worker(worker_args, self.policy)
         current = self.issue(issue["number"])
@@ -354,6 +363,9 @@ print(json.dumps({'type':'message_end','message':message}), flush=True)
         self.assertIn("openswarm:done", names)
         result_comments = [xs.bus_parse_result(comment["body"]) for comment in current["comments"]]
         report = next(report for report in result_comments if report)
+        ledger = [json.loads(line) for line in (self.data / "ledger.jsonl").read_text().splitlines()]
+        entry = next(row for row in ledger if row["id"] == run_id)
+        self.assertEqual(entry["lessons_injected"], ["L-0300"])
         self.assertEqual(report["status"], "done")
         self.assertEqual(report["branch"], f"openswarm/{run_id}")
         self.assertFalse((self.root / "untrusted-verify-ran").exists())

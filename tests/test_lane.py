@@ -118,9 +118,14 @@ class LaneTests(unittest.TestCase):
         knowledge = self.root / "knowledge"
         knowledge.mkdir()
         (knowledge / "card-types.yaml").write_text("card_types:\n  - feature\n")
+        (knowledge / "lessons").mkdir()
+        (knowledge / "lessons" / "L-0200.yaml").write_text(
+            "id: L-0200\nrule: Keep lane edits covered by tests.\nguard_level: L2\n"
+            "applies_to:\n  card_types: [feature]\n  paths: [src/*.py]\n  backends: [pi]\n")
         (self.data / "policy.local.json").write_text(json.dumps({"knowledge": {"repo": str(knowledge)}}))
         self.start_lane()
-        run_id = self.assign("add the fixture change", "--card-type", "feature", "--rework-of", "parent-run")
+        run_id = self.assign("add the fixture change", "--card-type", "feature", "--paths", "src/lane.py",
+                             "--rework-of", "parent-run")
         state = self.wait_run(run_id)
         result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
         self.assertEqual(state["status"], "done")
@@ -131,7 +136,11 @@ class LaneTests(unittest.TestCase):
         entry = next(row for row in ledger if row["id"] == run_id)
         self.assertEqual(entry["card_type"], "feature")
         self.assertEqual(entry["rework_of"], "parent-run")
+        self.assertEqual(entry["lessons_injected"], ["L-0200"])
         self.assertEqual(entry["area"], ["lane_result.txt"])
+        messages = [json.loads(line) for line in pathlib.Path(self.env["FAKE_PI_RPC_LOG"]).read_text().splitlines()]
+        prompt = next(row["message"] for row in messages if row.get("type") == "prompt")
+        self.assertIn("[L-0200] Keep lane edits covered by tests.", prompt)
         self.assertEqual((self.data / "lanes" / self.lane_name / "wt" / "lane_result.txt").read_text(), "completed")
         self.assertEqual(self.git("show", f"openswarm/{run_id}:lane_result.txt"), "completed")
         self.assertFalse((self.repo / "lane_result.txt").exists())

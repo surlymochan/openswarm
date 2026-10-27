@@ -11,6 +11,7 @@ Subcommands:
   status           human summary of state + recommended concurrency
   route            pick backend/model/effort for a task profile (JSON out)
   run              route + execute in an isolated git worktree, record ledger (JSON out)
+  lessons          preview applicable knowledge-repo lessons
   lane             manage long-lived Codex app-server / Cursor ACP / Pi RPC executor lanes
   fleet            inspect hosts and forward openswarm commands over local / SSH / instabox transports
   batch            queue task cards across fleet hosts and collect their branches
@@ -123,7 +124,7 @@ def load_policy():
 
 def configured_card_types(policy):
     """Return the configured card types, or None when no list is available."""
-    repo = os.path.expanduser(str((policy.get("knowledge") or {}).get("repo") or "~/work/agent-knowledge"))
+    repo = os.path.expanduser(str((policy.get("knowledge") or {}).get("repo") or DEFAULT_KNOWLEDGE_REPO))
     path = os.path.join(repo, "card-types.yaml")
     try:
         with open(path, encoding="utf-8") as stream:
@@ -195,6 +196,217 @@ def validate_card_type(policy, card_type):
     known = configured_card_types(policy)
     if known is not None and card_type not in known:
         raise ValueError(f"unknown card type: {card_type}")
+
+
+DEFAULT_KNOWLEDGE_REPO = "~/work/agent-knowledge"
+LESSONS_MAX_COUNT = 12
+LESSONS_MAX_CHARS = 3000
+LESSONS_HEADER = "Lessons (L3 entries are reminders):\n"
+LESSON_FIELDS = {"id", "rule", "guard_level", "applies_to"}
+LESSON_APPLIES_TO_FIELDS = {"card_types", "paths", "backends"}
+
+
+def lesson_yaml_comment(line):
+    quote, escaped = None, False
+    for index, char in enumerate(line):
+        if quote == '"' and escaped:
+            escaped = False
+            continue
+        if quote == '"' and char == "\\":
+            escaped = True
+            continue
+        if quote and char == quote:
+            quote = None
+        elif not quote and char in ("'", '"'):
+            quote = char
+        elif not quote and char == "#" and (index == 0 or line[index - 1].isspace()):
+            return line[:index]
+    return line
+
+
+def lesson_yaml_scalar(raw, allow_list=False):
+    value = raw.strip()
+    if allow_list and value.startswith("["):
+        if not value.endswith("]"):
+            raise ValueError("unterminated inline list")
+        inner = value[1:-1].strip()
+        if not inner:
+            return []
+        items, start, quote, escaped = [], 0, None, False
+        for index, char in enumerate(inner):
+            if quote == '"' and escaped:
+                escaped = False
+                continue
+            if quote == '"' and char == "\\":
+                escaped = True
+                continue
+            if quote and char == quote:
+                quote = None
+            elif not quote and char in ("'", '"'):
+                quote = char
+            elif not quote and char == ",":
+                items.append(inner[start:index].strip())
+                start = index + 1
+        if quote:
+            raise ValueError("unterminated quoted list item")
+        items.append(inner[start:].strip())
+        if any(not item for item in items):
+            raise ValueError("inline list contains an empty item")
+        return [lesson_yaml_scalar(item) for item in items]
+    if not value:
+        raise ValueError("expected a scalar")
+    if value[0] in ("'", '"'):
+        if len(value) < 2 or value[-1] != value[0]:
+            raise ValueError("unterminated quoted scalar")
+        if value[0] == '"':
+            try:
+                parsed = json.loads(value)
+            except ValueError as error:
+                raise ValueError("invalid double-quoted scalar") from error
+        else:
+            inner = value[1:-1]
+            parsed_parts, index = [], 0
+            while index < len(inner):
+                if inner[index] == "'":
+                    if index + 1 >= len(inner) or inner[index + 1] != "'":
+                        raise ValueError("invalid single-quoted scalar")
+                    parsed_parts.append("'")
+                    index += 2
+                else:
+                    parsed_parts.append(inner[index])
+                    index += 1
+            parsed = "".join(parsed_parts)
+        if value[0] == "'" and "'" in value[1:-1].replace("''", ""):
+            raise ValueError("invalid single-quoted scalar")
+        if not isinstance(parsed, str) or not parsed:
+            raise ValueError("expected a non-empty string scalar")
+        return parsed
+    if (value[0] in "&*!|>{}[]" or value in ("null", "~") or value.startswith(("- ", "? "))
+            or ": " in value):
+        raise ValueError("unsupported YAML scalar syntax")
+    return value
+
+
+def parse_lesson_yaml(text):
+    """Parse one strict lesson mapping from the repository's small YAML subset."""
+    lesson, applies, active_map = {}, {}, None
+    for number, original in enumerate(text.splitlines(), 1):
+        content = lesson_yaml_comment(original).rstrip()
+        if not content.strip():
+            continue
+        if "\t" in content:
+            raise ValueError(f"line {number}: tabs are not supported")
+        indent = len(content) - len(content.lstrip(" "))
+        stripped = content.strip()
+        if indent == 0:
+            active_map = None
+            match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_-]*):(?:[ \t]*(.*))?", stripped)
+            if not match:
+                raise ValueError(f"line {number}: expected a top-level key and scalar")
+            key, raw = match.group(1), (match.group(2) or "").strip()
+            if key in lesson:
+                raise ValueError(f"line {number}: duplicate key {key!r}")
+            if key == "applies_to":
+                if raw:
+                    raise ValueError(f"line {number}: applies_to must be a nested mapping")
+                lesson[key] = applies
+                active_map = "applies_to"
+            else:
+                lesson[key] = lesson_yaml_scalar(raw)
+        elif indent == 2 and active_map == "applies_to":
+            match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_-]*):[ \t]*(.*)", stripped)
+            if not match:
+                raise ValueError(f"line {number}: expected an applies_to list")
+            key, raw = match.group(1), match.group(2).strip()
+            if key not in LESSON_APPLIES_TO_FIELDS:
+                raise ValueError(f"line {number}: unsupported applies_to key {key!r}")
+            if key in applies:
+                raise ValueError(f"line {number}: duplicate applies_to key {key!r}")
+            values = lesson_yaml_scalar(raw, allow_list=True)
+            if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+                raise ValueError(f"line {number}: applies_to.{key} must be an inline list")
+            applies[key] = values
+        else:
+            raise ValueError(f"line {number}: unsupported indentation or nested mapping")
+    missing = LESSON_FIELDS - lesson.keys()
+    if missing:
+        raise ValueError("missing required field(s): " + ", ".join(sorted(missing)))
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", lesson["id"]):
+        raise ValueError("id must contain only letters, digits, dot, underscore, or hyphen")
+    for key in LESSON_APPLIES_TO_FIELDS:
+        lesson["applies_to"].setdefault(key, [])
+    return lesson
+
+
+def lesson_path_matches(pattern, card_text, paths):
+    pattern = str(pattern).replace("\\", "/").strip()
+    text = str(card_text or "").replace("\\", "/")
+    candidates = [str(path).replace("\\", "/").strip() for path in (paths or []) if str(path).strip()]
+    candidates.extend(re.findall(r"(?<![\w.-])(?:\.{1,2}/)?[A-Za-z0-9_@.+-]+(?:/[A-Za-z0-9_.*?+{}@+-]+)+(?:\.[A-Za-z0-9_+-]+)?", text))
+    if any(fnmatch.fnmatchcase(candidate, pattern) for candidate in candidates):
+        return True
+    if not any(char in pattern for char in "*?["):
+        return pattern in text
+    return False
+
+
+def select_lessons(policy, card_type=None, backend=None, card_text="", paths=None):
+    repo = os.path.expanduser(str((policy.get("knowledge") or {}).get("repo") or DEFAULT_KNOWLEDGE_REPO))
+    directory = os.path.join(repo, "lessons")
+    try:
+        filenames = sorted(name for name in os.listdir(directory) if name.endswith(".yaml"))
+    except FileNotFoundError:
+        return "", []
+    except OSError as error:
+        print(f"openswarm: warning: cannot read lessons directory {directory}: {error}", file=sys.stderr)
+        return "", []
+    matched = []
+    for filename in filenames:
+        path = os.path.join(directory, filename)
+        try:
+            with open(path, encoding="utf-8") as stream:
+                lesson = parse_lesson_yaml(stream.read())
+        except (OSError, ValueError) as error:
+            print(f"openswarm: warning: skipping lesson file {path}: {error}", file=sys.stderr)
+            continue
+        if lesson["guard_level"] not in ("L2", "L3"):
+            continue
+        applies = lesson["applies_to"]
+        if applies["card_types"] and card_type not in applies["card_types"]:
+            continue
+        if applies["backends"] and backend not in applies["backends"]:
+            continue
+        if applies["paths"] and not any(lesson_path_matches(pattern, card_text, paths) for pattern in applies["paths"]):
+            continue
+        path_literals = [sum(char not in "*?[]" for char in pattern) for pattern in applies["paths"]]
+        dimensions = sum(bool(applies[key]) for key in ("card_types", "paths", "backends"))
+        selector_size = sum(len(applies[key]) for key in ("card_types", "paths", "backends"))
+        specificity = (-dimensions, -max(path_literals, default=0), selector_size, lesson["id"])
+        matched.append((specificity, lesson))
+    matched.sort(key=lambda item: item[0])
+    lines, ids, length = [], [], len(LESSONS_HEADER)
+    for _, lesson in matched:
+        rule = " ".join(lesson["rule"].split())
+        line = f"[{lesson['id']}] {rule}"
+        added = len(line) + (1 if lines else 0)
+        if len(lines) >= LESSONS_MAX_COUNT or length + added > LESSONS_MAX_CHARS:
+            continue
+        lines.append(line)
+        ids.append(lesson["id"])
+        length += added
+    return (LESSONS_HEADER + "\n".join(lines), ids) if lines else ("", [])
+
+
+def add_lessons_to_prompt(prompt, policy, card_type=None, backend=None, card_text="", paths=None):
+    block, ids = select_lessons(policy, card_type, backend, card_text, paths)
+    if block:
+        separator = "\n\n" + block + "\n\n"
+        report_at = prompt.rfind(REPORT_INSTRUCTION)
+        if report_at >= 0:
+            prompt = prompt[:report_at] + separator + prompt[report_at:]
+        else:
+            prompt += separator
+    return prompt, ids
 
 
 def source_enabled(policy, name):
@@ -2397,6 +2609,8 @@ def cmd_run(args, policy):
             v = getattr(args, flag, None)
             if v:
                 child += [f"--{flag.replace('_', '-')}", str(v)]
+        if getattr(args, "paths", None):
+            child += ["--paths", *args.paths]
         if getattr(args, "verify", None):
             child += ["--verify", args.verify]
         if getattr(args, "base", None):
@@ -2455,6 +2669,8 @@ def cmd_run(args, policy):
         prompt += (f"\nAfter you finish, the planner runs this acceptance command on the host, outside your sandbox: "
                    f"`{args.verify}`. If your sandbox blocks running it (ports, network, missing deps), say so in "
                    f"`tests` instead of treating it as a code failure.\n")
+    prompt, lessons_injected = add_lessons_to_prompt(
+        prompt, policy, card_type, decision["backend"], task, getattr(args, "paths", None))
     attempts, tried = [], []
     budget_denial = None
     deadline = NOW() + budget_min * 60
@@ -2565,6 +2781,7 @@ def cmd_run(args, policy):
                    "branch": fin.get("branch"), "verify": verify,
                    "files_changed": changed,
                    "card_type": card_type, "rework_of": rework_of,
+                   "lessons_injected": lessons_injected,
                    "reasons": decision.get("reasons")})
     set_status(rdir, state="finished", status=status, finished=NOW(), commit=fin.get("commit"))
     print(json.dumps(out, indent=2, ensure_ascii=False))
@@ -3232,6 +3449,8 @@ def bus_worker_run(issue, cfg, args, policy):
                    "--backend", args.backend]
         if card_type:
             command += ["--card-type", card_type]
+        if getattr(args, "paths", None):
+            command += ["--paths", *args.paths]
         if rework_of:
             command += ["--rework-of", rework_of]
         if args.model:
@@ -3802,7 +4021,7 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                         with open(os.path.join(rdir, "task.md"), "w") as f:
                             f.write(task)
                         spec = {k: req.get(k) for k in ("title", "verify", "verify_baseline", "budget_minutes", "base",
-                                                        "card_type", "rework_of")}
+                                                        "card_type", "rework_of", "paths")}
                         provider = execution_provider(lane["backend"], policy=load_policy(), lane=lane)
                         spec.update({"run_id": rid, "task": task, "started": NOW(), "provider": provider})
                         spec["_event_file"] = os.path.join(rdir, f"events.1.{lane['backend']}.jsonl")
@@ -4405,7 +4624,8 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
                    "files": len((final or {}).get("files_changed") or []),
                    "branch": fin.get("branch"), "verify": verify,
                    "files_changed": changed,
-                   "card_type": spec.get("card_type"), "rework_of": spec.get("rework_of")})
+                   "card_type": spec.get("card_type"), "rework_of": spec.get("rework_of"),
+                   "lessons_injected": spec.get("lessons_injected", [])})
     set_status(rdir, state="finished", status=status, finished=NOW(), commit=fin.get("commit"), lane=lane["name"])
     return out
 
@@ -4448,6 +4668,8 @@ def lane_do_run(lane, spec, child, server, current):
             prompt += (f"\nAfter you finish, the planner runs this acceptance command on the host, outside your sandbox: "
                        f"`{spec['verify']}`. If your sandbox blocks running it (ports, network, missing deps), say so in "
                        "`tests` instead of treating it as a code failure.\n")
+        prompt, spec["lessons_injected"] = add_lessons_to_prompt(
+            prompt, load_policy(), spec.get("card_type"), lane["backend"], task, spec.get("paths"))
         models = []
         for model in [lane["model"], *(lane.get("fallback_models") or [])]:
             if model not in models:
@@ -4791,7 +5013,8 @@ def cmd_lane_assign(args):
                                          "verify": args.verify, "verify_baseline": args.verify_baseline,
                                          "budget_minutes": budget, "base": args.base,
                                          "card_type": getattr(args, "card_type", None),
-                                         "rework_of": getattr(args, "rework_of", None)})
+                                         "rework_of": getattr(args, "rework_of", None),
+                                         "paths": getattr(args, "paths", None) or []})
     if response.get("ok"):
         response.update({"lane": lane["name"], "watch": f"openswarm watch {rid}",
                          "result": os.path.join(RUNS, rid, "result.json")})
@@ -5531,6 +5754,8 @@ def batch_launch(spec, row):
         for key in ("backend", "model", "effort", "verify", "budget_minutes", "card_type", "rework_of"):
             if spec.get(key) is not None:
                 args += ["--" + key.replace("_", "-"), str(spec[key])]
+        if spec.get("paths"):
+            args += ["--paths", *spec["paths"]]
         reply = host_json(host, args)
         return safe_id(reply["id"])
     finally:
@@ -5723,6 +5948,7 @@ def cmd_batch(args, policy):
             "per_host": args.per_host, "backend": backend, "provider": execution_provider(backend, decision, policy),
             "concurrency": concurrency_caps, "model": args.model, "effort": args.effort,
             "card_type": getattr(args, "card_type", None), "rework_of": getattr(args, "rework_of", None),
+            "paths": getattr(args, "paths", None) or [],
             "verify": args.verify, "budget_minutes": args.budget_minutes or round(policy["run"]["timeout_seconds"] / 60),
             "poll_seconds": args.poll_seconds}
     summary = {"id": bid, "repo": args.repo, "base": base, "state": "queued", "started": NOW(), "cards": [
@@ -6573,6 +6799,13 @@ def main():
     sp = sub.add_parser("status")
     sp.add_argument("--refresh", action="store_true")
 
+    sp = sub.add_parser("lessons", help="inspect applicable executor lessons")
+    lessons_sub = sp.add_subparsers(dest="lessons_cmd", required=True)
+    lp = lessons_sub.add_parser("preview", help="preview the lesson block for a dispatch")
+    lp.add_argument("--card-type")
+    lp.add_argument("--backend")
+    lp.add_argument("--paths", nargs="+", default=[])
+
     def add_profile(p, include_bus=False):
         p.add_argument("--type", default="impl",
                        help="impl|refactor|debug|test|docs|mechanical|review|research|migration|format|rename")
@@ -6593,6 +6826,7 @@ def main():
     add_profile(sp, include_bus=True)
     sp.add_argument("--card-type", help="optional task card type from knowledge/card-types.yaml")
     sp.add_argument("--rework-of", help="run id this task is reworking")
+    sp.add_argument("--paths", nargs="+", default=[], help="path hints for matching applicable lessons")
     sp.add_argument("--prompt")
     sp.add_argument("--task-file")
     sp.add_argument("--title")
@@ -6678,6 +6912,7 @@ def main():
     sp.add_argument("--detach", action="store_true")
     sp.add_argument("--card-type", help="optional task card type from knowledge/card-types.yaml")
     sp.add_argument("--rework-of", help="run id this batch reworks")
+    sp.add_argument("--paths", nargs="+", default=[], help="path hints for matching applicable lessons")
     sp.add_argument("--batch-id", help=argparse.SUPPRESS)
     sp.add_argument("--poll-seconds", type=float, default=2, help=argparse.SUPPRESS)
 
@@ -6706,6 +6941,7 @@ def main():
     sp.add_argument("--verify", help="worker-owned verify command")
     sp.add_argument("--card-type", help="default card type for bus tasks")
     sp.add_argument("--rework-of", help="run id this task reworks")
+    sp.add_argument("--paths", nargs="+", default=[], help="path hints for matching applicable lessons")
     sp.add_argument("--once", action="store_true", help="claim at most one queued issue, then exit")
 
     sp = sub.add_parser("lane", help="manage resident executor lanes")
@@ -6727,6 +6963,7 @@ def main():
     lp.add_argument("--base")
     lp.add_argument("--card-type", help="optional task card type from knowledge/card-types.yaml")
     lp.add_argument("--rework-of", help="run id this task is reworking")
+    lp.add_argument("--paths", nargs="+", default=[], help="path hints for matching applicable lessons")
     lp = lane_sub.add_parser("steer", help="steer the active turn")
     lp.add_argument("name")
     lp.add_argument("--text", required=True)
@@ -6764,6 +7001,10 @@ def main():
             print(json.dumps(st, indent=2, ensure_ascii=False))
     elif a.cmd == "status":
         cmd_status(policy, a.refresh)
+    elif a.cmd == "lessons":
+        block, _ = select_lessons(policy, a.card_type, a.backend, paths=a.paths)
+        if block:
+            print(block)
     elif a.cmd == "route":
         st = get_state(policy, a.refresh)
         print(json.dumps(route(profile_from_args(a), st, policy), indent=2, ensure_ascii=False))

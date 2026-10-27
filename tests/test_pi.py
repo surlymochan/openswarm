@@ -125,8 +125,13 @@ class PiBackend(unittest.TestCase):
         os.makedirs(knowledge)
         with open(os.path.join(knowledge, "card-types.yaml"), "w") as stream:
             stream.write("card_types:\n  - feature\n")
+        lessons = os.path.join(knowledge, "lessons")
+        os.makedirs(lessons)
+        with open(os.path.join(lessons, "L-0100.yaml"), "w") as stream:
+            stream.write("id: L-0100\nrule: Keep the generated helper covered by a test.\nguard_level: L2\n"
+                         "applies_to:\n  card_types: [feature]\n  paths: [src/*.py]\n  backends: [pi]\n")
         policy = xs.deep_merge(POLICY, {"knowledge": {"repo": knowledge}})
-        code = self.dispatch(policy=policy, card_type="feature", rework_of="previous-run")
+        code = self.dispatch(policy=policy, card_type="feature", rework_of="previous-run", paths=["src/add.py"])
         self.assertEqual(code, 0)
         entry, result = self.last_result()
         self.assertEqual(result["status"], "done")
@@ -137,6 +142,7 @@ class PiBackend(unittest.TestCase):
         self.assertEqual(entry["usage"], usage)
         self.assertEqual(entry["card_type"], "feature")
         self.assertEqual(entry["rework_of"], "previous-run")
+        self.assertEqual(entry["lessons_injected"], ["L-0100"])
         self.assertEqual(entry["run_id"], entry["id"])
         self.assertEqual(entry["area"], ["add.py"])
         self.assertEqual(entry["tokens"], {"input": 120, "output": 45, "total": 165})
@@ -148,9 +154,11 @@ class PiBackend(unittest.TestCase):
         self.assertIsNone(entry["review_findings"])
         self.assertIsNone(entry["merged"])
         self.assertIsNone(entry["defect_within_7d"])
-        self.assertEqual(entry["lessons_injected"], [])
+        self.assertEqual(entry["lessons_injected"], ["L-0100"])
         with open(self.log) as fh:
             argv = json.load(fh)
+        prompt = argv[-1]
+        self.assertIn("[L-0100] Keep the generated helper covered by a test.", prompt)
         self.assertEqual(argv[argv.index("--mode") + 1], "json")
         self.assertEqual(argv[argv.index("--tools") + 1], "read,bash,edit,write,grep,find,ls")
         self.assertIn("-p", argv)
