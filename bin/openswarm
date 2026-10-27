@@ -2,6 +2,8 @@
 """openswarm — Claude plans, Codex / OpenCode Go / DeepSeek execute.
 
 Cursor CLI is an opt-in executor (`--backend cursor`); it is not in the automatic routing order.
+The Antigravity CLI is an opt-in executor too (`--backend agy`, alias `--backend gemini`); it is not in
+the automatic routing order either.
 Pi coding agent is an opt-in executor (`--backend pi`); it is not in the automatic routing order either.
 
 Subcommands:
@@ -74,6 +76,12 @@ WORKTREES = f"{DATA}/worktrees"
 OPENCODE_DB = envvar("OPENCODE_DB", f"{HOME}/.local/share/opencode/opencode.db")
 
 NOW = time.time
+
+# The Antigravity CLI (`agy`) is the executor behind the `gemini` alias.
+AGY_DEFAULT_MODEL = "gemini-3.8-flash-medium"
+BACKEND_ALIASES = {"gemini": "agy"}
+AGY_LOGIN_TIMEOUT = 5
+_AGY_LOGIN_CACHE = {}
 
 
 # ---------------------------------------------------------------- utils
@@ -548,7 +556,7 @@ def probe(policy, quiet=False):
     state = {"generated_at": NOW(), "generated_at_local": iso(NOW()),
              "claude": probe_claude(policy), "codex": probe_codex(policy),
              "ocgo": probe_ocgo(policy), "deepseek": probe_deepseek(policy),
-             "cursor": probe_cursor(policy), "pi": probe_pi(policy)}
+             "cursor": probe_cursor(policy), "agy": probe_agy(policy), "pi": probe_pi(policy)}
     jsave(STATE, state)
     return state
 
@@ -877,6 +885,70 @@ def plan_cursor(prof, st, policy, forced, notes):
     return {"backend": "cursor", "model": model, "effort": None, "tier": tier}, None
 
 
+def agy_bin():
+    """OPENSWARM_AGY_BIN, then `agy` on PATH, then ~/.local/bin/agy.
+
+    A set OPENSWARM_AGY_BIN that is missing or not executable is an error, not a cue to try the next place.
+    """
+    env_bin = envvar("AGY_BIN")
+    if env_bin:
+        return env_bin if os.access(env_bin, os.X_OK) else None
+    found = shutil.which("agy")
+    if found and os.access(found, os.X_OK):
+        return found
+    home_bin = os.path.expanduser("~/.local/bin/agy")
+    if os.access(home_bin, os.X_OK):
+        return home_bin
+    return None
+
+
+def agy_login_state(binary=None):
+    """'logged in' / 'not logged in' from a cheap `agy models` call. Credentials are never read or shown."""
+    binary = binary or agy_bin()
+    if not binary:
+        return "unknown"
+    if binary in _AGY_LOGIN_CACHE:
+        return _AGY_LOGIN_CACHE[binary]
+    rc, out, err = sh([binary, "models"], timeout=AGY_LOGIN_TIMEOUT)
+    text = f"{out or ''}\n{err or ''}"
+    if rc == 0:
+        state = "logged in"
+    elif AUTH_ERROR_RE.search(text):
+        state = "not logged in"
+    else:
+        state = "unknown"
+    _AGY_LOGIN_CACHE[binary] = state
+    return state
+
+
+def agy_status(policy):
+    """Binary, default model and login state of the Antigravity CLI (never any credential)."""
+    cfg = policy.get("agy") or {}
+    binary = agy_bin()
+    return {"binary": binary, "default_model": cfg.get("default_model") or AGY_DEFAULT_MODEL,
+            "login": agy_login_state(binary)}
+
+
+def probe_agy(policy):
+    cfg = policy.get("agy") or {}
+    return {"binary": agy_bin(), "default_model": cfg.get("default_model") or AGY_DEFAULT_MODEL,
+            "login": agy_login_state(), "quota": None}
+
+
+def plan_agy(prof, st, policy, forced, notes):
+    known = st.get("agy") if isinstance(st.get("agy"), dict) else None
+    binary = known.get("binary") if known is not None and "binary" in known else agy_bin()
+    if not binary:
+        return None, "no working agy binary"
+    cfg = policy.get("agy") or {}
+    model = prof.get("model") or cfg.get("default_model") or (known or {}).get("default_model") or AGY_DEFAULT_MODEL
+    if f"agy/{model}" in breakers() or "agy/all" in breakers():
+        return None, "agy breaker open"
+    notes.append("agy quota unknown (opt-in backend; not metered by openswarm)")
+    tier = policy["difficulty_map"][str(prof["difficulty"])]["tier"]
+    return {"backend": "agy", "model": model, "effort": None, "tier": tier}, None
+
+
 def pi_bin():
     """OPENSWARM_PI_BIN, then `pi` on PATH, then ~/.local/bin/pi.
 
@@ -914,7 +986,13 @@ def plan_pi(prof, st, policy, forced, notes):
     return {"backend": "pi", "model": model, "effort": None, "tier": tier}, None
 
 
-PLANNERS = {"codex": plan_codex, "ocgo": plan_ocgo, "deepseek": plan_deepseek, "cursor": plan_cursor, "pi": plan_pi}
+PLANNERS = {"codex": plan_codex, "ocgo": plan_ocgo, "deepseek": plan_deepseek, "cursor": plan_cursor,
+            "agy": plan_agy, "pi": plan_pi}
+
+
+def canonical_backend(name):
+    """`gemini` is an accepted alias for the Antigravity (`agy`) backend."""
+    return BACKEND_ALIASES.get(name, name)
 
 
 def claude_mode(st, policy):
@@ -942,7 +1020,7 @@ def route(prof, st, policy, exclude=()):
     r = policy["routing"]
     notes = []
     if prof.get("backend"):
-        order = [prof["backend"]]
+        order = [canonical_backend(prof["backend"])]
     elif prof["type"] in r["review_types"]:
         order = ["ocgo", "codex", "deepseek"]
         notes.append("review: prefer a non-GPT family for an independent second opinion")
@@ -1008,7 +1086,8 @@ TASK:
 
 MODEL_UNAVAILABLE_RE = re.compile(r"(at capacity|server.?overloaded|overloaded|try a different model|model is not supported|not supported when using|model .{0,40}not (found|available))", re.I)
 OPENCODE_ABORT_RE = re.compile(r"stream error.*(usage limit exceeded|insufficient balance|quota exceeded|rate.?limit)", re.I)
-RATE_LIMIT_RE = re.compile(r"(\b429\b|rate.?limit|usage limit|quota|too many requests|insufficient balance|spend.?control)", re.I)
+RATE_LIMIT_RE = re.compile(r"(\b429\b|resource[_ -]?exhausted|rate.?limit|usage limit|quota|too many requests|insufficient balance|spend.?control)", re.I)
+AUTH_ERROR_RE = re.compile(r"(authentication required|not authenticated|unauthenticated|not logged in|please log ?in|login required|auth(?:entication)? error|FatalAuthenticationError)", re.I)
 
 
 def set_status(rdir, **kw):
@@ -1126,6 +1205,8 @@ def executor_error_class(rc, final, err_text):
         return "budget_exceeded"
     if rc != 0 and MODEL_UNAVAILABLE_RE.search(err_text or ""):
         return "model_unavailable"
+    if rc != 0 and AUTH_ERROR_RE.search(err_text or ""):
+        return "auth"
     if rc == 75 or (RATE_LIMIT_RE.search(err_text or "") and (rc != 0 or final is None)):
         return "rate_limit"
     if rc != 0 or final is None:
@@ -1155,7 +1236,7 @@ def run_executor_with_rate_limit(backend, decision, state, prompt, wd, rdir, bud
         event_file = os.path.join(rdir, f"events.{attempt_number}.{backend}.jsonl")
         call_decision = dict(decision)
         if continuation:
-            call_decision["_resume_session"] = resume_session if backend == "codex" else True
+            call_decision["_resume_session"] = resume_session if backend in ("codex", "agy") else True
         before = quota_used(state, decision)
 
         if not reserve_provider_slot(
@@ -1191,7 +1272,7 @@ def run_executor_with_rate_limit(backend, decision, state, prompt, wd, rdir, bud
 
         trip_breaker(rate_limit_breaker_key(backend, decision, err_text or "rate limited"), policy,
                      (err_text or "rate limited")[-200:])
-        can_resume = backend in ("pi", "cursor") or (backend == "codex" and (meta or {}).get("thread_id"))
+        can_resume = backend in ("pi", "cursor", "agy") or (backend == "codex" and (meta or {}).get("thread_id"))
         can_retry = retries < max_retries and can_resume
         wait_seconds = rate_limit_delay(policy, retries) if can_retry else 0
         lane_record_event(event_file, {"type": "RATELIMIT", "retry": retries + 1 if can_retry else retries,
@@ -1199,7 +1280,8 @@ def run_executor_with_rate_limit(backend, decision, state, prompt, wd, rdir, bud
                                        "backend": backend, "provider": provider})
         if not can_retry:
             return attempts, final, "rate_limit"
-        resume_session = (meta or {}).get("thread_id") if backend == "codex" else True
+        resume_session = (meta or {}).get("thread_id") if backend == "codex" else (
+            (meta or {}).get("conversation_id") or True if backend == "agy" else True)
         set_status(rdir, state="queued", queue_reason="rate limited", events=event_file,
                    attempt=attempt_number + 1, concurrency_keys=concurrency_keys(backend, provider))
         if not wait_run_rate_limit(wait_seconds, rdir, budget_deadline):
@@ -1258,6 +1340,8 @@ def event_commands(event):
     elif method in ("item/commandExecution/requestApproval", "execCommandApproval"):
         payload = event.get("params") or {}
     elif event.get("type") in ("tool_call", "tool_use"):
+        payload = event
+    elif event.get("type") == "step_update":  # agy stream-json
         payload = event
     elif event.get("type") == "assistant":
         payload = [b for b in (event.get("message") or {}).get("content") or []
@@ -1607,6 +1691,135 @@ def exec_cursor(d, st, prompt, wd, rdir, timeout, evp):
     return rc, final, {"usage": usage}, err_text
 
 
+AGY_USAGE_KEYS = ("input_tokens", "output_tokens", "thinking_tokens", "cache_read_tokens", "total_tokens")
+AGY_USAGE_NAMES = {"input_tokens": ("input_tokens", "inputTokens", "prompt_tokens"),
+                   "output_tokens": ("output_tokens", "outputTokens", "completion_tokens"),
+                   "thinking_tokens": ("thinking_tokens", "thinkingTokens", "reasoning_tokens"),
+                   "cache_read_tokens": ("cache_read_tokens", "cacheReadTokens", "cache_read"),
+                   "total_tokens": ("total_tokens", "totalTokens", "total")}
+
+
+def agy_usage(raw):
+    """The result envelope's usage object. Missing or malformed counts become 0."""
+    out = {k: 0 for k in AGY_USAGE_KEYS}
+    if not isinstance(raw, dict):
+        return out
+    for key, names in AGY_USAGE_NAMES.items():
+        for name in names:
+            if raw.get(name) is None:
+                continue
+            try:
+                out[key] = int(raw[name])
+            except (TypeError, ValueError):
+                out[key] = 0
+            break
+    return out
+
+
+def agy_event(event):
+    """(kind, payload) of one agy stream-json event. The event name may sit in type/event/kind."""
+    if not isinstance(event, dict):
+        return None, {}
+    kind = event.get("type") or event.get("event") or event.get("kind") or ""
+    payload = event
+    for key in ("data", "result", "payload"):
+        nested = event.get(key)
+        if isinstance(nested, dict) and ("status" in nested or "usage" in nested or "response" in nested):
+            payload = nested
+            break
+    return str(kind).lower(), payload
+
+
+def agy_result(event):
+    """The result envelope of an agy stream: conversation id, status, response, error and usage."""
+    _kind, payload = agy_event(event)
+    return {"conversation_id": payload.get("conversation_id") or payload.get("conversationId"),
+            "status": str(payload.get("status") or "").upper(),
+            "response": payload.get("response") or payload.get("text") or "",
+            "error": payload.get("error"),
+            "usage": agy_usage(payload.get("usage"))}
+
+
+def agy_step_text(payload):
+    """Best-effort assistant text of an agy step_update event."""
+    for key in ("text", "response", "message", "delta", "content"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+        if isinstance(value, dict):
+            nested = value.get("text") or value.get("content")
+            if isinstance(nested, str) and nested.strip():
+                return nested
+    return ""
+
+
+def agy_command(binary, model, prompt, effort=None, conversation=None, cfg=None):
+    """The agy headless invocation: one prompt per process, events on stdout as NDJSON."""
+    cmd = [binary, "-p", prompt, "--model", model, "--output-format", "stream-json",
+           "--dangerously-skip-permissions"]
+    if effort:
+        cmd += ["--effort", effort]
+    if conversation:
+        cmd += ["--conversation", conversation] if isinstance(conversation, str) else ["--continue"]
+    if (cfg or {}).get("print_timeout"):
+        cmd += ["--print-timeout", str((cfg or {})["print_timeout"])]
+    return cmd
+
+
+def exec_agy(d, st, prompt, wd, rdir, timeout, evp):
+    """agy -p <prompt> --model <slug> --output-format stream-json --dangerously-skip-permissions
+
+    stdin is /dev/null (run_proc) and cwd is the worktree. Quota is unknown; usage comes from the result event.
+    """
+    binary = agy_bin()
+    cfg = load_policy().get("agy") or {}
+    model = d.get("model") or cfg.get("default_model") or AGY_DEFAULT_MODEL
+    if not binary:
+        open(evp, "w").close()
+        with open(evp + ".err", "w") as f:
+            f.write("agy not found\n")
+        return 127, None, {"usage": agy_usage(None)}, "agy not found"
+    cmd = agy_command(binary, model, prompt, d.get("effort"), d.get("_resume_session"), cfg)
+    rc = run_proc(cmd, wd, os.environ.copy(), timeout, evp)
+    usage, response, errors, conversation = agy_usage(None), None, [], None
+    try:
+        streamed = open(evp, errors="ignore")
+    except OSError:
+        streamed = None
+    if streamed is not None:
+        with streamed:
+            for line in streamed:
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                kind, payload = agy_event(ev)
+                if not conversation and payload.get("conversation_id"):
+                    conversation = payload.get("conversation_id")
+                if kind != "result":
+                    continue
+                result = agy_result(ev)
+                if result["conversation_id"]:
+                    conversation = result["conversation_id"]
+                if any(result["usage"].values()):
+                    usage = result["usage"]
+                if result["response"]:
+                    response = result["response"]
+                if result["error"] or result["status"] in ("ERROR", "INVALID"):
+                    errors.append(short(result["error"] or result["response"] or "agy error", 500))
+    try:
+        with open(evp + ".err", errors="ignore") as errf:
+            err_tail = errf.read()[-3000:]
+    except OSError:
+        err_tail = ""
+    err_text = "\n".join(errors) + err_tail
+    if errors and rc == 0:
+        rc = 1
+    final = extract_json(response) if isinstance(response, str) else (
+        response if isinstance(response, dict) and "status" in response else None)
+    return rc, final, {"usage": usage, "conversation_id": conversation}, err_text
+
+
 PI_USAGE_KEYS = ("input", "output", "cacheRead", "cacheWrite")
 PI_TOOLS = "read,bash,edit,write,grep,find,ls"
 
@@ -1680,7 +1893,7 @@ def exec_pi(d, st, prompt, wd, rdir, timeout, evp):
 
 
 EXECUTORS = {"codex": exec_codex, "ocgo": exec_opencode, "deepseek": exec_opencode, "cursor": exec_cursor,
-             "pi": exec_pi}
+             "agy": exec_agy, "pi": exec_pi}
 
 
 def git(args, cwd, timeout=60):
@@ -1929,9 +2142,9 @@ def adjust_status_for_verify(status, verify):
 
 
 JUNK = ["__pycache__/**", "*.pyc", ".DS_Store", "node_modules/**", ".pytest_cache/**", ".venv/**", "*.egg-info/**"]
-NEVER_COMMIT = ["*_????????-????-????-????-????????????.jsonl", ".pi/", ".codex/", ".cursor/",
+NEVER_COMMIT = ["*_????????-????-????-????-????????????.jsonl", ".pi/", ".codex/", ".cursor/", ".agy/",
                 "pi-session*.jsonl", "codex-session*.jsonl", "cursor-session*.jsonl",
-                "pi*.log", "codex*.log", "cursor*.log"]
+                "pi*.log", "codex*.log", "cursor*.log", "agy*.log"]
 
 
 def executor_artifact(path, patterns):
@@ -2159,7 +2372,7 @@ def cmd_run(args, policy):
         attempts.extend(current_attempts)
         if err_class == "model_unavailable":  # same backend, next model in the tier
             trip_breaker(f"{b}/{decision['model']}", policy, attempts[-1].get("error_tail") or "model unavailable")
-        if err_class == "rate_limit" and b in ("pi", "codex", "cursor"):
+        if err_class == "rate_limit" and b in ("pi", "codex", "cursor", "agy"):
             result = final
             break
         if final is not None or err_class not in ("rate_limit", "exec_error", "model_unavailable") or not policy["run"]["fallback"] \
@@ -2261,7 +2474,7 @@ def cmd_run(args, policy):
 # ---------------------------------------------------------------- GitHub issue bus
 
 BUS_STATES = ("queued", "claimed", "done", "failed", "cancelled")
-BUS_EXECUTOR_BACKENDS = ("codex", "ocgo", "deepseek", "cursor", "pi")
+BUS_EXECUTOR_BACKENDS = ("codex", "ocgo", "deepseek", "cursor", "agy", "pi")
 BUS_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 BUS_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$")
 BUS_SHA_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
@@ -3028,8 +3241,8 @@ def lane_config():
         if name in names:
             raise ValueError(f"invalid lane config {where}: duplicate lane name {name!r}")
         names.add(name)
-        if backend not in ("codex", "cursor", "pi"):
-            raise ValueError(f"invalid lane config {where}: backend must be codex, cursor, or pi")
+        if backend not in ("codex", "cursor", "agy", "pi"):
+            raise ValueError(f"invalid lane config {where}: backend must be codex, cursor, agy, or pi")
         repo = lane.get("repo")
         if not isinstance(repo, str) or not os.path.isabs(repo):
             raise ValueError(f"invalid lane config {where}: repo must be an absolute path")
@@ -3037,6 +3250,8 @@ def lane_config():
             raise ValueError(f"invalid lane config {where}: repo directory does not exist: {repo}")
         if backend == "cursor" and lane.get("model") is None:
             lane["model"] = "composer-2.5"
+        if backend == "agy" and lane.get("model") is None:
+            lane["model"] = AGY_DEFAULT_MODEL
         if not isinstance(lane.get("model"), str) or not lane["model"].strip():
             raise ValueError(f"invalid lane config {where}: model is required")
         fallback_models = lane.get("fallback_models")
@@ -3262,6 +3477,10 @@ class LaneChild:
     def alive(self):
         return self.proc.poll() is None
 
+    @property
+    def pid(self):
+        return self.proc.pid
+
     def send(self, obj):
         with self.write_lock:
             self.proc.stdin.write(json.dumps(obj, ensure_ascii=False) + "\n")
@@ -3317,6 +3536,96 @@ class LaneChild:
                 stream.close()
             except Exception:
                 pass
+
+
+class AgyChild:
+    """Resident lane child for the Antigravity CLI: one `agy -p` process per turn.
+
+    agy has no ACP/RPC mode, so every turn is a fresh headless run in the lane worktree.
+    A steer aborts the running process and resumes the conversation; an abort kills the process tree.
+    """
+
+    def __init__(self, lane, cwd, policy):
+        self.lane, self.cwd = lane, cwd
+        self.proc = None
+        self.events = queue.Queue()
+        self.stderr_lines = []
+
+    def start(self, prompt, model=None, effort=None, conversation=None):
+        """Run one headless agy turn; events land in self.events as they arrive."""
+        binary = envvar("AGY_BIN") or self.lane.get("binary") or agy_bin()
+        if not binary:
+            raise RuntimeError("agy binary not found; set lane binary or install the Antigravity CLI")
+        cfg = load_policy().get("agy") or {}
+        cmd = agy_command(binary, model or self.lane["model"], prompt, effort or self.lane.get("effort"),
+                          conversation, cfg)
+        proc = subprocess.Popen(cmd, cwd=self.cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, bufsize=1, start_new_session=True)
+        events, stderr_lines = queue.Queue(), []
+        self.proc, self.events, self.stderr_lines = proc, events, stderr_lines
+        threading.Thread(target=self._read_stdout, args=(proc, events), daemon=True).start()
+        threading.Thread(target=self._read_stderr, args=(proc, stderr_lines), daemon=True).start()
+        return proc.pid
+
+    def _read_stdout(self, proc, events):
+        try:
+            for line in proc.stdout:
+                try:
+                    events.put(json.loads(line))
+                except ValueError:
+                    continue
+        finally:
+            events.put(None)
+
+    def _read_stderr(self, proc, stderr_lines):
+        try:
+            for line in proc.stderr:
+                stderr_lines.append(line)
+        except Exception:
+            pass
+
+    def alive(self):
+        """An agy lane runs one process per turn, so an idle lane (no process) is alive."""
+        return self.proc is None or self.proc.poll() is None
+
+    @property
+    def pid(self):
+        return self.proc.pid if self.proc else None
+
+    def send(self, obj):
+        pass  # headless print mode has no control channel
+
+    def next_event(self, timeout=0):
+        try:
+            return self.events.get(timeout=timeout)
+        except queue.Empty:
+            return False
+
+    def wait_response(self, req_id, timeout=30, event_file=None):
+        raise RuntimeError("agy headless mode has no RPC channel")
+
+    def stderr_text(self):
+        return "".join(self.stderr_lines)
+
+    def close(self):
+        if self.alive():
+            kill_tree(self.proc.pid, grace=1)
+        try:
+            self.proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            pass
+        for stream in (self.proc.stdout, self.proc.stderr):
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+
+def lane_child(lane, cwd, policy):
+    """The resident child of a lane: a long-lived RPC/ACP process, or one agy process per turn."""
+    if lane["backend"] == "agy":
+        return AgyChild(lane, cwd, policy)
+    return LaneChild(lane, cwd, policy)
 
 
 def lane_record_event(path, event):
@@ -3392,6 +3701,12 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                             lane_record_event(event_file, {"type": "steer", "mode": "cancel-and-continue", "text": text})
                             turn.setdefault("steer_queue", []).append(text)
                             lane_cursor_cancel(child, turn)
+                        elif lane["backend"] == "agy":
+                            event_file = current.get("_event_file") or os.path.join(
+                                RUNS, current.get("run_id", ""), f"events.1.{lane['backend']}.jsonl")
+                            lane_record_event(event_file, {"type": "steer", "mode": "abort-and-resume", "text": text})
+                            turn.setdefault("steer_queue", []).append(text)
+                            lane_agy_stop(child)
                         elif turn.get("id") and child and child.alive():
                             if lane["backend"] == "codex":
                                 child.send({"jsonrpc": "2.0", "id": f"steer-{uuid.uuid4().hex}", "method": "turn/steer",
@@ -3451,11 +3766,19 @@ def lane_abort_child(lane, child, turn):
             child.send({"jsonrpc": "2.0", "method": "session/cancel",
                         "params": {"sessionId": turn["session_id"]}})
             turn["cursor_cancel_sent"] = True
+        elif lane["backend"] == "agy":
+            lane_agy_stop(child)
         else:
             turn["abort_pending"] = True
         turn["abort_sent"] = True
     except (BrokenPipeError, OSError):
         pass
+
+
+def lane_agy_stop(child):
+    """Kill the running agy process tree; the turn is resumed with the steer text."""
+    if child and child.pid and child.proc and child.proc.poll() is None:
+        kill_tree(child.proc.pid, grace=1)
 
 
 def lane_begin_turn(lane, child, prompt, worktree, event_file, turn):
@@ -3487,6 +3810,10 @@ def lane_begin_turn(lane, child, prompt, worktree, event_file, turn):
         pid = "prompt-" + uuid.uuid4().hex
         child.send({"id": pid, "type": "prompt", "message": prompt})
         turn["id"] = pid
+    elif lane["backend"] == "agy":
+        turn["id"] = "agy-" + uuid.uuid4().hex
+        turn["prompt"] = prompt
+        child.start(prompt, model=lane["model"], effort=lane.get("effort"))
     else:
         sid = "session-" + uuid.uuid4().hex
         child.send({"jsonrpc": "2.0", "id": sid, "method": "session/new",
@@ -3544,6 +3871,10 @@ def lane_continue_turn(lane, child, prompt, event_file, turn):
         req_id = "prompt-" + uuid.uuid4().hex
         child.send({"id": req_id, "type": "prompt", "message": prompt})
         turn["id"] = req_id
+    elif lane["backend"] == "agy":
+        turn["id"] = "agy-" + uuid.uuid4().hex
+        child.start(prompt, model=lane["model"], effort=lane.get("effort"),
+                    conversation=turn.get("conversation_id"))
     else:
         lane_cursor_start_prompt(child, turn, prompt)
 
@@ -3620,7 +3951,7 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
     set_status(rdir, state="running", lane=lane["name"], backend=lane["backend"], model=lane["model"],
                effort=lane.get("effort"), provider=provider, concurrency_keys=concurrency_keys(lane["backend"], provider),
                workspace=ws["path"], events=event_file, attempt=attempt, deadline=deadline,
-               executor_pid=child.proc.pid)
+               executor_pid=child.pid)
     lane_record_event(event_file, {"type": "lane_start", "lane": lane["name"]})
     if continuation:
         lane_continue_turn(lane, child, prompt, event_file, turn)
@@ -3635,6 +3966,9 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
                                        "input": [{"type": "text", "text": value}]}})
             elif lane["backend"] == "pi":
                 child.send({"id": f"steer-{uuid.uuid4().hex}", "type": "steer", "message": value})
+            elif lane["backend"] == "agy":
+                turn.setdefault("steer_queue", []).append(value)
+                lane_agy_stop(child)
             else:
                 turn.setdefault("steer_queue", []).append(value)
                 lane_cursor_cancel(child, turn)
@@ -3643,6 +3977,33 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
     budget_hit = NOW() >= deadline
     risk_policy = load_policy()
     abort_deadline = None
+
+    def agy_resume_steer():
+        """Restart the agy turn with the queued steer text; True when a new turn was started."""
+        if not turn.get("steer_queue") or spec.get("abort_requested") or budget_hit:
+            return False
+        correction = turn["steer_queue"].pop(0)
+        # The follow-up prompt replaces the cancelled one, so it has to restate the report
+        # requirement; otherwise the agent finishes the work without printing the JSON report.
+        # The task text is kept as well: without a conversation id the new run starts from scratch.
+        child.start(f"{turn.get('prompt') or ''}\n\n"
+                    "Correction to the interrupted task: apply this update while continuing the task.\n\n"
+                    + correction + "\n\n" + REPORT_INSTRUCTION,
+                    model=lane["model"], effort=lane.get("effort"), conversation=turn.get("conversation_id"))
+        turn["id"] = "agy-" + uuid.uuid4().hex
+        return True
+
+    def lane_failure(detail):
+        """Error class of a lane turn that ended without a report (agy reports auth failures on stderr)."""
+        text = detail or ""
+        if lane["backend"] == "agy":
+            text = child.stderr_text()[-600:] or text
+        if AUTH_ERROR_RE.search(text):
+            return "auth", text
+        if RATE_LIMIT_RE.search(text):
+            return "rate_limit", text
+        return ("risk_blocked" if spec.get("risk_blocks") else "exec_error"), text
+
     if budget_hit:
         lane_abort_child(lane, child, turn)
         abort_deadline = NOW() + 30
@@ -3671,9 +4032,22 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
         msg = child.next_event(0.15)
         if msg is False:
             if not child.alive():
-                return None, usage, "risk_blocked" if spec.get("risk_blocks") else "exec_error", 1, event_file, "resident executor process exited"
+                if lane["backend"] == "agy":
+                    msg = child.next_event(1.0)  # a finished process may still have events in its pipe
+                    if msg is False:
+                        if agy_resume_steer():
+                            continue
+                        error_class, detail = lane_failure("resident executor process exited")
+                        return None, usage, error_class, 1, event_file, detail
+                else:
+                    return None, usage, "risk_blocked" if spec.get("risk_blocks") else "exec_error", 1, event_file, "resident executor process exited"
             continue
         if msg is None:
+            if lane["backend"] == "agy":
+                if agy_resume_steer():
+                    continue
+                error_class, detail = lane_failure("resident executor stdout closed")
+                return None, usage, error_class, 1, event_file, detail
             return None, usage, "risk_blocked" if spec.get("risk_blocks") else "exec_error", 1, event_file, "resident executor stdout closed"
         block = enforced_risk(msg, risk_policy, ws["path"])
         if block:
@@ -3729,6 +4103,30 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
                                        if isinstance(b, dict) and b.get("type") == "text")
                         final = extract_json(text) or final
                 ended = True
+        elif lane["backend"] == "agy":
+            lane_record_event(event_file, msg)
+            kind, payload = agy_event(msg)
+            if payload.get("conversation_id"):
+                turn["conversation_id"] = payload.get("conversation_id")
+            if kind != "result":
+                continue
+            result = agy_result(msg)
+            if result["conversation_id"]:
+                turn["conversation_id"] = result["conversation_id"]
+            if any(result["usage"].values()):
+                usage = result["usage"]
+            if spec.get("abort_requested") or budget_hit:
+                ended = True
+            elif turn.get("steer_queue"):
+                if agy_resume_steer():
+                    continue
+                ended = True
+            elif result["status"] in ("SUCCESS", ""):
+                final = extract_json(result["response"]) or final
+                ended = True
+            else:
+                errors.append(short(result["error"] or result["response"] or "agy error", 400))
+                ended = True
         else:
             if msg.get("method") and "id" in msg and lane_acp_request(child, msg, event_file):
                 continue
@@ -3767,7 +4165,13 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
     if budget_hit:
         return final, usage, "budget_exceeded", 124, event_file, None
     if errors:
-        error_class = "rate_limit" if RATE_LIMIT_RE.search(" ".join(errors)) else "exec_error"
+        text = " ".join(errors)
+        if AUTH_ERROR_RE.search(text):
+            error_class = "auth"
+        elif RATE_LIMIT_RE.search(text):
+            error_class = "rate_limit"
+        else:
+            error_class = "exec_error"
         return final, usage, error_class, 75 if error_class == "rate_limit" else 1, event_file, errors[-1]
     if final is None:
         # The turn ended normally (cursor end_turn / codex turn completed / pi agent_end) but no JSON
@@ -4033,8 +4437,8 @@ def cmd_lane_serve(lane, policy):
             rc, _, err = lane_git(["worktree", "add", "--detach", "-q", wt, base], top, timeout=300)
             if rc:
                 raise RuntimeError(f"lane worktree creation failed: {err[:250]}")
-        child = LaneChild(lane, wt, policy)
-        lane_write_state(name, state="idle", child_pid=child.proc.pid, last_error=None,
+        child = lane_child(lane, wt, policy)
+        lane_write_state(name, state="idle", child_pid=child.pid, last_error=None,
                          turn_state=None, concurrency_keys=[])
     except Exception as e:
         traceback.print_exc()
@@ -4065,9 +4469,9 @@ def cmd_lane_serve(lane, policy):
         if child is None and NOW() >= next_start:
             try:
                 wt = os.path.join(lane_root(name), "wt")
-                child = LaneChild(lane, wt, policy)
+                child = lane_child(lane, wt, policy)
                 backoff = 1
-                lane_write_state(name, state="idle", child_pid=child.proc.pid, current_run=None, last_error=None,
+                lane_write_state(name, state="idle", child_pid=child.pid, current_run=None, last_error=None,
                                  turn_state=None, concurrency_keys=[])
             except Exception as e:
                 traceback.print_exc()
@@ -4089,7 +4493,7 @@ def cmd_lane_serve(lane, policy):
                 down_after = bool(spec.get("down_requested"))
                 current.clear()
             if child and child.alive():
-                lane_write_state(name, state="idle", child_pid=child.proc.pid, current_run=None, last_error=None)
+                lane_write_state(name, state="idle", child_pid=child.pid, current_run=None, last_error=None)
             else:
                 lane_write_state(name, state="crashed", child_pid=None, current_run=None,
                                  last_error="resident executor process exited")
@@ -4097,7 +4501,7 @@ def cmd_lane_serve(lane, policy):
                 shutdown = True
             continue
         if child:
-                lane_write_state(name, state="idle", child_pid=child.proc.pid, current_run=None,
+                lane_write_state(name, state="idle", child_pid=child.pid, current_run=None,
                                  turn_state=None, concurrency_keys=[])
         timeout = max(0, min(0.5, next_start - NOW())) if child is None else 0.5
         try:
@@ -4478,8 +4882,9 @@ def fleet_snapshot():
             runs.append(row)
     policy = load_policy()
     providers = {backend: execution_provider(backend, policy=policy)
-                 for backend in ("codex", "cursor", "pi", "ocgo", "deepseek")}
-    return {"lanes": lanes, "active_runs": runs, "providers": providers}
+                 for backend in ("codex", "cursor", "agy", "pi", "ocgo", "deepseek")}
+    return {"lanes": lanes, "active_runs": runs, "providers": providers,
+            "backends": {"agy": agy_status(policy)}}
 
 
 def cmd_fleet(args):
@@ -4526,6 +4931,10 @@ def cmd_fleet(args):
         for row in rows:
             state = "paused" if row["paused"] else ("reachable" if row["reachable"] else "unreachable")
             print(f"{row['name']}  {state}  lanes={len(row['lanes'])} active={len(row['active_runs'])}")
+            agy = (row.get("backends") or {}).get("agy") or {}
+            if agy:
+                print(f"  agy bin={agy.get('binary') or '-'} model={agy.get('default_model') or '-'} "
+                      f"login={agy.get('login') or 'unknown'}")
             for lane in row["lanes"]:
                 print(f"  {lane['name']} {lane['state']} {lane.get('model') or '-'} run={lane.get('current_run') or '-'}")
             for run in row["active_runs"]:
@@ -4949,6 +5358,14 @@ def summarize_event(o):
     t = o.get("type", "")
     if t == "steer":
         return "msg", f"Steer ({o.get('mode', 'queued')}): {o.get('text', '')}"
+    if t == "step_update":  # agy stream-json
+        text = agy_step_text(o)
+        return ("msg", text) if text else (None, None)
+    if t == "result" and ("status" in o or "conversation_id" in o):  # agy stream-json
+        result = agy_result(o)
+        if result["status"] in ("ERROR", "INVALID"):
+            return "error", short(result["error"] or result["response"] or "agy error", 400)
+        return "end", json.dumps(result["usage"])
     if t == "permission_request":
         return "msg", f"Permission granted ({o.get('selected') or 'cancelled'}): {o.get('title') or 'tool access'}"
     it = o.get("item") or {}
@@ -5533,6 +5950,10 @@ def cmd_status(policy, refresh):
     print(f"Pi       opt-in (--backend pi) bin={pi.get('binary') or '-'} "
           f"model={pi.get('default_model') or (policy.get('pi') or {}).get('default_model') or 'pi default'} "
           f"quota=unknown")
+    ag = st.get("agy") or {}
+    print(f"Antigravity opt-in (--backend agy, alias gemini) bin={ag.get('binary') or '-'} "
+          f"model={ag.get('default_model') or (policy.get('agy') or {}).get('default_model') or AGY_DEFAULT_MODEL} "
+          f"login={ag.get('login') or agy_login_state()} quota=unknown")
     br = breakers()
     if br:
         print(f"Breakers {', '.join(f'{k} until {iso(v)}' for k, v in br.items())}")
@@ -5555,9 +5976,10 @@ def main():
                        help="impl|refactor|debug|test|docs|mechanical|review|research|migration|format|rename")
         p.add_argument("--difficulty", type=int, default=3, help="1 (trivial) .. 5 (hardest)")
         p.add_argument("--context-tokens", type=int, default=0, help="approx context the executor must read")
-        backends = ["codex", "ocgo", "deepseek", "cursor", "pi"] + (["github-issue"] if include_bus else [])
+        backends = ["codex", "ocgo", "deepseek", "cursor", "agy", "gemini", "pi"] + (["github-issue"] if include_bus else [])
         p.add_argument("--backend", choices=backends,
-                       help="force a backend. cursor and pi are opt-in and are not chosen unless named here or listed in routing")
+                       help="force a backend. cursor, agy (alias gemini) and pi are opt-in and are not chosen "
+                            "unless named here or listed in routing")
         p.add_argument("--model")
         p.add_argument("--effort")
 

@@ -45,10 +45,12 @@ class LaneTests(unittest.TestCase):
     def set_config(self, backend=None, model=None, fallback_models=None):
         if backend:
             self.backend = backend
-        fixture = {"codex": "fake_app_server.py", "cursor": "fake_cursor_acp.py", "pi": "fake_pi_rpc.py"}[self.backend]
+        fixture = {"codex": "fake_app_server.py", "cursor": "fake_cursor_acp.py",
+                   "agy": "fake_agy.py", "pi": "fake_pi_rpc.py"}[self.backend]
         binary = FIXTURES / fixture
         if model is None:
-            model = "composer-2.5" if self.backend == "cursor" else "fake-model"
+            model = "composer-2.5" if self.backend == "cursor" else (
+                "gemini-3.8-flash-medium" if self.backend == "agy" else "fake-model")
         (self.data / "lanes").mkdir(parents=True, exist_ok=True)
         (self.data / "lanes.json").write_text(json.dumps({"lanes": [{
             "name": self.lane_name, "backend": self.backend, "model": model,
@@ -59,6 +61,8 @@ class LaneTests(unittest.TestCase):
         }]}))
         if self.backend == "cursor":
             self.env["FAKE_CURSOR_ACP_LOG"] = str(self.root / "fake-cursor-acp.jsonl")
+        if self.backend == "agy":
+            self.env["FAKE_AGY_LOG"] = str(self.root / "fake-agy.jsonl")
 
     def git(self, *args):
         return subprocess.run(["git", *args], cwd=self.repo, check=True, capture_output=True, text=True).stdout.strip()
@@ -384,6 +388,39 @@ class LaneTests(unittest.TestCase):
         for value in values:
             self.assertIn(value, events)
         self.assertNotIn("session/prompt", [entry.get("method") for entry in self.cursor_log()])
+
+    def test_agy_assign_commits_and_writes_normal_result(self):
+        self.set_config("agy")
+        self.start_lane()
+        run_id = self.assign("add the fixture change")
+        state = self.wait_run(run_id)
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual(state["status"], "done")
+        self.assertEqual(result["backend"], "agy")
+        self.assertEqual(result["model"], "gemini-3.8-flash-medium")
+        self.assertEqual(result["usage"]["input_tokens"], 120)
+        self.assertTrue(result["commit"])
+        self.assertEqual(self.git("show", f"openswarm/{run_id}:lane_result.txt"),
+                         "completed by the fake Antigravity CLI")
+        calls = [json.loads(line) for line in pathlib.Path(self.env["FAKE_AGY_LOG"]).read_text().splitlines()]
+        self.assertEqual(calls[0][calls[0].index("--model") + 1], "gemini-3.8-flash-medium")
+        self.assertEqual(calls[0][calls[0].index("--output-format") + 1], "stream-json")
+
+    def test_agy_steer_aborts_the_process_and_resumes_the_conversation(self):
+        self.set_config("agy")
+        self.start_lane()
+        run_id = self.assign("LANE_TEST_WAIT original task")
+        self.wait_running(run_id)
+        self.cli("lane", "steer", self.lane_name, "--text", "write steered instruction")
+        self.assertEqual(self.wait_run(run_id)["status"], "done")
+        calls = [json.loads(line) for line in pathlib.Path(self.env["FAKE_AGY_LOG"]).read_text().splitlines()]
+        self.assertEqual(len(calls), 2)
+        self.assertIn("--conversation", calls[1])
+        self.assertEqual(calls[1][calls[1].index("--conversation") + 1], "conv-1")
+        self.assertIn("write steered instruction", calls[1][calls[1].index("-p") + 1])
+        events = (self.data / "runs" / run_id / "events.1.agy.jsonl").read_text()
+        self.assertIn('"mode": "abort-and-resume"', events)
+        self.assertTrue((self.data / "lanes" / self.lane_name / "wt" / "lane_result.txt").exists())
 
     def test_cursor_permission_is_allowed_and_logged(self):
         self.set_config("cursor")

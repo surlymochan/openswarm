@@ -1,0 +1,20 @@
+{
+  "id": "agy",
+  "name": "Antigravity CLI (agy -p)",
+  "role": "opt-in executor. Not selected unless --backend agy (alias --backend gemini) is passed, or \"agy\" is listed in routing.default_order",
+  "invoke": "agy -p <prompt> --model <slug> --output-format stream-json --dangerously-skip-permissions",
+  "stdin": "/dev/null",
+  "cwd": "<worktree>",
+  "binary_resolution": "OPENSWARM_AGY_BIN, else agy on PATH, else ~/.local/bin/agy",
+  "model": "--model, else policy agy.default_model (gemini-3.8-flash-medium)",
+  "quota_source": "none (unknown). Token usage is read from the result envelope after the run, not used for routing",
+  "usage_fields": ["input_tokens", "output_tokens", "thinking_tokens", "cache_read_tokens", "total_tokens"],
+  "steerSupport": "abort-and-resume: the running process is killed and the conversation is resumed with the steer text",
+  "streaming_events": "NDJSON stream-json lines: init, step_update and a result envelope (conversation_id, status, response, error, usage)",
+  "costTier": "unknown",
+  "privacyRisk": "model_provider",
+  "dataBoundary": "worktree + Antigravity",
+  "never": [
+    "reading anything under ~/.gemini or other credential stores"
+  ]
+}
