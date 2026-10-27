@@ -34,6 +34,7 @@ import fnmatch
 import fcntl
 import hashlib
 import html
+import io
 import json
 import math
 import os
@@ -662,9 +663,9 @@ def trip_breaker(key, policy, reason):
     jsave(BREAKERS, b)
 
 
-def recent_ledger(n=50):
+def recent_ledger(n=50, path=None):
     try:
-        with open(LEDGER) as f:
+        with open(path or LEDGER) as f:
             lines = f.readlines()[-n:]
         return [json.loads(x) for x in lines if x.strip()]
     except Exception:
@@ -4908,6 +4909,129 @@ def host_run(host, command, timeout=60, input=None):
         return 127, b"", b"transport executable unavailable"
 
 
+LEDGER_MAX_LINE_BYTES = 64 * 1024
+LEDGER_MAX_HOST_LINES = 100_000
+
+
+def ledger_stream_records(stream, host_name, max_lines=LEDGER_MAX_HOST_LINES, per_host_limit=False):
+    """Read bounded JSONL rows, tagging legacy records and redacting titles again."""
+    lines, host_lines = 0, {}
+    while max_lines is None or lines < max_lines:
+        line = stream.readline(LEDGER_MAX_LINE_BYTES + 3)
+        if not line:
+            break
+        lines += 1
+        if len(line) > LEDGER_MAX_LINE_BYTES + 2 or (
+                len(line.rstrip(b"\r\n")) > LEDGER_MAX_LINE_BYTES):
+            while not line.endswith(b"\n"):
+                line = stream.readline(8192)
+                if not line or line.endswith(b"\n"):
+                    break
+            continue
+        try:
+            entry = json.loads(line)
+        except (ValueError, UnicodeError):
+            continue
+        if not isinstance(entry, dict):
+            continue
+        entry = dict(entry)
+        record_host = entry.get("host")
+        if not isinstance(record_host, str) or not record_host:
+            record_host = host_name
+        if per_host_limit:
+            if host_lines.get(record_host, 0) >= LEDGER_MAX_HOST_LINES:
+                continue
+            host_lines[record_host] = host_lines.get(record_host, 0) + 1
+        entry["host"] = record_host
+        if isinstance(entry.get("title"), str):
+            entry["title"] = bus_redact(entry["title"])
+        run_id = entry.get("run_id") or entry.get("id")
+        if run_id is None:
+            continue
+        entry["run_id"] = run_id
+        yield entry
+
+
+def ledger_records(data, host_name):
+    return list(ledger_stream_records(io.BytesIO(data), host_name))
+
+
+def fleet_ledger_path():
+    return os.path.join(DATA, "ledger-fleet.jsonl")
+
+
+def cmd_fleet_ledger_pull(args):
+    hosts = fleet_config()
+    if args.hosts:
+        requested = [name.strip() for name in args.hosts.split(",") if name.strip()]
+        if not requested:
+            raise ValueError("--hosts requires at least one host name")
+        unknown = [name for name in requested if name not in hosts]
+        if unknown:
+            raise ValueError("unknown fleet host: " + ", ".join(unknown))
+        selected = [hosts[name] for name in dict.fromkeys(requested)]
+    else:
+        selected = list(hosts.values())
+    if not selected:
+        raise ValueError("fleet has no hosts")
+
+    destination = os.path.expanduser(args.into) if args.into else fleet_ledger_path()
+    merged, seen = [], set()
+
+    # Keep existing rows first, so a pull never rewrites an already collected record.
+    try:
+        with open(destination, "rb") as stream:
+            for record in ledger_stream_records(stream, "local", max_lines=None, per_host_limit=True):
+                key = (str(record.get("host") or "local"), str(record["run_id"]))
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(record)
+    except FileNotFoundError:
+        pass
+
+    succeeded = 0
+    for host in selected:
+        if host["kind"] == "local":
+            try:
+                with open(LEDGER, "rb") as stream:
+                    succeeded += 1
+                    for record in ledger_stream_records(stream, host["name"]):
+                        key = (str(record.get("host") or host["name"]), str(record["run_id"]))
+                        if key not in seen:
+                            seen.add(key)
+                            merged.append(record)
+            except OSError as error:
+                succeeded -= 1
+                print(f"{host['name']}: unreachable ({error})", file=sys.stderr)
+            continue
+        else:
+            ledger_file = '"$HOME"/.claude/openswarm/ledger.jsonl'
+            rc, data, error = host_run(host, "cat " + ledger_file, timeout=60)
+            if rc:
+                detail = error.decode(errors="replace").strip() or f"transport failed (rc={rc})"
+                print(f"{host['name']}: unreachable ({detail})", file=sys.stderr)
+                continue
+            records = iter(ledger_records(data, host["name"]))
+        succeeded += 1
+        for record in records:
+            key = (str(record.get("host") or host["name"]), str(record["run_id"]))
+            if key not in seen:
+                seen.add(key)
+                merged.append(record)
+
+    if not succeeded:
+        print("no fleet host ledger could be read", file=sys.stderr)
+        raise SystemExit(1)
+
+    os.makedirs(os.path.dirname(os.path.abspath(destination)), exist_ok=True)
+    temporary = f"{destination}.tmp{os.getpid()}"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        for record in merged:
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+    os.replace(temporary, destination)
+    print(f"pulled {len(merged)} ledger entries into {destination}")
+
+
 def host_openswarm(host, args):
     binary = host.get("openswarm") or (os.path.realpath(__file__) if host["kind"] == "local"
                                        else "~/.local/bin/openswarm")
@@ -5047,6 +5171,9 @@ def cmd_fleet(args):
         sys.stdout.buffer.write(out)
         sys.stderr.buffer.write(err)
         raise SystemExit(rc)
+    if args.fleet_cmd == "ledger" and args.fleet_ledger_cmd == "pull":
+        cmd_fleet_ledger_pull(args)
+        return
     hosts = list(fleet_config().values())
     states = instabox_states(hosts)
     rows = []
@@ -6256,6 +6383,11 @@ def main():
     fp.add_argument("--timeout", type=float, default=300)
     fp.add_argument("host")
     fp.add_argument("args", nargs=argparse.REMAINDER)
+    fp = fleet_sub.add_parser("ledger", help="collect ledgers from fleet hosts")
+    fleet_ledger_sub = fp.add_subparsers(dest="fleet_ledger_cmd", required=True)
+    fp = fleet_ledger_sub.add_parser("pull", help="merge host ledgers into one file")
+    fp.add_argument("--hosts", help="comma-separated fleet host names")
+    fp.add_argument("--into", help="destination JSONL path")
     fleet_sub.add_parser("_snapshot", help=argparse.SUPPRESS)
     fp = fleet_sub.add_parser("_run-info", help=argparse.SUPPRESS)
     fp.add_argument("run_id")
@@ -6351,6 +6483,7 @@ def main():
     sp = sub.add_parser("ledger")
     sp.add_argument("-n", type=int, default=20)
     sp.add_argument("--json", action="store_true", help="print full ledger records as JSON")
+    sp.add_argument("--fleet", action="store_true", help="read the merged fleet ledger")
 
     a = ap.parse_args()
     policy = load_policy()
@@ -6433,7 +6566,7 @@ def main():
     elif a.cmd == "ingest-claude":
         ingest_claude(a)
     elif a.cmd == "ledger":
-        entries = recent_ledger(a.n)
+        entries = recent_ledger(a.n, fleet_ledger_path() if a.fleet else None)
         if a.json:
             print(json.dumps(entries, indent=2, ensure_ascii=False))
         else:
