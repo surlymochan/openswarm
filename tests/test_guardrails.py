@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import subprocess
 import sys
@@ -132,6 +133,64 @@ class GuardrailsTests(unittest.TestCase):
         self.assertTrue(xs.rm_outside_worktree("cd /tmp && bash -lc 'rm file'", str(self.root)))
         self.assertTrue(xs.enforced_risk({"type": "tool_execution_start", "args": {"command": "bash -lc 'git push origin'"}}, {}, str(self.root)))
         self.assertEqual(xs.enforced_risk({"type": "tool_execution_start", "args": {"command": "cat .env"}}, {}, str(self.root))["risk"], "secret print")
+
+    def test_rm_guard_accepts_worktree_subdirectories_and_executor_tmp(self):
+        nested = self.root / "nested"
+        nested.mkdir()
+        root = str(self.root.resolve())
+        self.assertFalse(xs.rm_outside_worktree("cd nested && rm -rf file", str(self.root)))
+        self.assertFalse(xs.rm_outside_worktree("rm -rf $TMPDIR/cache", str(self.root)))
+        self.assertFalse(xs.rm_outside_worktree("rm -rf .openswarm-tmp/cache", str(self.root)))
+        self.assertTrue(xs.rm_outside_worktree("rm -rf $TMPDIR/../../outside", str(self.root)))
+        self.assertTrue(xs.rm_outside_worktree("rm -rf /outside/file", str(self.root)))
+        self.assertEqual(xs.rm_target_path_class("nested/file", root, root), "inside")
+        self.assertEqual(xs.rm_target_path_class("$TMPDIR/cache", root, root), "tmp")
+        self.assertEqual(xs.rm_target_path_class("$TMPDIR/../../outside", root, root), "outside")
+        self.assertEqual(xs.rm_target_path_class("/outside/file", root, root), "outside")
+
+    def test_rm_block_records_only_path_class(self):
+        outside = Path(tempfile.mkdtemp(prefix="outside-wt-"))
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        target = outside / "private-file"
+        target.write_text("keep private path out of run result\n")
+        block = xs.enforced_risk({"type": "tool_execution_start", "args": {
+            "command": f"rm -rf {target}"}}, {}, str(self.root))
+        self.assertEqual(block["path_class"], "outside")
+        self.assertNotIn(str(target), json.dumps(block))
+
+    def test_executor_tmp_environment_is_local_excluded_and_cleaned(self):
+        repo = self.root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        nested = repo / "nested"
+        nested.mkdir()
+        self.assertFalse(xs.rm_outside_worktree("rm -rf file", str(nested)))
+        self.assertFalse(xs.rm_outside_worktree("cd nested && rm -rf file", str(repo)))
+
+        tmpdir, env = xs.configure_executor_environment(str(repo), {"PATH": os.environ.get("PATH", "")})
+        self.assertEqual(tmpdir, str(repo.resolve() / ".openswarm-tmp"))
+        self.assertTrue(Path(tmpdir).is_dir())
+        self.assertEqual([env[name] for name in ("TMPDIR", "TMP", "TEMP")], [tmpdir] * 3)
+        exclude = subprocess.run(["git", "rev-parse", "--git-path", "info/exclude"], cwd=repo,
+                                 check=True, capture_output=True, text=True).stdout.strip()
+        exclude_path = Path(exclude) if os.path.isabs(exclude) else repo / exclude
+        self.assertIn("/.openswarm-tmp/", exclude_path.read_text())
+
+        result_path = self.root / "executor-env.json"
+        script = self.root / "check_executor_env.py"
+        script.write_text(
+            "import json, os\n"
+            "tmp = os.environ['TMPDIR']\n"
+            "json.dump({'tmpdir': tmp, 'tmp': os.environ['TMP'], 'temp': os.environ['TEMP'], "
+            "'exists': os.path.isdir(tmp)}, open(os.environ['RESULT_PATH'], 'w'))\n")
+        events = self.root / "runs" / "executor" / "events.jsonl"
+        events.parent.mkdir(parents=True)
+        self.assertEqual(xs.run_proc([sys.executable, str(script)], str(repo),
+                                     {"RESULT_PATH": str(result_path)}, 10, str(events)), 0)
+        executor_env = json.loads(result_path.read_text())
+        self.assertEqual([executor_env[name] for name in ("tmpdir", "tmp", "temp")], [tmpdir] * 3)
+        self.assertTrue(executor_env["exists"])
+        self.assertFalse(Path(tmpdir).exists())
 
     def report_fixture(self):
         self.ledger([
