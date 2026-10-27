@@ -11,6 +11,7 @@ Subcommands:
   status           human summary of state + recommended concurrency
   route            pick backend/model/effort for a task profile (JSON out)
   run              route + execute in an isolated git worktree, record ledger (JSON out)
+  compare          run the same card on two executors and record a best-of-two comparison
   review           cross-family read-only review of a finished run
   consult          ask multiple executors the same question in read-only mode
   lessons          preview, propose, and escalate executor lessons
@@ -4008,7 +4009,8 @@ def cmd_run(args, policy):
                    "lessons_injected": lessons_injected,
                    "reasons": decision.get("reasons"), **routing_fields})
     set_status(rdir, state="finished", status=status, finished=NOW(), commit=fin.get("commit"))
-    maybe_schedule_auto_review(rid, card_type, status, fin.get("branch"), fin.get("commit"), policy)
+    if not getattr(args, "no_auto_review", False):
+        maybe_schedule_auto_review(rid, card_type, status, fin.get("branch"), fin.get("commit"), policy)
     print(json.dumps(out, indent=2, ensure_ascii=False))
     sys.exit(3 if budget_denial else 0 if status == "done" else 1)
 
@@ -8619,6 +8621,436 @@ def consult_module():
     return module
 
 
+COMPARE_DEFAULT_ORDER = ("codex", "ocgo", "deepseek", "agy", "cursor", "pi")
+
+
+def parse_compare_backend(value):
+    backend, separator, model = str(value or "").partition(":")
+    backend = canonical_backend(backend.strip())
+    model = model.strip() if separator else None
+    if backend not in PLANNERS or (separator and not model):
+        raise ValueError("backend must be codex, ocgo, deepseek, cursor, agy, pi, or BACKEND:MODEL")
+    return backend, model
+
+
+def compare_backend_family(backend, model=None, policy=None, state=None):
+    """Resolve the broad provider family used to keep the two candidates independent."""
+    backend = canonical_backend(backend)
+    policy = policy or {}
+    if backend == "codex":
+        return "openai"
+    if backend == "deepseek":
+        return "deepseek"
+    if backend == "agy":
+        return "google"
+    if backend == "ocgo":
+        models = ((state or {}).get("ocgo") or {}).get("models") or []
+        match = next((item for item in models if item.get("id") == model), None)
+        return str((match or {}).get("family") or "ocgo").casefold()
+    if backend == "cursor":
+        model = model or ((policy.get("cursor") or {}).get("default_model"))
+        prefix = str(model or "").casefold().split("-", 1)[0]
+        return {"gpt": "openai", "claude": "anthropic", "gemini": "google", "grok": "xai"}.get(
+            prefix, "cursor")
+    if backend == "pi":
+        provider = ((policy.get("pi") or {}).get("provider"))
+        model_prefix = str(model or "").split("/", 1)[0]
+        return str(provider or model_prefix or "pi").casefold()
+    return backend
+
+
+def select_compare_backends(args, policy):
+    explicit_a = parse_compare_backend(args.a) if args.a else None
+    explicit_b = parse_compare_backend(args.b) if args.b else None
+    state = get_state(policy)
+    profile = {"type": "impl", "difficulty": 3}
+    candidates = []
+    if not explicit_a or not explicit_b:
+        order = list((policy.get("routing") or {}).get("default_order") or COMPARE_DEFAULT_ORDER)
+        order.extend(COMPARE_DEFAULT_ORDER)
+        for backend in order:
+            backend = canonical_backend(backend)
+            if backend not in PLANNERS or any(item[0] == backend for item in candidates):
+                continue
+            decision = route({**profile, "backend": backend}, state, policy)
+            if decision.get("ok"):
+                model = decision.get("model")
+                family = compare_backend_family(backend, model, policy, state)
+                candidates.append((backend, model, family))
+
+    def as_candidate(explicit):
+        backend, model = explicit
+        return backend, model, compare_backend_family(backend, model, policy, state)
+
+    def choose_other(used):
+        for candidate in candidates:
+            if candidate[2] != used:
+                return candidate
+        raise ValueError("two available executor families are required; specify --a and --b")
+
+    if explicit_a and explicit_b:
+        a, b = as_candidate(explicit_a), as_candidate(explicit_b)
+    elif explicit_a:
+        a = as_candidate(explicit_a)
+        b = choose_other(a[2])
+    elif explicit_b:
+        b = as_candidate(explicit_b)
+        a = choose_other(b[2])
+    else:
+        if not candidates:
+            raise ValueError("no available executor backends")
+        a = candidates[0]
+        b = choose_other(a[2])
+    if a[2] == b[2]:
+        raise ValueError(f"compare executors must be from different families ({a[2]})")
+    for backend, _, _ in (a, b):
+        if not route({**profile, "backend": backend}, state, policy).get("ok"):
+            raise ValueError(f"compare backend is unavailable: {backend}")
+    return {"a": {"backend": a[0], "model": a[1]}, "b": {"backend": b[0], "model": b[1]}}
+
+
+def compare_diff_stats(result):
+    workspace = result.get("workspace") if isinstance(result.get("workspace"), dict) else {}
+    repo, base, branch = workspace.get("repo"), workspace.get("base"), result.get("branch")
+    if not isinstance(repo, str) or not os.path.isdir(repo) or not base or not branch:
+        return {"available": False, "files": None, "insertions": None, "deletions": None,
+                "changed_lines": None, "paths": [], "error": "completed diff unavailable"}
+    rc, output, error = git(["diff", "--no-ext-diff", "--no-textconv", "--numstat", f"{base}...{branch}"], repo)
+    if rc:
+        return {"available": False, "files": None, "insertions": None, "deletions": None,
+                "changed_lines": None, "paths": [], "error": short(error, 300)}
+    insertions = deletions = 0
+    paths = []
+    for line in output.splitlines():
+        columns = line.split("\t", 2)
+        if len(columns) != 3:
+            continue
+        added, removed, path = columns
+        paths.append(path)
+        if added.isdigit():
+            insertions += int(added)
+        if removed.isdigit():
+            deletions += int(removed)
+    return {"available": True, "files": len(paths), "insertions": insertions, "deletions": deletions,
+            "changed_lines": insertions + deletions, "paths": sorted(paths)}
+
+
+def compare_verify_rc(result):
+    verify = result.get("verify") if isinstance(result.get("verify"), dict) else {}
+    rc = verify.get("rc", result.get("verify_rc"))
+    return rc if isinstance(rc, int) and not isinstance(rc, bool) else None
+
+
+def compare_review_counts(review):
+    if review.get("status") != "reviewed":
+        return None
+    findings = review.get("findings") or []
+    return {key: sum(item.get("severity") == severity for item in findings)
+            for key, severity in (("p0", "P0"), ("p1", "P1"), ("p2", "P2"))}
+
+
+def compare_candidate_score(candidate):
+    rc = candidate.get("verify_rc")
+    counts = compare_review_counts(candidate.get("review") or {})
+    stats = candidate.get("diff") or {}
+    seconds = candidate.get("seconds")
+    return {"verify_pass": rc == 0 if rc is not None else None,
+            "p0p1": counts["p0"] + counts["p1"] if counts is not None else None,
+            "diff_size": stats.get("changed_lines") if stats.get("available") else None,
+            "seconds": seconds if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) else None}
+
+
+def compare_order(a, b):
+    """Return 1 if A wins, -1 if B wins, or 0 for an exact score tie."""
+    left, right = a["score"], b["score"]
+    left_pass, right_pass = left.get("verify_pass") is True, right.get("verify_pass") is True
+    if left_pass != right_pass:
+        return 1 if left_pass else -1
+    # A failed cross-family review is missing evidence; record it and skip this criterion.
+    if left.get("p0p1") is not None and right.get("p0p1") is not None and left["p0p1"] != right["p0p1"]:
+        return 1 if left["p0p1"] < right["p0p1"] else -1
+    for key in ("diff_size", "seconds"):
+        lv, rv = left.get(key), right.get(key)
+        if lv is None and rv is not None:
+            return -1
+        if rv is None and lv is not None:
+            return 1
+        if lv is not None and rv is not None and lv != rv:
+            return 1 if lv < rv else -1
+    return 0
+
+
+def choose_compare_winner(a, b):
+    order = compare_order(a, b)
+    return a if order > 0 else b if order < 0 else None
+
+
+def compare_diff_notes(a, b, winner):
+    stats_a, stats_b = a.get("diff") or {}, b.get("diff") or {}
+    notes = []
+    if stats_a.get("available") and stats_b.get("available"):
+        notes.append(f"A changed {stats_a['files']} files and {stats_a['changed_lines']} lines "
+                     f"(+{stats_a['insertions']}/-{stats_a['deletions']}); B changed {stats_b['files']} files "
+                     f"and {stats_b['changed_lines']} lines (+{stats_b['insertions']}/-{stats_b['deletions']}).")
+        only_a = sorted(set(stats_a.get("paths") or []) - set(stats_b.get("paths") or []))
+        only_b = sorted(set(stats_b.get("paths") or []) - set(stats_a.get("paths") or []))
+        shared = sorted(set(stats_a.get("paths") or []) & set(stats_b.get("paths") or []))
+        if only_a:
+            notes.append("A-only changed paths: " + ", ".join(only_a) + ".")
+        if only_b:
+            notes.append("B-only changed paths: " + ", ".join(only_b) + ".")
+        if shared:
+            notes.append("Changed by both: " + ", ".join(shared) + ".")
+    else:
+        notes.append("Diff statistics are unavailable for at least one candidate.")
+    for label, candidate in (("A", a), ("B", b)):
+        review = candidate.get("review") or {}
+        if review.get("status") == "reviewed":
+            findings = review.get("findings") or []
+            if findings:
+                details = "; ".join(f"{item['severity']} {item['path']}:{item['line']} {item['title']}"
+                                     for item in findings)
+                notes.append(f"Review of {label} reported {details}.")
+            else:
+                notes.append(f"Review of {label} reported no findings.")
+        else:
+            notes.append(f"Review of {label} failed: {review.get('error') or 'unknown error'}.")
+    if winner:
+        notes.append(f"Winner: {winner['label']} ({winner['backend']}) based on the score ordering.")
+    else:
+        notes.append("The candidates tied on the available score criteria; there is no winner.")
+    return [bus_redact(note) for note in notes]
+
+
+def compare_run_command(run_id, backend, model, args, cwd, minutes):
+    command = [sys.executable, os.path.realpath(__file__), "run", "--run-id", run_id,
+               "--cwd", cwd, "--title", args.title, "--budget-minutes", str(minutes),
+               "--backend", backend]
+    if model:
+        command += ["--model", model]
+    if args.card_type:
+        command += ["--card-type", args.card_type]
+    if args.verify:
+        command += ["--verify", args.verify]
+    command.append("--no-auto-review")
+    return command
+
+
+def run_compare_executors(compare_id, task, selections, args, minutes):
+    cwd = os.path.abspath(os.getcwd())
+    processes, outputs = {}, {}
+    for label in ("a", "b"):
+        run_id = new_run_id()
+        while run_id == compare_id or os.path.exists(os.path.join(RUNS, run_id)):
+            run_id = new_run_id()
+        rdir = os.path.join(RUNS, run_id)
+        os.makedirs(rdir, exist_ok=False)
+        with open(os.path.join(rdir, "task.md"), "w", encoding="utf-8") as stream:
+            stream.write(task)
+        selection = selections[label]
+        try:
+            processes[label] = (run_id, subprocess.Popen(
+                compare_run_command(run_id, selection["backend"], selection.get("model"), args, cwd, minutes),
+                cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, start_new_session=True))
+        except OSError as error:
+            outputs[label] = (run_id, None, f"could not start executor: {bus_redact(str(error))}")
+    # Both children are started before either is joined, allowing their worktrees to run concurrently.
+    for label, (run_id, process) in processes.items():
+        try:
+            stdout, _ = process.communicate()
+            outputs[label] = (run_id, process.returncode, stdout or "")
+        except Exception as error:
+            outputs[label] = (run_id, None, f"executor runner failed: {bus_redact(str(error))}")
+    results = {}
+    for label in ("a", "b"):
+        run_id, returncode, output = outputs[label]
+        result = jload(os.path.join(RUNS, run_id, "result.json"))
+        if not isinstance(result, dict) or not isinstance(result.get("status"), str):
+            try:
+                parsed = json.loads(output)
+                result = parsed if isinstance(parsed, dict) and isinstance(parsed.get("status"), str) else None
+            except (TypeError, ValueError):
+                result = None
+        if result is None:
+            result = {"id": run_id, "status": "failed", "backend": selections[label]["backend"],
+                      "model": selections[label].get("model"), "seconds": None,
+                      "error_class": "compare_runner_failed", "error": bus_redact(output or
+                                                                                   f"runner exited {returncode}"),
+                      "verify": None, "workspace": {}}
+        result.setdefault("id", run_id)
+        result.setdefault("backend", selections[label]["backend"])
+        result.setdefault("model", selections[label].get("model"))
+        results[label] = result
+    return results
+
+
+def compare_review(run_id, policy):
+    try:
+        payload = perform_peer_review(run_id, None, policy)
+        counts = {key: sum(item["severity"] == severity for item in payload["findings"])
+                  for key, severity in (("p0", "P0"), ("p1", "P1"), ("p2", "P2"))}
+        record = jload(os.path.join(RUNS, run_id, "review.json"), {}) or {}
+        return {"status": "reviewed", "by": record.get("by"), **counts, **payload}
+    except Exception as error:
+        return {"status": "failed", "error": bus_redact(str(error))[:500]}
+
+
+def update_compare_ledger(candidates, compare_id, winner_id):
+    path = LEDGER
+    os.makedirs(DATA, exist_ok=True)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    lock_path = os.path.join(DATA, "budget.lock")
+    with open(lock_path, "a") as budget_lock, open(path + ".lock", "a") as ledger_lock:
+        for held in sorted((budget_lock, ledger_lock), key=lambda item: item.name):
+            fcntl.flock(held, fcntl.LOCK_EX)
+        try:
+            with open(path, encoding="utf-8") as stream:
+                lines = stream.readlines()
+        except FileNotFoundError:
+            lines = []
+        positions = {}
+        for index, line in enumerate(lines):
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(entry, dict):
+                run_id = entry.get("id") or entry.get("run_id")
+                if run_id:
+                    positions[run_id] = index
+        for candidate in candidates:
+            run_id = candidate["run_id"]
+            result = candidate.get("result") or {}
+            nested = result.get("result") if isinstance(result.get("result"), dict) else {}
+            entry = {"id": run_id, "run_id": run_id, "ts": NOW(), "title": result.get("title"),
+                     "status": result.get("status") or "failed", "backend": candidate.get("backend"),
+                     "model": candidate.get("model"), "summary": result.get("error") or nested.get("summary"),
+                     "seconds": result.get("seconds"), "verify": result.get("verify"),
+                     "verify_rc": candidate.get("verify_rc"), "compare_id": compare_id,
+                     "compare_result": "tie" if winner_id is None else "win" if winner_id == run_id else "lose"}
+            if run_id in positions:
+                index = positions[run_id]
+                old = json.loads(lines[index])
+                old.update({key: value for key, value in entry.items()
+                            if key in ("compare_id", "compare_result")})
+                lines[index] = json.dumps(bus_sanitize(old), ensure_ascii=False) + "\n"
+            else:
+                positions[run_id] = len(lines)
+                lines.append(json.dumps(bus_sanitize(entry), ensure_ascii=False) + "\n")
+        fd, temporary = tempfile.mkstemp(prefix=".ledger-compare-", dir=os.path.dirname(path) or ".")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.writelines(lines)
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+
+def compare_markdown(report):
+    lines = [f"# Best-of-two comparison: {bus_redact(report['title'])}", "",
+             f"Compare ID: `{report['id']}`", "",
+             f"Winner: **{report['winner_label'] or 'none'}**" +
+             (f" (`{report['winner']}`)" if report.get("winner") else ""), ""]
+    for label in ("a", "b"):
+        candidate = report["runs"][label]
+        result = candidate.get("result") or {}
+        diff = candidate.get("diff") or {}
+        review = candidate.get("review") or {}
+        nested = result.get("result") if isinstance(result.get("result"), dict) else {}
+        lines.extend([f"## {label.upper()} — {candidate['backend']}" +
+                      (f" (`{candidate['model']}`)" if candidate.get("model") else ""), "",
+                      f"- Run: `{candidate['run_id']}`; status: {result.get('status') or 'unknown'}",
+                      f"- Verify rc: {candidate.get('verify_rc') if candidate.get('verify_rc') is not None else 'not available'}",
+                      f"- Diff: {diff.get('files') if diff.get('available') else 'unavailable'} files; "
+                      f"{diff.get('insertions') if diff.get('available') else '—'} insertions, "
+                      f"{diff.get('deletions') if diff.get('available') else '—'} deletions",
+                      f"- Review: {review.get('status')}" +
+                      (f"; P0/P1/P2 = {review.get('p0', 0)}/{review.get('p1', 0)}/{review.get('p2', 0)}"
+                       if review.get("status") == "reviewed" else f"; {review.get('error', 'unknown error')}"),
+                      f"- Seconds: {candidate.get('seconds') if candidate.get('seconds') is not None else 'not available'}",
+                      f"- Summary: {bus_redact(nested.get('summary') or result.get('error') or '—')}", ""])
+    lines.extend(["## Diff notes", ""])
+    lines.extend(f"- {note}" for note in report.get("diff_notes") or [])
+    if report.get("proposal"):
+        lines.extend(["", f"Pattern proposal: `{report['proposal']}`"])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_compare_proposal(report, policy):
+    knowledge = os.path.expanduser(str((policy.get("knowledge") or {}).get("repo") or DEFAULT_KNOWLEDGE_REPO))
+    date = policy_day(policy)[0]
+    directory = os.path.join(knowledge, "proposals", date)
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, f"pattern-{report['id']}.md")
+    winner = report["runs"][report["winner_label"].lower()]
+    diff = winner.get("diff") or {}
+    text = [f"# Pattern proposal from compare {report['id']}", "",
+            f"Winner: {winner['backend']} (`{winner['run_id']}`).", "", "## Evidence", "",
+            f"- Verify rc: {winner.get('verify_rc') if winner.get('verify_rc') is not None else 'not available'}.",
+            (f"- Diff: {diff.get('files')} files, {diff.get('insertions')} insertions, "
+             f"{diff.get('deletions')} deletions." if diff.get("available") else
+             "- Diff statistics are unavailable."),
+            f"- Review status: {winner.get('review', {}).get('status')}."]
+    text.extend(f"- {note}" for note in report.get("diff_notes") or [])
+    text.extend(["", "## Proposed pattern", "",
+                 "Review the recorded changed paths and reviewer findings before adopting this approach for "
+                 "similar cards. This proposal records observed differences; it does not claim the comparison "
+                 "establishes causation.", ""])
+    with open(path, "x", encoding="utf-8") as stream:
+        stream.write("\n".join(text))
+    return path
+
+
+def cmd_compare(args, policy):
+    validate_card_type(policy, args.card_type)
+    task_path = os.path.abspath(os.path.expanduser(args.task_file))
+    with open(task_path, encoding="utf-8") as stream:
+        task = stream.read()
+    if not task.strip():
+        raise ValueError("empty task")
+    selections = select_compare_backends(args, policy)
+    minutes = args.budget_minutes if args.budget_minutes is not None else policy["run"]["timeout_seconds"] / 60
+    check_budget(policy, [(selections[label]["backend"], minutes) for label in ("a", "b")])
+    compare_id = new_run_id()
+    while os.path.exists(os.path.join(RUNS, compare_id)):
+        compare_id = new_run_id()
+    output_dir = os.path.join(RUNS, compare_id)
+    os.makedirs(output_dir, exist_ok=False)
+    results = run_compare_executors(compare_id, task, selections, args, minutes)
+    candidates = {}
+    for label in ("a", "b"):
+        result = results[label]
+        run_id = result["id"]
+        review = compare_review(run_id, policy)
+        candidate = {"label": label.upper(), "run_id": run_id, "backend": result.get("backend"),
+                     "model": result.get("model"), "result": bus_sanitize(result),
+                     "verify_rc": compare_verify_rc(result), "seconds": result.get("seconds"),
+                     "diff": compare_diff_stats(result), "review": bus_sanitize(review)}
+        candidate["score"] = compare_candidate_score(candidate)
+        candidates[label] = candidate
+    winner = choose_compare_winner(candidates["a"], candidates["b"])
+    winner_label = winner["label"] if winner else None
+    report = {"id": compare_id, "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+              "title": args.title, "task_file": os.path.basename(task_path), "card_type": args.card_type,
+              "verify": args.verify, "budget_minutes": minutes,
+              "winner": winner["run_id"] if winner else None, "winner_label": winner_label,
+              "runs": candidates}
+    report["diff_notes"] = compare_diff_notes(candidates["a"], candidates["b"], winner)
+    update_compare_ledger(list(candidates.values()), compare_id, report["winner"])
+    if winner:
+        report["proposal"] = write_compare_proposal(report, policy)
+    json_path = os.path.join(output_dir, "compare.json")
+    md_path = os.path.join(output_dir, "compare.md")
+    jsave(json_path, bus_sanitize(report))
+    with open(md_path, "w", encoding="utf-8") as stream:
+        stream.write(compare_markdown(report))
+    print(json.dumps({"id": compare_id, "winner": report["winner"], "winner_label": winner_label,
+                      "compare_json": json_path, "compare_md": md_path,
+                      "proposal": report.get("proposal")}, ensure_ascii=False, indent=2))
+
+
 def main():
     ap = argparse.ArgumentParser(prog="openswarm", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -8681,8 +9113,18 @@ def main():
     sp.add_argument("--budget-minutes", type=float, help="hard wall-clock budget; executor is killed when exceeded")
     sp.add_argument("--detach", action="store_true", help="run in background; monitor with `openswarm watch <id>`")
     sp.add_argument("--run-id", help=argparse.SUPPRESS)
+    sp.add_argument("--no-auto-review", action="store_true", help=argparse.SUPPRESS)
     sp.add_argument("--dry-run", action="store_true")
     sp.add_argument("--executor", help="optional GitHub bus executor routing label")
+
+    sp = sub.add_parser("compare", help="run one task in parallel on two executor families")
+    sp.add_argument("--task-file", required=True)
+    sp.add_argument("--title", required=True)
+    sp.add_argument("--a", help="first executor backend or BACKEND:MODEL")
+    sp.add_argument("--b", help="second executor backend or BACKEND:MODEL")
+    sp.add_argument("--verify", help="acceptance command run on both worktrees")
+    sp.add_argument("--card-type", help="optional task card type from knowledge/card-types.yaml")
+    sp.add_argument("--budget-minutes", type=float, help="per-run hard wall-clock budget")
 
     sp = sub.add_parser("review", help="review a finished run with a cross-family read-only executor")
     sp.add_argument("run_id")
@@ -8904,6 +9346,15 @@ def main():
             cmd_run(a, policy)
         except ValueError as error:
             print(f"openswarm: {error}", file=sys.stderr)
+            sys.exit(2)
+    elif a.cmd == "compare":
+        try:
+            cmd_compare(a, policy)
+        except BudgetExceeded as error:
+            print(json.dumps(error.detail, ensure_ascii=False), file=sys.stderr)
+            sys.exit(3)
+        except (OSError, RuntimeError, ValueError) as error:
+            print(f"openswarm: compare failed: {bus_redact(str(error))}", file=sys.stderr)
             sys.exit(2)
     elif a.cmd == "review":
         try:

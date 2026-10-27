@@ -215,6 +215,22 @@ The default `review.auto_card_types` (`feature`, `fix`, `review-fix`, `migration
 after a committed run. `review.prefer` selects the first available reviewer; `review.max_concurrent` bounds
 automatic review jobs, while `review.timeout_seconds` and `review.max_diff_chars` cap review work.
 
+Run the same card on two executor families with:
+
+```bash
+openswarm compare --task-file TASK.md --title TITLE \
+  [--a BACKEND[:MODEL]] [--b BACKEND[:MODEL]] [--verify CMD] \
+  [--card-type TYPE] [--budget-minutes N]
+```
+
+If either backend is omitted, compare selects an available backend from a different family. Both normal run
+admissions apply the daily budget and provider concurrency caps. Each finished diff receives a cross-family
+review; review errors are retained in the comparison and do not stop the other review. The winner is selected
+by verification pass, fewer P0/P1 findings (when both reviews succeed), smaller changed-line count, then fewer
+seconds; an exact tie has no winner. Results are saved under `runs/<compare-id>/compare.json` and
+`compare.md`; a winner also creates a `pattern-<compare-id>.md` proposal under
+`knowledge.repo/proposals/<date>/`.
+
 Review completed runs with `openswarm ledger accept <run_id> [--reject] [--reason TEXT] [--fleet]`. The decision,
 reason and timestamp are recorded atomically. `openswarm ledger ingest` sets acceptance from merged or closed
 without merge PRs unless a manual decision is already present. Use `openswarm ledger backfill-pass [--fleet]` to
