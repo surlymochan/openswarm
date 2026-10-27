@@ -12,6 +12,7 @@ Subcommands:
   route            pick backend/model/effort for a task profile (JSON out)
   run              route + execute in an isolated git worktree, record ledger (JSON out)
   review           cross-family read-only review of a finished run
+  consult          ask multiple executors the same question in read-only mode
   lessons          preview, propose, and escalate executor lessons
   lane             manage long-lived Codex app-server / Cursor ACP / Pi RPC executor lanes
   fleet            inspect hosts and forward openswarm commands over local / SSH / instabox transports
@@ -38,6 +39,7 @@ import fnmatch
 import fcntl
 import hashlib
 import html
+import importlib.util
 import io
 import json
 import math
@@ -8603,9 +8605,24 @@ def cmd_status(policy, refresh):
     print(f"Claude review mode: {mode} — {why}")
 
 
+def consult_module():
+    module = sys.modules.get("openswarm_consult")
+    if module is not None:
+        return module
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "openswarm_consult.py")
+    spec = importlib.util.spec_from_file_location("openswarm_consult", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load consult helper from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def main():
     ap = argparse.ArgumentParser(prog="openswarm", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
+    consult_module().add_parser(sub)
 
     sp = sub.add_parser("probe")
     sp.add_argument("--quiet", action="store_true")
@@ -8853,6 +8870,10 @@ def main():
             print(json.dumps(st, indent=2, ensure_ascii=False))
     elif a.cmd == "status":
         cmd_status(policy, a.refresh)
+    elif a.cmd == "consult":
+        result = consult_module().cmd_consult(a, sys.modules[__name__], policy)
+        if result:
+            sys.exit(result)
     elif a.cmd == "lessons":
         if a.lessons_cmd == "preview":
             block, _ = select_lessons(policy, a.card_type, a.backend, paths=a.paths)
