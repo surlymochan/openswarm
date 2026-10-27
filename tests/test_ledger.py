@@ -44,7 +44,11 @@ class LedgerTests(unittest.TestCase):
             "if endpoint not in fixtures:\n"
             "    print('missing fixture: ' + endpoint, file=sys.stderr)\n"
             "    raise SystemExit(1)\n"
-            "print(json.dumps(fixtures[endpoint]))\n"
+            "result = fixtures[endpoint]\n"
+            "if isinstance(result, dict) and '__http_status__' in result:\n"
+            "    print('HTTP ' + str(result['__http_status__']) + ': ' + result.get('message', ''), file=sys.stderr)\n"
+            "    raise SystemExit(1)\n"
+            "print(json.dumps(result))\n"
         )
         fake.chmod(0o755)
         self.gh_env = {"OPENSWARM_GH_BIN": str(fake), "GH_FIXTURES": str(fixture_file),
@@ -164,6 +168,52 @@ class LedgerTests(unittest.TestCase):
         self.run_ingest("--repo", repo)
         self.assertEqual(path.read_bytes(), first_contents)
         self.assertEqual(calls.read_text().splitlines(), first_calls)
+
+    def test_ledger_ingest_continues_after_missing_local_commit_and_counts_unlinked(self):
+        repo = "octo/project"
+        missing_run, missing_sha, branch = "local-only-run", "a" * 40, "openswarm/local-only-run"
+        linked_run, linked_sha, number = "published-run", "b" * 40, 44
+        branch_query = urllib.parse.urlencode({"state": "all", "head": f"octo:{branch}"})
+        body_query = "repo:octo/project is:pr in:body local-only-run"
+        comment_query = "repo:octo/project is:pr in:comments local-only-run"
+        search_body = "search/issues?" + urllib.parse.urlencode({"q": body_query}) + "&per_page=100&page=1"
+        search_comment = "search/issues?" + urllib.parse.urlencode({"q": comment_query}) + "&per_page=100&page=1"
+        fixtures = {
+            f"repos/{repo}/commits/{missing_sha}/pulls?per_page=100&page=1": {
+                "__http_status__": 422, "message": "No commit found for SHA"},
+            f"repos/{repo}/pulls?{branch_query}&per_page=100&page=1": [],
+            search_body: {"items": []},
+            search_comment: {"items": []},
+            f"repos/{repo}/commits/{linked_sha}/pulls?per_page=100&page=1": [{"number": number}],
+            f"repos/{repo}/pulls/{number}": {"number": number, "merged": False},
+            f"repos/{repo}/pulls/{number}/comments?per_page=100&page=1": [],
+            f"repos/{repo}/pulls/{number}/reviews?per_page=100&page=1": [],
+        }
+        calls = self.make_gh(fixtures)
+        path = self.put_fleet_ledger(
+            {"id": missing_run, "ts": xs.NOW(), "branch": branch, "commit": missing_sha},
+            {"id": linked_run, "ts": xs.NOW(), "commit": linked_sha},
+        )
+
+        output = self.run_ingest("--repo", repo)
+
+        entries = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertIsNone(entries[0].get("pr"))
+        self.assertEqual(entries[1]["pr"]["number"], number)
+        self.assertIn("ingested 1 PR-linked runs", output)
+        self.assertIn("1 unlinked", output)
+        called = calls.read_text().splitlines()
+        self.assertIn(f"repos/{repo}/pulls?{branch_query}&per_page=100&page=1", called)
+        self.assertIn(search_body, called)
+        self.assertIn(search_comment, called)
+
+    def test_ledger_ingest_does_not_suppress_other_github_errors(self):
+        repo, run_id, sha = "octo/project", "server-error-run", "c" * 40
+        endpoint = f"repos/{repo}/commits/{sha}/pulls?per_page=100&page=1"
+        self.make_gh({endpoint: {"__http_status__": 500, "message": "Internal Server Error"}})
+        with mock.patch.dict(os.environ, self.gh_env):
+            with self.assertRaisesRegex(xs.BusError, "HTTP 500"):
+                xs.linked_pr_for_run({"id": run_id, "commit": sha}, repo)
 
     def test_ledger_ingest_links_by_branch(self):
         repo, branch, run_id, number = "octo/project", "openswarm/branch-run", "branch-run", 22

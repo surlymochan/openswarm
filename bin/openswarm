@@ -281,7 +281,15 @@ def lesson_yaml_scalar(raw, allow_list=False):
         if not isinstance(parsed, str) or not parsed:
             raise ValueError("expected a non-empty string scalar")
         return parsed
-    if (value[0] in "&*!|>{}[]" or value in ("null", "~") or value.startswith(("- ", "? "))
+    if value in ("~", "null", "Null", "NULL"):
+        return None
+    if value.casefold() == "true":
+        return True
+    if value.casefold() == "false":
+        return False
+    if re.fullmatch(r"[+-]?[0-9]+", value):
+        return int(value)
+    if (value[0] in "&*!|>{}[]" or value.startswith(("- ", "? "))
             or ": " in value):
         raise ValueError("unsupported YAML scalar syntax")
     return value
@@ -331,7 +339,8 @@ def parse_lesson_yaml(text):
     missing = LESSON_FIELDS - lesson.keys()
     if missing:
         raise ValueError("missing required field(s): " + ", ".join(sorted(missing)))
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", lesson["id"]):
+    if (not isinstance(lesson["id"], str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", lesson["id"])):
         raise ValueError("id must contain only letters, digits, dot, underscore, or hyphen")
     for key in LESSON_APPLIES_TO_FIELDS:
         lesson["applies_to"].setdefault(key, [])
@@ -5279,11 +5288,19 @@ def gh_ingest_api(run_id, repo, endpoint):
     return result
 
 
-def gh_ingest_pages(run_id, repo, endpoint):
+def gh_ingest_pages(run_id, repo, endpoint, allow_unlinked=False):
     rows, page = [], 1
     while True:
         separator = "&" if "?" in endpoint else "?"
-        result = gh_ingest_api(run_id, repo, f"{endpoint}{separator}per_page=100&page={page}")
+        try:
+            result = gh_ingest_api(run_id, repo, f"{endpoint}{separator}per_page=100&page={page}")
+        except BusError as error:
+            detail = str(error).split(" failed:", 1)[-1]
+            if allow_unlinked and re.search(
+                    r"\bHTTP\s+(?:404|422)\b|\b404(?:\s+Not Found|:)|\b422(?:\s+Unprocessable Entity|:)",
+                    detail, re.I):
+                return rows
+            raise
         if isinstance(result, dict) and isinstance(result.get("items"), list):
             result = result["items"]
         if not isinstance(result, list):
@@ -5356,10 +5373,10 @@ def linked_pr_for_run(entry, repo):
         owner = repo.split("/", 1)[0]
         head = urllib.parse.urlencode({"state": "all", "head": f"{owner}:{branch}"})
         endpoint = f"repos/{repo}/pulls?{head}"
-        candidates.extend(gh_ingest_pages(run_id, repo, endpoint))
+        candidates.extend(gh_ingest_pages(run_id, repo, endpoint, allow_unlinked=True))
     if isinstance(commit, str) and BUS_SHA_RE.fullmatch(commit):
         endpoint = f"repos/{repo}/commits/{commit}/pulls"
-        candidates.extend(gh_ingest_pages(run_id, repo, endpoint))
+        candidates.extend(gh_ingest_pages(run_id, repo, endpoint, allow_unlinked=True))
     candidates = [item for item in candidates if gh_pr_number(item)]
     if candidates:
         return candidates[0]
@@ -5480,7 +5497,7 @@ def cmd_ledger_ingest(args):
         raise ValueError("fleet ledger not found; run fleet ledger pull first")
     threshold = NOW() - args.since * 86400
     lock_path = path + ".lock"
-    updated = linked_count = 0
+    updated = linked_count = unlinked_count = 0
     with open(lock_path, "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         with open(path, encoding="utf-8") as stream:
@@ -5498,6 +5515,7 @@ def cmd_ledger_ingest(args):
             before = json.dumps(entry, ensure_ascii=False, sort_keys=True)
             linked = ingest_ledger_entry(entry, repos)
             linked_count += int(linked)
+            unlinked_count += int(not linked)
             after = json.dumps(entry, ensure_ascii=False, sort_keys=True)
             if after != before:
                 updated += 1
@@ -5517,7 +5535,8 @@ def cmd_ledger_ingest(args):
             finally:
                 if os.path.exists(temporary):
                     os.unlink(temporary)
-    print(f"ingested {linked_count} PR-linked runs; updated {updated} ledger entries in {path}")
+    print(f"ingested {linked_count} PR-linked runs; {unlinked_count} unlinked; "
+          f"updated {updated} ledger entries in {path}")
 
 
 def host_openswarm(host, args):

@@ -62,6 +62,23 @@ class LessonsTests(unittest.TestCase):
         self.assertIn("skipping lesson file", warning.getvalue())
         self.assertIn("unsupported applies_to key 'unknown'", warning.getvalue())
 
+    def test_yaml_scalar_subset_accepts_null_booleans_integers_and_strings(self):
+        lesson = xs.parse_lesson_yaml(
+            "id: L-0014\nrule: a plain string\nguard_level: L2\nguard_ref: null\n"
+            "enabled: true\nretired: false\nretry_count: 123\ntitle: 'quoted string'\n"
+            "applies_to:\n  card_types: []\n  paths: []\n  backends: []\n")
+        self.assertIsNone(lesson["guard_ref"])
+        self.assertIs(lesson["enabled"], True)
+        self.assertIs(lesson["retired"], False)
+        self.assertEqual(lesson["retry_count"], 123)
+        self.assertEqual(lesson["rule"], "a plain string")
+        self.assertEqual(lesson["title"], "quoted string")
+
+    def test_yaml_scalar_subset_still_rejects_anchors(self):
+        with self.assertRaisesRegex(ValueError, "unsupported YAML scalar syntax"):
+            xs.parse_lesson_yaml(
+                "id: L-0015\nrule: valid\nguard_level: L2\nextra: &anchor value\n")
+
     def test_selection_caps_at_twelve_lessons_and_three_thousand_characters(self):
         for index in range(15):
             self.write_lesson(f"{index:02}.yaml", f"L-{index:04}", "short")
