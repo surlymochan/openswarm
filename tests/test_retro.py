@@ -86,6 +86,7 @@ class RetroTests(unittest.TestCase):
         self.assertEqual((code, error), (0, ""))
         summary = json.loads(output)
         self.assertEqual(summary["counts"], {"runs": 3, "groups": 2, "failures": 1, "rejected": 1,
+                                             "exec_pass_null": 1,
                                              "lesson_proposals": 0, "guard_proposals": 0,
                                              "routing_comparisons": 2})
         self.assertFalse(any(name == "fleet ledger pull" for name, _ in calls))
@@ -98,6 +99,7 @@ class RetroTests(unittest.TestCase):
                         "New lesson and guard proposals", "Routing advice vs actual", "Proposed changes"):
             self.assertIn(heading, report)
         self.assertIn("1/2 (50%)", report)
+        self.assertIn("null=1", report)
         self.assertIn("exec_error", report)
         self.assertIn("tests failed", report)
         self.assertIn("Skipped fleet ledger pull (--no-pull).", report)

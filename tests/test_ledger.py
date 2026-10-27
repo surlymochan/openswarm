@@ -170,7 +170,8 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(record["tokens"], {"input": 12, "output": 8, "total": 20})
         self.assertEqual(record["lessons_injected"], [])
         self.assertIsNone(record["merged"])
-        self.assertFalse(record["exec_pass"])
+        self.assertIsNone(record["exec_pass"])
+        self.assertEqual(record["exec_pass_reason"], "pass_data_missing")
         self.assertIsNone(record["accepted"])
         self.assertEqual(list(xs.ledger_entries()), [record])
 
@@ -188,8 +189,12 @@ class LedgerTests(unittest.TestCase):
         self.assertTrue(xs.exec_pass_value("partial", True, False, False, None))  # partial with a commit
         self.assertFalse(xs.exec_pass_value("failed", False, False, False, None))
         self.assertTrue(xs.exec_pass_value("failed", True, False, False, None))
+        self.assertTrue(xs.exec_pass_value("budget_exceeded", True, False, True, {"rc": 0}))
+        self.assertFalse(xs.exec_pass_value("failed", True, False, True, None))
         self.assertFalse(xs.exec_pass_value("done", True, False, True, {"rc": 2}))
+        self.assertFalse(xs.exec_pass_value("done", False, False, True, None))
         self.assertTrue(xs.exec_pass_value("done", False, True, False, None))  # read-only output file
+        self.assertIsNone(xs.exec_pass_value("done", True, False, None, None))
 
         output = self.root / "review.md"
         output.write_text("review")
@@ -213,20 +218,43 @@ class LedgerTests(unittest.TestCase):
         self.assertFalse(rejected["accepted"])
 
         Path(xs.LEDGER).write_text("".join(json.dumps(record) + "\n" for record in (
-            {"id": "partial", "status": "partial", "commit": "abc"},
-            {"id": "failed", "status": "failed", "commit": "def"},
+            {"id": "partial", "status": "partial", "commit": "abc", "verify_requested": False},
+            {"id": "failed", "status": "failed"},
+            {"id": "budget-pass", "status": "budget_exceeded", "commit": "def",
+             "verify_requested": True, "verify": {"rc": 0}},
             {"id": "verified-fail", "status": "done", "files_changed": ["x"],
              "verify": {"rc": 2}},
-            {"id": "unverified", "status": "done", "files_changed": ["x"], "verify": None},
+            {"id": "unverified", "status": "done", "files_changed": ["x"], "verify_requested": False},
+            {"id": "no-changes", "status": "done", "files_changed": [], "files": 0,
+             "verify_requested": False},
+            {"id": "unknown", "status": "done"},
         )))
         result = self.run_ledger_command("backfill-pass")
         rows = {record["id"]: record for record in
                 (json.loads(line) for line in Path(xs.LEDGER).read_text().splitlines())}
-        self.assertEqual(result["updated"], 3)
+        self.assertEqual(result["updated"], 7)
         self.assertTrue(rows["partial"]["exec_pass"])
-        self.assertNotIn("exec_pass", rows["failed"])
+        self.assertFalse(rows["failed"]["exec_pass"])
+        self.assertTrue(rows["budget-pass"]["exec_pass"])
         self.assertFalse(rows["verified-fail"]["exec_pass"])
         self.assertTrue(rows["unverified"]["exec_pass"])
+        self.assertFalse(rows["no-changes"]["exec_pass"])
+        self.assertIsNone(rows["unknown"]["exec_pass"])
+        self.assertEqual(rows["unknown"]["exec_pass_reason"], "change_evidence_missing")
+
+        Path(xs.LEDGER).write_text("".join(json.dumps(record) + "\n" for record in (
+            {"id": "stale-false", "status": "done", "exec_pass": False,
+             "exec_pass_changed": True, "verify_requested": False},
+            {"id": "stale-true", "status": "failed", "exec_pass": True,
+             "exec_pass_changed": False, "verify_requested": False},
+            {"id": "active", "status": "running"},
+        )))
+        result = self.run_ledger_command("backfill-pass", "--recompute")
+        rows = [json.loads(line) for line in Path(xs.LEDGER).read_text().splitlines()]
+        self.assertEqual(result["updated"], 2)
+        self.assertEqual(result["skipped"], 1)
+        self.assertTrue(rows[0]["exec_pass"])
+        self.assertFalse(rows[1]["exec_pass"])
 
         fleet = self.put_fleet_ledger({"id": "fleet-run", "status": "done", "commit": "abc"})
         fleet_result = self.run_ledger_command("backfill-pass", "--fleet")

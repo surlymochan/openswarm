@@ -1572,6 +1572,7 @@ def compute_routing_weights(entries, min_samples=8):
         tokens = [value for value in (routing_tokens(entry) for entry in runs) if value is not None]
         accepted_values = [entry["accepted"] for entry in runs if isinstance(entry.get("accepted"), bool)]
         exec_pass_values = [entry["exec_pass"] for entry in runs if isinstance(entry.get("exec_pass"), bool)]
+        exec_pass_passes = sum(exec_pass_values)
         outcomes = [outcome for outcome in (routing_outcome(entry) for entry in runs) if outcome is not None]
         rows.append({
             "backend": backend,
@@ -1583,7 +1584,9 @@ def compute_routing_weights(entries, min_samples=8):
             "accepted_runs": len(accepted_values),
             "accepted_rate": sum(accepted_values) / len(accepted_values) if accepted_values else None,
             "exec_pass_runs": len(exec_pass_values),
-            "exec_pass_rate": sum(exec_pass_values) / len(exec_pass_values) if exec_pass_values else None,
+            "exec_pass_rate": exec_pass_passes / len(exec_pass_values) if exec_pass_values else None,
+            "exec_pass_ratio": f"{exec_pass_passes}/{len(exec_pass_values)}",
+            "exec_pass_null_runs": len(runs) - len(exec_pass_values),
             "first_try_rate": sum(count == 1 for count in attempt_counts) / len(runs),
             "rework_rate": sum(bool(entry.get("rework_of")) for entry in runs) / len(runs),
             "review_p1_rate": sum(reviewed) / len(reviewed) if reviewed else None,
@@ -1706,6 +1709,13 @@ def retro_ratio(entries, field):
         return "— (0/0)"
     passed = sum(values)
     return f"{passed}/{len(values)} ({passed / len(values):.0%})"
+
+
+def retro_exec_pass_ratio(entries):
+    values = [entry["exec_pass"] for entry in entries if isinstance(entry.get("exec_pass"), bool)]
+    passed = sum(values)
+    rate = f" ({passed / len(values):.0%})" if values else ""
+    return f"{passed}/{len(values)}{rate}; null={len(entries) - len(values)}"
 
 
 def retro_groups(entries):
@@ -1842,9 +1852,9 @@ def retro_report_text(entries, start, end, days, policy, notes, lesson_paths, gu
     if groups:
         for (backend, model, card_type), runs in groups:
             lines.append(f"| {retro_safe(backend)} | {retro_safe(model)} | {retro_safe(card_type)} | {len(runs)} "
-                         f"| {retro_ratio(runs, 'exec_pass')} | {retro_ratio(runs, 'accepted')} |")
+                         f"| {retro_exec_pass_ratio(runs)} | {retro_ratio(runs, 'accepted')} |")
     else:
-        lines.append("| — | — | — | 0 | — (0/0) | — (0/0) |")
+        lines.append("| — | — | — | 0 | — (0/0); null=0 | — (0/0) |")
 
     lines.extend(["", "## Top failure error_classes", "", "| error_class | Runs |", "| --- | ---: |"])
     lines.extend([f"| {retro_safe(name)} | {count} |" for name, count in failures] or ["| None recorded | 0 |"])
@@ -1982,6 +1992,7 @@ def cmd_retro(args, policy):
                          "routing_weights": routing_weights_path(policy)},
                "counts": {"runs": len(entries), "groups": len(retro_groups(entries)),
                           "failures": sum(retro_is_failure(entry) for entry in entries), "rejected": len(rejected),
+                          "exec_pass_null": sum(not isinstance(entry.get("exec_pass"), bool) for entry in entries),
                           "lesson_proposals": len(lesson_paths), "guard_proposals": len(guard_paths),
                           "routing_comparisons": len(compare_rows)},
                "steps": {name: {"ok": result.get("ok", False), "skipped": result.get("skipped", False),
@@ -2035,26 +2046,73 @@ def read_only_output_exists(root, files):
     return False
 
 
+def exec_pass_assessment(changed, read_only_output, verify_requested, verify):
+    """Return the pass value and a reason when available evidence is insufficient."""
+    if not (changed or read_only_output):
+        return False, None
+    if isinstance(verify, dict):
+        rc = verify.get("rc")
+        if isinstance(rc, int) and not isinstance(rc, bool):
+            return rc == 0, None
+        return None, "verify_result_missing"
+    if verify_requested is False:
+        return True, None
+    if verify_requested is True:
+        return False, None
+    return None, "verify_request_unknown"
+
+
+def exec_pass_fields(changed, read_only_output, verify_requested, verify):
+    value, reason = exec_pass_assessment(changed, read_only_output, verify_requested, verify)
+    return {"exec_pass": value, "exec_pass_reason": reason,
+            "exec_pass_changed": bool(changed or read_only_output),
+            "read_only_output": bool(read_only_output), "verify_requested": bool(verify_requested)}
+
+
 def exec_pass_value(_executor_status, changed, read_only_output, verify_requested, verify):
     """Compute execution success from change evidence and host verification, ignoring executor status."""
-    verify_passed = not verify_requested or (isinstance(verify, dict) and verify.get("rc") == 0)
-    return bool((changed or read_only_output) and verify_passed)
+    return exec_pass_assessment(changed, read_only_output, verify_requested, verify)[0]
+
+
+def backfill_exec_pass_details(entry):
+    status = entry.get("status")
+    changed = entry.get("exec_pass_changed") if isinstance(entry.get("exec_pass_changed"), bool) else None
+    if changed is None:
+        files = entry.get("files_changed")
+        file_count = entry.get("files")
+        file_count_known = (isinstance(file_count, (int, float)) and not isinstance(file_count, bool)
+                            and math.isfinite(file_count) and file_count >= 0)
+        has_files = isinstance(files, list) and any(isinstance(path, str) and path.strip() for path in files)
+        has_files = has_files or (file_count_known and file_count > 0)
+        has_read_only_output = entry.get("read_only_output") is True
+        changed = bool(entry.get("commit") or has_files or has_read_only_output)
+        if not changed:
+            no_change_evidence = (file_count_known and file_count == 0) or (isinstance(files, list) and not files)
+            if not no_change_evidence and status in ("done", "partial"):
+                return None, "change_evidence_missing"
+
+    if not changed:
+        return False, None
+
+    verify = entry.get("verify") if isinstance(entry.get("verify"), dict) else None
+    verify_rc = entry.get("verify_rc", verify.get("rc") if verify else None)
+    if verify is None and isinstance(verify_rc, int) and not isinstance(verify_rc, bool):
+        verify = {"rc": verify_rc}
+    verify_requested = entry.get("verify_requested")
+    if not isinstance(verify_requested, bool):
+        if verify is not None:
+            verify_requested = True
+        elif status in ("done", "partial") and entry.get("error_class") not in (
+                "rate_limit", "risk_blocked", "stopped", "exec_error", "prepare_failed"):
+            # These successful terminal statuses run host verification whenever one was requested.
+            verify_requested = False
+        else:
+            verify_requested = None
+    return exec_pass_assessment(changed, entry.get("read_only_output") is True, verify_requested, verify)
 
 
 def backfill_exec_pass(entry):
-    status = entry.get("status")
-    files = entry.get("files_changed")
-    has_files = isinstance(files, list) and any(isinstance(path, str) and path.strip() for path in files)
-    file_count = entry.get("files")
-    has_files = has_files or (isinstance(file_count, (int, float)) and not isinstance(file_count, bool)
-                              and file_count > 0)
-    if status not in ("done", "partial") or not (entry.get("commit") or has_files):
-        return None
-    verify = entry.get("verify")
-    verify = verify if isinstance(verify, dict) else None
-    verify_rc = entry.get("verify_rc", verify.get("rc") if verify else None)
-    verify_requested = entry.get("verify") is not None or verify_rc is not None
-    return not verify_requested or verify_rc == 0
+    return backfill_exec_pass_details(entry)[0]
 
 
 def budget_status(policy, date=None, entries=None):
@@ -3702,7 +3760,8 @@ def cmd_run(args, policy):
             jsave(f"{rdir}/result.json", output)
             append_ledger({"id": rid, "ts": NOW(), "title": title, "status": "failed",
                            "backend": "github-issue", "error_class": "bus_error", "summary": bus_redact(str(error))[:300],
-                           "card_type": card_type, "rework_of": rework_of})
+                           "card_type": card_type, "rework_of": rework_of,
+                           **exec_pass_fields(False, False, bool(args.verify), None)})
             set_status(rdir, state="finished", status="failed", finished=NOW(), error_class="bus_error")
             print(json.dumps(output, indent=2, ensure_ascii=False), file=sys.stderr)
             raise SystemExit(2)
@@ -3713,7 +3772,8 @@ def cmd_run(args, policy):
         out = {"id": rid, "status": "unroutable", "decision": decision}
         set_status(rdir, state="unroutable")
         append_ledger({"id": rid, "ts": NOW(), "title": title, "status": "unroutable", "decision": decision,
-                       "card_type": card_type, "rework_of": rework_of})
+                       "card_type": card_type, "rework_of": rework_of,
+                       **exec_pass_fields(False, False, bool(args.verify), None)})
         jsave(f"{rdir}/result.json", out)
         print(json.dumps(out, indent=2, ensure_ascii=False))
         sys.exit(2)
@@ -3787,7 +3847,8 @@ def cmd_run(args, policy):
             append_ledger({"id": rid, "ts": NOW(), "title": title, "profile": prof, "status": "failed",
                            "backend": decision["backend"], "model": decision["model"],
                            "error_class": "prepare_failed", "seconds": prepared["seconds"],
-                           "card_type": card_type, "rework_of": rework_of, **routing_fields})
+                           "card_type": card_type, "rework_of": rework_of, **routing_fields,
+                           **exec_pass_fields(False, False, bool(args.verify), None)})
             set_status(rdir, state="finished", status="failed", error_class="prepare_failed", finished=NOW())
             print(json.dumps(out, indent=2, ensure_ascii=False))
             sys.exit(1)
@@ -3877,8 +3938,7 @@ def cmd_run(args, policy):
         else:
             verify["baseline"] = {"error": base.get("error")}
     has_changes = bool(fin.get("commit") or workspace_changed or (changed and not read_only))
-    exec_pass = exec_pass_value((result or {}).get("status"), has_changes, read_only_output,
-                                bool(args.verify), verify)
+    pass_fields = exec_pass_fields(has_changes, read_only_output, bool(args.verify), verify)
     if not args.keep_worktree:
         cleanup_worktree(ws, fin.get("commit"))
         fin["worktree"] = None
@@ -3918,7 +3978,7 @@ def cmd_run(args, policy):
                    "seconds": wall_seconds, "usage": usage,
                    "risk_blocks": out["risk_blocks"], "summary": (result or {}).get("summary"),
                    "commit": fin.get("commit"), "files": len((result or {}).get("files_changed") or []),
-                   "exec_pass": exec_pass,
+                   **pass_fields,
                    "branch": fin.get("branch"), "verify": verify,
                    "files_changed": changed,
                    "card_type": card_type, "rework_of": rework_of,
@@ -4311,11 +4371,11 @@ def bus_finish_run(rid, rdir, title, root, remote, issue, result, executor, stat
     changed = changed_paths(root, task.get("base"), commit, (result or {}).get("files_changed"))
     read_only = task.get("type") in READ_ONLY_CARD_TYPES or card_type in READ_ONLY_CARD_TYPES
     read_only_output = read_only and read_only_output_exists(root, (result or {}).get("files_changed"))
-    exec_pass = exec_pass_value((result or {}).get("status"), bool(commit or (changed and not read_only)),
-                                read_only_output, bool(verify_command), verify)
+    pass_fields = exec_pass_fields(bool(commit or (changed and not read_only)), read_only_output,
+                                   bool(verify_command), verify)
     append_ledger(bus_sanitize({"id": rid, "ts": now, "title": title, "status": status, "backend": "github-issue",
                                 "seconds": elapsed, "summary": (result or {}).get("summary"), "commit": commit,
-                                "exec_pass": exec_pass,
+                                **pass_fields,
                                 "files": len((result or {}).get("files_changed") or []), "bus": bus_info,
                                 "error_class": output["error_class"], "branch": branch, "verify": verify,
                                 "files_changed": changed,
@@ -5763,9 +5823,8 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
                             (final or {}).get("files_changed"))
     read_only = spec.get("card_type") in READ_ONLY_CARD_TYPES
     read_only_output = read_only and read_only_output_exists(ws.get("path"), (final or {}).get("files_changed"))
-    exec_pass = exec_pass_value((final or {}).get("status"),
-                                bool(fin.get("commit") or (changed and not read_only)), read_only_output,
-                                bool(spec.get("verify")), verify)
+    pass_fields = exec_pass_fields(bool(fin.get("commit") or (changed and not read_only)), read_only_output,
+                                   bool(spec.get("verify")), verify)
     append_ledger({"id": rid, "ts": NOW(), "title": title, "status": status, "lane": lane["name"],
                    "backend": lane["backend"], "model": model, "effort": lane.get("effort"),
                    "attempts": attempts, "error_class": error_class,
@@ -5773,7 +5832,7 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
                    "usage": usage, "commit": fin.get("commit"),
                    "risk_blocks": out["risk_blocks"], "summary": (final or {}).get("summary"),
                    "files": len((final or {}).get("files_changed") or []),
-                   "exec_pass": exec_pass,
+                   **pass_fields,
                    "branch": fin.get("branch"), "verify": verify,
                    "files_changed": changed,
                    "card_type": spec.get("card_type"), "rework_of": spec.get("rework_of"),
@@ -5917,7 +5976,8 @@ def lane_do_run(lane, spec, child, server, current):
             append_ledger({"id": rid, "ts": NOW(), "title": spec.get("title"), "status": "failed",
                            "lane": lane["name"], "backend": lane["backend"], "model": lane["model"],
                            "error_class": error_class, "card_type": spec.get("card_type"),
-                           "rework_of": spec.get("rework_of")})
+                           "rework_of": spec.get("rework_of"),
+                           **exec_pass_fields(False, False, bool(spec.get("verify")), None)})
             return status
         return lane_finalize_run(lane, spec, ws, None, {}, error_class, 1, evp)
 
@@ -6819,13 +6879,24 @@ def cmd_ledger_backfill_pass(args):
                 entry = json.loads(raw)
             except (ValueError, UnicodeError):
                 continue
-            if not isinstance(entry, dict) or "exec_pass" in entry:
+            if not isinstance(entry, dict):
                 continue
-            value = backfill_exec_pass(entry)
-            if value is None:
+            status = entry.get("status")
+            if not isinstance(status, str) or status in ("queued", "routing", "running", "verifying"):
                 skipped += 1
                 continue
+            if not getattr(args, "recompute", False) and isinstance(entry.get("exec_pass"), bool):
+                skipped += 1
+                continue
+            value, reason = backfill_exec_pass_details(entry)
             entry["exec_pass"] = value
+            if reason:
+                entry["exec_pass_reason"] = reason
+            else:
+                entry.pop("exec_pass_reason", None)
+            if not getattr(args, "recompute", False) and entry == json.loads(raw):
+                skipped += 1
+                continue
             lines[index] = json.dumps(entry, ensure_ascii=False) + "\n"
             updated += 1
         if updated:
@@ -8009,7 +8080,9 @@ def append_ledger(entry):
         "title": bus_redact(entry.get("title") or ""),
         "status": entry.get("status"),
         "error_class": entry.get("error_class"),
-        "exec_pass": entry.get("exec_pass") if isinstance(entry.get("exec_pass"), bool) else False,
+        "exec_pass": entry.get("exec_pass") if isinstance(entry.get("exec_pass"), bool) else None,
+        "exec_pass_reason": (None if isinstance(entry.get("exec_pass"), bool) else
+                             entry.get("exec_pass_reason") or "pass_data_missing"),
         "accepted": entry.get("accepted") if isinstance(entry.get("accepted"), bool) else None,
         "accepted_reason": entry.get("accepted_reason"),
         "accepted_at": entry.get("accepted_at"),
@@ -8340,6 +8413,7 @@ def main():
     lp.add_argument("--fleet", action="store_true", help="update the merged fleet ledger")
     lp = ledger_sub.add_parser("backfill-pass", help="compute exec_pass for older ledger records")
     lp.add_argument("--fleet", action="store_true", help="update the merged fleet ledger")
+    lp.add_argument("--recompute", action="store_true", help="recompute exec_pass for every finished ledger record")
 
     a = ap.parse_args()
     policy = load_policy()

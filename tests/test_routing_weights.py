@@ -49,6 +49,7 @@ class RoutingWeightsTests(unittest.TestCase):
              "attempts": [{}]},
             {"backend": "ocgo", "model": "m2", "card_type": "fix", "status": "done", "exec_pass": True,
              "attempts": [{}]},
+            {"backend": "pi", "model": "m3", "card_type": "fix", "status": "done", "exec_pass": None},
         ]
 
         result = xs.compute_routing_weights(rows, min_samples=3)
@@ -60,6 +61,8 @@ class RoutingWeightsTests(unittest.TestCase):
         self.assertIsNone(codex["accepted_rate"])
         self.assertEqual(codex["exec_pass_runs"], 4)
         self.assertEqual(codex["exec_pass_rate"], 0.5)
+        self.assertEqual(codex["exec_pass_ratio"], "2/4")
+        self.assertEqual(codex["exec_pass_null_runs"], 0)
         self.assertEqual(codex["first_try_rate"], 0.5)
         self.assertEqual(codex["rework_rate"], 0.25)
         self.assertEqual(codex["review_p1_rate"], 2 / 3)
@@ -67,6 +70,9 @@ class RoutingWeightsTests(unittest.TestCase):
         self.assertEqual(codex["median_seconds"], 2.5)
         self.assertTrue(codex["enough"])
         self.assertFalse(result["entries"][1]["enough"])
+        pi = next(row for row in result["entries"] if row["backend"] == "pi")
+        self.assertEqual(pi["exec_pass_ratio"], "0/0")
+        self.assertEqual(pi["exec_pass_null_runs"], 1)
         self.assertFalse(xs.routing_passed({"status": "done", "verify": None, "verify_rc": None}))
         self.assertFalse(xs.routing_passed({"status": "done", "exec_pass": False}))
         self.assertTrue(xs.routing_passed({"status": "partial", "exec_pass": True}))
