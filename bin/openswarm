@@ -2977,8 +2977,47 @@ def plan_pi(prof, st, policy, forced, notes):
     return {"backend": "pi", "model": model, "effort": None, "tier": tier}, None
 
 
+def minimax_key_from_pi():
+    """Read Pi's MiniMax credential without exposing it in command arguments."""
+    auth = jload(os.path.expanduser("~/.pi/agent/auth.json"), {}) or {}
+    entry = auth.get("minimax-cn") or {}
+    return entry.get("key") if isinstance(entry, dict) else None
+
+
+def hermes_bin(policy):
+    path = os.path.expanduser(str((policy.get("hermes") or {}).get("binary") or "~/.local/hermes/bin/hermes"))
+    return path if os.path.isfile(path) and os.access(path, os.X_OK) else None
+
+
+def plan_hermes(prof, st, policy, forced, notes):
+    if not hermes_bin(policy):
+        return None, "no working hermes binary"
+    cfg = policy.get("hermes") or {}
+    return {"backend": "hermes", "model": prof.get("model") or cfg.get("model"),
+            "provider": cfg.get("provider") or "minimax-cn", "effort": None,
+            "tier": policy["difficulty_map"][str(prof["difficulty"])]["tier"]}, None
+
+
+def exec_hermes(d, st, prompt, wd, rdir, timeout, evp):
+    policy = load_policy()
+    lane = {"name": "oneshot", "backend": "hermes", "model": d.get("model"),
+            "provider": d.get("provider") or (policy.get("hermes") or {}).get("provider") or "minimax-cn"}
+    child = None
+    try:
+        child = LaneChild(lane, wd, policy)
+        spec = {"started": NOW(), "budget_minutes": timeout / 60, "_event_file": evp}
+        final, usage, error, rc, _, detail = lane_run_turn(lane, child, spec, prompt, {"path": wd}, rdir,
+                                                           None, {}, [])
+        return rc, final, {"usage": usage}, detail or error or ""
+    except (OSError, RuntimeError) as exc:
+        return 1, None, {"usage": {}}, str(exc)
+    finally:
+        if child:
+            child.close()
+
+
 PLANNERS = {"codex": plan_codex, "ocgo": plan_ocgo, "deepseek": plan_deepseek, "cursor": plan_cursor,
-            "agy": plan_agy, "pi": plan_pi}
+            "agy": plan_agy, "pi": plan_pi, "hermes": plan_hermes}
 
 
 def canonical_backend(name):
@@ -3115,7 +3154,7 @@ def execution_provider(backend, decision=None, policy=None, lane=None):
     provider = config.get("provider")
     if not provider and backend == "pi":
         provider = ((policy or {}).get("pi") or {}).get("provider")
-    return provider
+    return provider or ("minimax-cn" if backend == "hermes" else None)
 
 
 def provider_concurrency_limits(policy, keys):
@@ -3898,7 +3937,7 @@ def exec_pi(d, st, prompt, wd, rdir, timeout, evp):
 
 
 EXECUTORS = {"codex": exec_codex, "ocgo": exec_opencode, "deepseek": exec_opencode, "cursor": exec_cursor,
-             "agy": exec_agy, "pi": exec_pi}
+             "agy": exec_agy, "pi": exec_pi, "hermes": exec_hermes}
 
 
 def git(args, cwd, timeout=60):
@@ -5774,8 +5813,8 @@ def lane_config():
         if name in names:
             raise ValueError(f"invalid lane config {where}: duplicate lane name {name!r}")
         names.add(name)
-        if backend not in ("codex", "cursor", "agy", "pi"):
-            raise ValueError(f"invalid lane config {where}: backend must be codex, cursor, agy, or pi")
+        if backend not in ("codex", "cursor", "agy", "pi", "hermes"):
+            raise ValueError(f"invalid lane config {where}: backend must be codex, cursor, agy, pi, or hermes")
         repo = lane.get("repo")
         if not isinstance(repo, str) or not os.path.isabs(repo):
             raise ValueError(f"invalid lane config {where}: repo must be an absolute path")
@@ -5785,7 +5824,10 @@ def lane_config():
             lane["model"] = "composer-2.5"
         if backend == "agy" and lane.get("model") is None:
             lane["model"] = AGY_DEFAULT_MODEL
-        if not isinstance(lane.get("model"), str) or not lane["model"].strip():
+        if backend == "hermes" and lane.get("model") is None:
+            lane["model"] = (load_policy().get("hermes") or {}).get("model")
+        if (backend != "hermes" or lane.get("model") is not None) and (
+                not isinstance(lane.get("model"), str) or not lane["model"].strip()):
             raise ValueError(f"invalid lane config {where}: model is required")
         fallback_models = lane.get("fallback_models")
         if fallback_models is not None and (not isinstance(fallback_models, list) or
@@ -5986,13 +6028,29 @@ class LaneChild:
             if lane.get("provider"):
                 cmd += ["--provider", lane["provider"]]
             cmd += ["--model", lane["model"]]
+        elif backend == "hermes":
+            binary = lane.get("binary") or hermes_bin(policy)
+            if not binary:
+                raise RuntimeError("hermes binary not found")
+            cmd = [binary, "acp"]
         else:
             binary = envvar("CURSOR_BIN") or lane.get("binary") or cursor_bin()
             if not binary:
                 raise RuntimeError("cursor-agent binary not found; set lane binary or install cursor-agent")
             cmd = [binary, "acp"]
+        child_env = os.environ.copy()
+        self.secret = None
+        if backend == "hermes":
+            cfg = policy.get("hermes") or {}
+            self.secret = minimax_key_from_pi()
+            if self.secret:
+                child_env[cfg.get("key_env") or "MINIMAX_CN_API_KEY"] = self.secret
+            child_env["HERMES_INFERENCE_PROVIDER"] = lane.get("provider") or cfg.get("provider") or "minimax-cn"
+            if lane.get("model"):
+                child_env["HERMES_MODEL"] = lane["model"]
         self.proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.DEVNULL, text=True, bufsize=1, start_new_session=True)
+                                     stderr=subprocess.DEVNULL, text=True, bufsize=1, start_new_session=True,
+                                     env=child_env)
         self.reader = threading.Thread(target=self._read, daemon=True)
         self.reader.start()
         if backend == "codex":
@@ -6006,7 +6064,7 @@ class LaneChild:
             except Exception:
                 self.close()
                 raise
-        elif backend == "cursor":
+        elif backend in ("cursor", "hermes"):
             try:
                 self.send({"jsonrpc": "2.0", "id": "init", "method": "initialize",
                            "params": {"protocolVersion": 1, "clientCapabilities": {},
@@ -6023,7 +6081,7 @@ class LaneChild:
         try:
             for line in self.proc.stdout:
                 try:
-                    self.events.put(json.loads(line))
+                    self.events.put(json.loads(line.replace(self.secret, "[REDACTED]") if self.secret else line))
                 except ValueError:
                     continue
         finally:
@@ -6063,7 +6121,7 @@ class LaneChild:
                     raise RuntimeError("executor stdout closed before RPC response")
                 if self.lane["backend"] == "codex" and item.get("id") == req_id and ("result" in item or "error" in item):
                     return item.get("result") or item
-                if self.lane["backend"] == "cursor" and item.get("id") == req_id and ("result" in item or "error" in item):
+                if self.lane["backend"] in ("cursor", "hermes") and item.get("id") == req_id and ("result" in item or "error" in item):
                     return item
                 if self.lane["backend"] == "pi" and item.get("id") == req_id and item.get("type") == "response":
                     if not item.get("success"):
@@ -6072,7 +6130,7 @@ class LaneChild:
                 if event_file and item.get("method") and "id" in item:
                     if lane_approval_response(self, item, event_file):
                         continue
-                    if self.lane["backend"] == "cursor" and lane_acp_request(self, item, event_file):
+                    if self.lane["backend"] in ("cursor", "hermes") and lane_acp_request(self, item, event_file):
                         continue
                 deferred.append(item)
             raise RuntimeError("executor RPC response timed out")
@@ -6252,7 +6310,7 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                         answer = {"ok": False, "error": f"lane {lane['name']} is idle"}
                     else:
                         text = str(req.get("text") or "")
-                        if lane["backend"] == "cursor":
+                        if lane["backend"] in ("cursor", "hermes"):
                             event_file = current.get("_event_file") or os.path.join(
                                 RUNS, current.get("run_id", ""), f"events.1.{lane['backend']}.jsonl")
                             lane_record_event(event_file, {"type": "steer", "mode": "cancel-and-continue", "text": text})
@@ -6319,7 +6377,7 @@ def lane_abort_child(lane, child, turn):
                         "params": {"threadId": turn["thread_id"], "turnId": turn["id"]}})
         elif lane["backend"] == "pi":
             child.send({"id": f"abort-{uuid.uuid4().hex}", "type": "abort"})
-        elif lane["backend"] == "cursor" and turn.get("session_id") and turn.get("cursor_prompt_id"):
+        elif lane["backend"] in ("cursor", "hermes") and turn.get("session_id") and turn.get("cursor_prompt_id"):
             child.send({"jsonrpc": "2.0", "method": "session/cancel",
                         "params": {"sessionId": turn["session_id"]}})
             turn["cursor_cancel_sent"] = True
@@ -6382,6 +6440,11 @@ def lane_begin_turn(lane, child, prompt, worktree, event_file, turn):
         turn["session_id"] = result.get("sessionId")
         if not turn["session_id"]:
             raise RuntimeError("cursor-agent ACP session/new response did not contain sessionId")
+        if lane["backend"] == "hermes" and not lane.get("model"):
+            lane_cursor_start_prompt(child, turn, prompt)
+            if turn.get("abort_pending"):
+                lane_abort_child(lane, child, turn)
+            return
         options = result.get("configOptions") or []
         selects = [option for option in options if isinstance(option, dict) and option.get("type") == "select"]
         model_options = [option for option in selects if option.get("category") == "model"] or selects
@@ -6406,7 +6469,8 @@ def lane_begin_turn(lane, child, prompt, worktree, event_file, turn):
         if selected.get("error"):
             raise RuntimeError(f"cursor-agent ACP model selection failed: {short(selected['error'], 300)}")
         lane["resolved_model"] = resolved
-        lane_write_state(lane["name"], model=resolved, resolved_model=resolved)
+        if lane["backend"] == "cursor":
+            lane_write_state(lane["name"], model=resolved, resolved_model=resolved)
         set_status(os.path.dirname(event_file), model=resolved, resolved_model=resolved)
         lane_cursor_start_prompt(child, turn, prompt)
     if turn.get("abort_pending"):
@@ -6504,7 +6568,7 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
     if not os.path.exists(event_file):
         open(event_file, "w").close()
     deadline = spec["started"] + max(0, float(spec["budget_minutes"] or 0)) * 60
-    provider = execution_provider(lane["backend"], lane=lane)
+    provider = execution_provider(lane["backend"], policy=load_policy(), lane=lane)
     set_status(rdir, state="running", lane=lane["name"], backend=lane["backend"], model=lane["model"],
                effort=lane.get("effort"), provider=provider, concurrency_keys=concurrency_keys(lane["backend"], provider),
                workspace=ws["path"], events=event_file, attempt=attempt, deadline=deadline,
@@ -10129,7 +10193,7 @@ def main():
         the repeated argument definitions and their help text aligned.
         """
         if profile_backends is None:
-            profile_backends = ["codex", "ocgo", "deepseek", "cursor", "agy", "gemini", "pi"]
+            profile_backends = ["codex", "ocgo", "deepseek", "cursor", "agy", "gemini", "pi", "hermes"]
         for field in fields:
             if field == "profile":
                 p.add_argument("--type", default="impl",
@@ -10187,7 +10251,7 @@ def main():
 
     sp = sub.add_parser("run")
     add_dispatch_arguments(sp, "profile", "card-type", "rework-of", "paths", "prompt", "task-file", "title",
-                           profile_backends=["codex", "ocgo", "deepseek", "cursor", "agy", "gemini", "pi",
+                           profile_backends=["codex", "ocgo", "deepseek", "cursor", "agy", "gemini", "pi", "hermes",
                                              "github-issue"],
                            card_type_help="optional task card type from knowledge/card-types.yaml",
                            rework_of_help="run id this task is reworking")

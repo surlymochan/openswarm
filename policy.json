@@ -193,6 +193,12 @@
       }
     }
   },
+  "hermes": {
+    "binary": "~/.local/hermes/bin/hermes",
+    "provider": "minimax-cn",
+    "model": null,
+    "key_env": "MINIMAX_CN_API_KEY"
+  },
   "cursor": {
     "_doc": "Opt-in executor. Not in routing.default_order, so route never picks it unless you add \"cursor\" there or pass --backend cursor. Quota is unknown; the CLI reports token usage after the run.",
     "default_model": "grok-4.7-high"

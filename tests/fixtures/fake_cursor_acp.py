@@ -44,7 +44,7 @@ def read_message(timeout=0.2):
 
 session_id = "fake-cursor-session"
 cwd = os.getcwd()
-record({"argv": sys.argv})
+record({"argv": sys.argv, "key_matches": os.environ.get("FAKE_EXPECTED_KEY") == os.environ.get(os.environ.get("FAKE_KEY_ENV", "MINIMAX_CN_API_KEY"))})
 config_options = [{"id": "model", "name": "Model", "category": "model", "type": "select",
                    "currentValue": "other-model", "options": [
                        {"value": "composer-2.5", "name": "Composer 2.5"},
