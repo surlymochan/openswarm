@@ -11,7 +11,7 @@ Subcommands:
   status           human summary of state + recommended concurrency
   route            pick backend/model/effort for a task profile (JSON out)
   run              route + execute in an isolated git worktree, record ledger (JSON out)
-  lessons          preview applicable knowledge-repo lessons
+  lessons          preview lessons or propose additions from PR review findings
   lane             manage long-lived Codex app-server / Cursor ACP / Pi RPC executor lanes
   fleet            inspect hosts and forward openswarm commands over local / SSH / instabox transports
   batch            queue task cards across fleet hosts and collect their branches
@@ -416,6 +416,325 @@ def add_lessons_to_prompt(prompt, policy, card_type=None, backend=None, card_tex
         else:
             prompt += separator
     return prompt, ids
+
+
+LESSON_ROOT_CAUSE_KEYWORDS = (
+    ("secret_exposure", (r"\bsecret", r"\btoken\b", r"credential", r"password", r"private key",
+                         r"api key", r"expos(?:e|ed|ure)", r"leak(?:ed|ing)?")),
+    ("trust_boundary", (r"trust boundary", r"untrusted", r"user[- ]controlled", r"authorization",
+                         r"authentication", r"permission", r"sandbox", r"allowlist", r"access control")),
+    ("input_validation", (r"validat", r"sanitize", r"unsanitized", r"schema", r"invalid input",
+                           r"input parsing", r"parse untrusted")),
+    ("concurrency", (r"concurren", r"race condition", r"race", r"thread.safe", r"deadlock", r"lock",
+                      r"atomic write")),
+    ("missing_test", (r"missing tests?", r"no tests?", r"test coverage", r"untested", r"regression test")),
+    ("i18n_literal", (r"i18n", r"internationali[sz]", r"locali[sz]", r"translation", r"locale",
+                       r"hard.coded (?:string|text|copy)", r"literal (?:string|text)")),
+    ("platform_assumption", (r"platform assumption", r"platform.specific", r"macos", r"windows", r"linux",
+                              r"path separator", r"operating system", r"environment variable")),
+    ("error_handling", (r"error handling", r"exception", r"error path", r"failure handling", r"return code",
+                         r"timeout", r"retry", r"swallow(?:ed|ing)? errors?")),
+)
+
+
+def lesson_root_cause_class(text):
+    value = str(text or "").casefold()
+    for name, patterns in LESSON_ROOT_CAUSE_KEYWORDS:
+        if any(re.search(pattern, value, re.I) for pattern in patterns):
+            return name
+    return "other"
+
+
+def lesson_finding_title(body):
+    """Return a short heading from a Codex inline comment, excluding its explanation."""
+    for line in str(body or "").splitlines():
+        title = line.strip()
+        if not title:
+            continue
+        title = re.sub(r"^#{1,6}\s*", "", title)
+        title = re.sub(r"^>\s*", "", title)
+        title = title.strip("* `_~")
+        if re.fullmatch(r"P[012](?:\s+Badge)?", title, re.I):
+            continue
+        match = re.match(r"^\[(P[012])\]\s*(.+)$", title, re.I)
+        if match:
+            title = match.group(2).strip().strip("* `_~")
+        else:
+            match = re.match(r"^(P[012])(?:\s+Badge)?\s*[:—-]\s*(.+)$", title, re.I)
+            if match:
+                title = match.group(2).strip().strip("* `_~")
+        title = re.sub(r"\s+", " ", title)
+        if title:
+            return bus_redact(title[:240]).rstrip(" .!?;:")
+    return "Review the affected code path"
+
+
+def lesson_top_level_paths(entry):
+    paths = entry.get("files_changed") or entry.get("area") or []
+    if isinstance(paths, str):
+        paths = [paths]
+    result = set()
+    for path in paths if isinstance(paths, list) else []:
+        if not isinstance(path, str):
+            continue
+        normalized = path.strip().replace("\\", "/")
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        normalized = normalized.lstrip("/")
+        top = normalized.split("/", 1)[0].strip()
+        if top and top not in (".", ".."):
+            result.add(top)
+    return sorted(result)
+
+
+def lesson_paths_overlap(existing, changed):
+    if not existing:
+        return True
+    if not changed:
+        return False
+    changed_roots = {path.split("/", 1)[0] for path in changed}
+    for pattern in existing:
+        value = str(pattern).replace("\\", "/").strip().lstrip("./")
+        if not value:
+            continue
+        root = value.split("/", 1)[0]
+        if any(fnmatch.fnmatchcase(path, root) or fnmatch.fnmatchcase(root, path)
+               for path in changed_roots):
+            return True
+    return False
+
+
+def lesson_existing_records(repo):
+    directory = os.path.join(repo, "lessons")
+    records = []
+    try:
+        filenames = sorted(name for name in os.listdir(directory) if name.endswith(".yaml"))
+    except FileNotFoundError:
+        return records
+    except OSError as error:
+        raise ValueError(f"cannot read lessons directory {directory}: {error}") from error
+    for filename in filenames:
+        path = os.path.join(directory, filename)
+        try:
+            with open(path, encoding="utf-8") as stream:
+                lesson = parse_lesson_yaml(stream.read())
+        except (OSError, ValueError) as error:
+            print(f"openswarm: warning: skipping lesson file {path}: {error}", file=sys.stderr)
+            continue
+        records.append(lesson)
+    return records
+
+
+def lesson_next_id(repo, existing, seen_comments=None):
+    used = set()
+    for lesson in existing:
+        lesson_id = lesson.get("id")
+        if isinstance(lesson_id, str):
+            match = re.fullmatch(r"L-(\d+)", lesson_id)
+            if match:
+                used.add(int(match.group(1)))
+    directory = os.path.join(repo, "proposals")
+    for path in glob.glob(os.path.join(directory, "**", "*.yaml"), recursive=True):
+        try:
+            with open(path, encoding="utf-8") as stream:
+                match = re.search(r"(?m)^id:\s*['\"]?(L-(\d+))['\"]?\s*$", stream.read())
+            if match:
+                used.add(int(match.group(2)))
+        except OSError:
+            continue
+    for item in (seen_comments or {}).values():
+        if isinstance(item, dict):
+            lesson_id = item.get("id") or item.get("lesson_id")
+            match = re.fullmatch(r"L-(\d+)", str(lesson_id or ""))
+            if match:
+                used.add(int(match.group(1)))
+    number = 1
+    while number in used:
+        number += 1
+    return number
+
+
+def lesson_yaml_quote(value):
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def lesson_proposal_yaml(proposal):
+    if proposal["kind"] == "recurrence":
+        return (f"proposal_type: recurrence\nlesson_id: {lesson_yaml_quote(proposal['lesson_id'])}\n"
+                f"root_cause_class: {lesson_yaml_quote(proposal['root_cause_class'])}\n"
+                f"recurrences: {proposal['recurrences']}\nsource: {lesson_yaml_quote(proposal['source'])}\n")
+    applies = proposal["applies_to"]
+    lines = [f"id: {lesson_yaml_quote(proposal['id'])}", f"date: {lesson_yaml_quote(proposal['date'])}",
+             f"title: {lesson_yaml_quote(proposal['title'])}",
+             f"root_cause_class: {lesson_yaml_quote(proposal['root_cause_class'])}",
+             f"recurrences: {proposal['recurrences']}",
+             f"rule: {lesson_yaml_quote(proposal['rule'])}", "guard_level: L2", "applies_to:"]
+    for key in ("card_types", "paths", "backends"):
+        values = ", ".join(lesson_yaml_quote(value) for value in applies[key])
+        lines.append(f"  {key}: [{values}]")
+    lines.append(f"source: {lesson_yaml_quote(proposal['source'])}")
+    return "\n".join(lines) + "\n"
+
+
+def lesson_read_comments(entry):
+    pr = entry.get("pr") if isinstance(entry.get("pr"), dict) else {}
+    repo, number = pr.get("repo"), gh_pr_number(pr)
+    if not isinstance(repo, str) or not BUS_REPO_RE.fullmatch(repo) or number is None or number < 1:
+        return []
+    run_id = str(entry.get("run_id") or entry.get("id") or "__lesson_propose__")
+    comments = gh_ingest_pages(run_id, repo, f"repos/{repo}/pulls/{number}/comments")
+    findings = []
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+        login = str((comment.get("user") or {}).get("login") or "").casefold()
+        if login != "chatgpt-codex-connector[bot]":
+            continue
+        badges = gh_badge_counts(comment.get("body"))
+        if not badges.get("p0") and not badges.get("p1"):
+            continue
+        comment_id = comment.get("id")
+        if isinstance(comment_id, bool) or not re.fullmatch(r"[0-9]+", str(comment_id or "")):
+            continue
+        findings.append((str(comment_id), comment, lesson_finding_title(comment.get("body"))))
+    return findings
+
+
+def lesson_markdown_summary(date, proposals, skipped=0):
+    lines = ["# Lesson proposals", "", f"Generated: {date}", "",
+             f"Proposals: {len(proposals)}", f"Already seen: {skipped}", ""]
+    if not proposals:
+        lines.append("No new proposals.")
+    for proposal in proposals:
+        label = (f"recurrence of `{proposal['lesson_id']}`" if proposal["kind"] == "recurrence"
+                 else f"new lesson `{proposal['id']}`")
+        lines.append(f"- {label}: `{proposal['root_cause_class']}` — {proposal['title']} ({proposal['source']})")
+    return "\n".join(lines) + "\n"
+
+
+def cmd_lessons_propose(args, policy):
+    if not math.isfinite(args.since) or args.since < 0:
+        raise ValueError("--since must be a finite non-negative number")
+    repo = os.path.expanduser(str((policy.get("knowledge") or {}).get("repo") or DEFAULT_KNOWLEDGE_REPO))
+    date = policy_day(policy)[0]
+    output_dir = os.path.abspath(os.path.expanduser(args.out)) if args.out else os.path.join(repo, "proposals", date)
+    proposals_root = os.path.join(repo, "proposals")
+    seen_path = os.path.join(proposals_root, "seen.json")
+    ledger_path = fleet_ledger_path() if args.fleet else LEDGER
+    threshold = NOW() - args.since * 86400
+    def has_priority_findings(entry):
+        findings = entry.get("review_findings") if isinstance(entry.get("review_findings"), dict) else {}
+        return any(isinstance(findings.get(key), (int, float)) and not isinstance(findings.get(key), bool)
+                   and findings.get(key) > 0 for key in ("p0", "p1"))
+
+    entries = [entry for entry in ledger_entries_from(ledger_path)
+               if (to_epoch(entry.get("ts")) or 0) >= threshold
+               and isinstance(entry.get("pr"), dict) and has_priority_findings(entry)]
+    candidates, processed_prs = [], set()
+    for entry in entries:
+        pr = entry["pr"]
+        pr_key = (pr.get("repo"), gh_pr_number(pr))
+        if pr_key in processed_prs:
+            continue
+        processed_prs.add(pr_key)
+        findings = lesson_read_comments(entry)
+        pr_url = f"https://github.com/{pr['repo']}/pull/{gh_pr_number(pr)}"
+        paths = lesson_top_level_paths(entry)
+        card_types = [str(entry["card_type"])] if entry.get("card_type") else []
+        backends = [str(entry["backend"])] if entry.get("backend") else []
+        for comment_id, comment, title in findings:
+            body = str(comment.get("body") or "")
+            root_class = lesson_root_cause_class(title + "\n" + body)
+            source = f"{pr_url}#discussion_r{comment_id}"
+            candidates.append({"comment_key": f"{pr['repo']}:{comment_id}", "title": title,
+                               "root_cause_class": root_class, "source": bus_redact(source),
+                               "paths": paths, "card_types": card_types, "backends": backends})
+
+    lock = None
+    if not args.dry_run:
+        os.makedirs(proposals_root, exist_ok=True)
+        lock = open(seen_path + ".lock", "a", encoding="utf-8")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        if os.path.isfile(seen_path):
+            try:
+                with open(seen_path, encoding="utf-8") as stream:
+                    seen = json.load(stream)
+            except (OSError, ValueError) as error:
+                raise ValueError(f"cannot read proposal seen index {seen_path}: {error}") from error
+        else:
+            seen = {}
+        if not isinstance(seen, dict):
+            raise ValueError(f"invalid proposal seen index: {seen_path}")
+        comment_ids = seen.get("comment_ids", {})
+        if isinstance(comment_ids, list):
+            comment_ids = {str(value): {} for value in comment_ids}
+        if not isinstance(comment_ids, dict):
+            raise ValueError(f"invalid proposal comment_ids index: {seen_path}")
+        new_candidates = [row for row in candidates if row["comment_key"] not in comment_ids]
+        skipped = len(candidates) - len(new_candidates)
+        existing = lesson_existing_records(repo)
+        next_number = lesson_next_id(repo, existing, comment_ids)
+        proposals, file_texts, next_seen = [], {}, dict(comment_ids)
+        for candidate in new_candidates:
+            matching = [lesson for lesson in existing
+                        if lesson.get("root_cause_class") == candidate["root_cause_class"]
+                        and lesson_paths_overlap((lesson.get("applies_to") or {}).get("paths") or [],
+                                                 candidate["paths"])]
+            if matching:
+                lesson = sorted(matching, key=lambda item: str(item.get("id")))[0]
+                old_recurrences = lesson.get("recurrences", 0)
+                recurrences = (old_recurrences if isinstance(old_recurrences, int)
+                               and not isinstance(old_recurrences, bool) and old_recurrences >= 0 else 0) + 1
+                proposal = {"kind": "recurrence", "lesson_id": lesson["id"],
+                            "root_cause_class": candidate["root_cause_class"],
+                            "recurrences": recurrences, "title": candidate["title"], "source": candidate["source"]}
+                filename = f"recurrence-{lesson['id']}-{candidate['comment_key'].rsplit(':', 1)[-1]}.yaml"
+                lesson["recurrences"] = recurrences
+            else:
+                lesson_id = f"L-{next_number:04d}"
+                next_number += 1
+                rule = bus_redact(f"Prevent recurrence of this finding: {candidate['title']}.")
+                proposal = {"kind": "new", "id": lesson_id, "date": date, "title": candidate["title"],
+                            "root_cause_class": candidate["root_cause_class"], "recurrences": 1,
+                            "rule": rule, "applies_to": {"card_types": candidate["card_types"],
+                            "paths": candidate["paths"], "backends": candidate["backends"]},
+                            "source": candidate["source"]}
+                filename = f"{lesson_id}.yaml"
+            proposals.append(proposal)
+            file_texts[filename] = lesson_proposal_yaml(proposal)
+            next_seen[candidate["comment_key"]] = {
+                "source": candidate["source"], "file": filename, "date": date,
+                **({"id": proposal["id"]} if proposal["kind"] == "new"
+                   else {"lesson_id": proposal["lesson_id"]})}
+        summary = lesson_markdown_summary(date, proposals, skipped)
+        if args.dry_run:
+            for filename, contents in file_texts.items():
+                print(f"--- {filename} ---")
+                print(contents, end="")
+            print(summary, end="")
+        else:
+            os.makedirs(output_dir, exist_ok=True)
+            for filename, contents in file_texts.items():
+                path = os.path.join(output_dir, filename)
+                fd, temporary = tempfile.mkstemp(prefix=os.path.basename(path) + ".tmp", dir=output_dir)
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                        stream.write(contents)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temporary, path)
+                finally:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+            summary_path = os.path.join(output_dir, "summary.md")
+            with open(summary_path, "w", encoding="utf-8") as stream:
+                stream.write(summary)
+            jsave(seen_path, {**seen, "comment_ids": next_seen})
+            print(f"wrote {len(proposals)} lesson proposal(s) to {output_dir}; seen index: {seen_path}")
+    finally:
+        if lock is not None:
+            lock.close()
 
 
 def source_enabled(policy, name):
@@ -7082,6 +7401,11 @@ def main():
     lp.add_argument("--card-type")
     lp.add_argument("--backend")
     lp.add_argument("--paths", nargs="+", default=[])
+    lp = lessons_sub.add_parser("propose", help="propose lessons from linked P0/P1 Codex PR findings")
+    lp.add_argument("--fleet", action="store_true", help="read the merged fleet ledger")
+    lp.add_argument("--since", type=float, default=30, help="only inspect runs from the last DAYS (default: 30)")
+    lp.add_argument("--out", help="proposal output directory (default: knowledge.repo/proposals/<date>)")
+    lp.add_argument("--dry-run", action="store_true", help="print proposals without writing proposal files")
 
     def add_profile(p, include_bus=False):
         p.add_argument("--type", default="impl",
@@ -7289,9 +7613,16 @@ def main():
     elif a.cmd == "status":
         cmd_status(policy, a.refresh)
     elif a.cmd == "lessons":
-        block, _ = select_lessons(policy, a.card_type, a.backend, paths=a.paths)
-        if block:
-            print(block)
+        if a.lessons_cmd == "preview":
+            block, _ = select_lessons(policy, a.card_type, a.backend, paths=a.paths)
+            if block:
+                print(block)
+        else:
+            try:
+                cmd_lessons_propose(a, policy)
+            except (BusError, ValueError) as error:
+                print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False), file=sys.stderr)
+                sys.exit(2)
     elif a.cmd == "route":
         validate_card_type(policy, a.card_type)
         st = get_state(policy, a.refresh)

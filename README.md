@@ -178,6 +178,16 @@ openswarm lessons preview --card-type fix --backend codex --paths src/file.py
 
 Injected lesson ids are recorded in the run ledger's `lessons_injected` field.
 
+Propose review-derived lessons from recent ledger runs linked to P0/P1 Codex inline findings with:
+
+```bash
+openswarm lessons propose [--fleet] [--since DAYS] [--out DIR] [--dry-run]
+```
+
+New lesson and recurrence proposals are written under `knowledge.repo/proposals/<date>/` by default. The command
+tracks processed inline comment ids in `knowledge.repo/proposals/seen.json`; it never edits existing lessons.
+`--dry-run` prints the proposed YAML and summary without writing proposal or seen-index files.
+
 ## Routing weights (record-only)
 
 `openswarm routing weights` summarizes ledger runs by backend, model and card type. It writes

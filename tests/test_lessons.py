@@ -22,15 +22,77 @@ class LessonsTests(unittest.TestCase):
         self.lessons = self.root / "lessons"
         self.lessons.mkdir()
         self.policy = {"knowledge": {"repo": str(self.root)}}
+        self.constants = {key: getattr(xs, key) for key in ("DATA", "LEDGER", "HOME")}
+        xs.DATA = str(self.root / "data")
+        xs.LEDGER = str(self.root / "data" / "ledger.jsonl")
+        xs.HOME = str(self.root / "home")
+        self.gh = None
 
     def tearDown(self):
         self.tmp.cleanup()
+        for key, value in self.constants.items():
+            setattr(xs, key, value)
 
-    def write_lesson(self, name, lesson_id, rule, guard="L2", card_types="[]", paths="[]", backends="[]"):
+    def write_lesson(self, name, lesson_id, rule, guard="L2", card_types="[]", paths="[]", backends="[]",
+                     root_cause_class=None, recurrences=0):
+        extra = (f"root_cause_class: {root_cause_class}\nrecurrences: {recurrences}\n"
+                 if root_cause_class else "")
         (self.lessons / name).write_text(
             f"id: {lesson_id}\ndate: 2026-10-27\nrule: {rule}\nguard_level: {guard}\napplies_to:\n"
-            f"  card_types: {card_types}\n  paths: {paths}\n  backends: {backends}\n",
+            f"  card_types: {card_types}\n  paths: {paths}\n  backends: {backends}\n{extra}",
             encoding="utf-8")
+
+    def make_gh(self, fixtures):
+        fake = self.root / "gh"
+        fixture_file = self.root / "gh-fixtures.json"
+        call_log = self.root / "gh-calls.txt"
+        fixture_file.write_text(json.dumps(fixtures), encoding="utf-8")
+        fake.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, sys\n"
+            "endpoint = sys.argv[2]\n"
+            "with open(os.environ['GH_CALL_LOG'], 'a') as log: log.write(endpoint + '\\n')\n"
+            "with open(os.environ['GH_FIXTURES']) as source: fixtures = json.load(source)\n"
+            "if endpoint not in fixtures:\n"
+            "    print('missing fixture: ' + endpoint, file=sys.stderr)\n"
+            "    raise SystemExit(1)\n"
+            "print(json.dumps(fixtures[endpoint]))\n", encoding="utf-8")
+        fake.chmod(0o755)
+        self.gh = {"OPENSWARM_GH_BIN": str(fake), "GH_FIXTURES": str(fixture_file),
+                   "GH_CALL_LOG": str(call_log)}
+        return call_log
+
+    def set_ledger_finding(self, comment_id=701, title="Validate the archive path before extraction",
+                           badge="P1", extra_comments=None, run_id="finding-run"):
+        repo, number = "octo/project", 14
+        comments = [{"id": comment_id, "user": {"login": "chatgpt-codex-connector[bot]"},
+                     "body": f"**[{badge}] {title}**\n\nThe finding affects this code path.\n\n{badge} Badge"}]
+        comments.extend(extra_comments or [])
+        self.make_gh({f"repos/{repo}/pulls/{number}/comments?per_page=100&page=1": comments})
+        path = Path(xs.LEDGER)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"id": run_id, "ts": xs.NOW(), "backend": "codex",
+                                    "card_type": "fix", "files_changed": ["src/archive.py", "README.md"],
+                                    "pr": {"repo": repo, "number": number,
+                                           "url": f"https://github.com/{repo}/pull/{number}"},
+                                    "review_findings": {"p0": 0, "p1": 1, "p2": 0}}) + "\n",
+                        encoding="utf-8")
+        fleet_path = Path(xs.fleet_ledger_path())
+        fleet_path.parent.mkdir(parents=True, exist_ok=True)
+        fleet_path.write_bytes(path.read_bytes())
+        return path
+
+    def run_propose(self, *args):
+        original_argv = sys.argv
+        try:
+            sys.argv = ["openswarm", "lessons", "propose", *args]
+            output = io.StringIO()
+            with mock.patch.object(xs, "load_policy", return_value=self.policy), \
+                    mock.patch.dict(os.environ, self.gh or {}), contextlib.redirect_stdout(output):
+                xs.main()
+            return output.getvalue()
+        finally:
+            sys.argv = original_argv
 
     def test_selection_filters_card_type_backend_and_paths_then_orders_specificity(self):
         self.write_lesson("global.yaml", "L-0001", "general rule")
@@ -107,6 +169,73 @@ class LessonsTests(unittest.TestCase):
         finally:
             sys.argv = old_argv
         self.assertIn("[L-0013] protect src path", output.getvalue())
+
+    def test_propose_writes_new_lesson_with_class_paths_profile_and_source(self):
+        self.set_ledger_finding(extra_comments=[
+            {"id": 702, "user": {"login": "reviewer"}, "body": "**[P0] Not from Codex**\nP0 Badge"},
+            {"id": 703, "user": {"login": "chatgpt-codex-connector[bot]"},
+             "body": "**[P2] Lower priority**\nP2 Badge"},
+        ])
+
+        output = self.run_propose("--fleet")
+
+        proposal = self.root / "proposals" / xs.policy_day(self.policy)[0] / "L-0001.yaml"
+        text = proposal.read_text(encoding="utf-8")
+        self.assertIn('root_cause_class: "input_validation"', text)
+        self.assertIn('card_types: ["fix"]', text)
+        self.assertIn('paths: ["README.md", "src"]', text)
+        self.assertIn('backends: ["codex"]', text)
+        self.assertIn("#discussion_r701", text)
+        self.assertTrue((proposal.parent / "summary.md").is_file())
+        seen = json.loads((self.root / "proposals" / "seen.json").read_text(encoding="utf-8"))
+        self.assertIn("octo/project:701", seen["comment_ids"])
+        self.assertIn("wrote 1 lesson proposal", output)
+
+    def test_propose_recurs_existing_class_and_overlapping_paths(self):
+        self.write_lesson("validation.yaml", "L-0030", "validate input", paths="[src/*.py]",
+                          root_cause_class="input_validation", recurrences=4)
+        self.set_ledger_finding()
+
+        self.run_propose()
+
+        proposal = self.root / "proposals" / xs.policy_day(self.policy)[0] / "recurrence-L-0030-701.yaml"
+        self.assertIn("recurrences: 5", proposal.read_text(encoding="utf-8"))
+        self.assertEqual((self.lessons / "validation.yaml").read_text(encoding="utf-8").count("recurrences: 4"), 1)
+
+    def test_unknown_finding_class_maps_to_other(self):
+        self.write_lesson("existing.yaml", "L-0001", "unrelated", root_cause_class="error_handling")
+        self.set_ledger_finding(title="Rename the summary heading", badge="P0")
+
+        self.run_propose()
+
+        proposal = self.root / "proposals" / xs.policy_day(self.policy)[0] / "L-0002.yaml"
+        self.assertIn('root_cause_class: "other"', proposal.read_text(encoding="utf-8"))
+
+    def test_comment_id_is_never_proposed_twice(self):
+        ledger = self.set_ledger_finding()
+        original = ledger.read_text(encoding="utf-8")
+        ledger.write_text(original + original, encoding="utf-8")
+        output_dir = self.root / "custom-out"
+
+        self.run_propose("--out", str(output_dir))
+        second = self.run_propose("--out", str(output_dir))
+
+        proposals = list(output_dir.glob("L-*.yaml"))
+        self.assertEqual(len(proposals), 1)
+        self.assertIn("wrote 0 lesson proposal", second)
+        self.assertEqual(list(json.loads((self.root / "proposals" / "seen.json").read_text())
+                              ["comment_ids"]), ["octo/project:701"])
+
+    def test_dry_run_prints_proposal_without_writing_proposals_or_seen_index(self):
+        self.set_ledger_finding()
+        output_dir = self.root / "dry-run-out"
+
+        output = self.run_propose("--out", str(output_dir), "--dry-run")
+
+        self.assertIn("--- L-0001.yaml ---", output)
+        self.assertIn("# Lesson proposals", output)
+        self.assertFalse(output_dir.exists())
+        self.assertFalse((self.root / "proposals" / "seen.json").exists())
 
 
 if __name__ == "__main__":
