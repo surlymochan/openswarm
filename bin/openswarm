@@ -12,6 +12,7 @@ Subcommands:
   route            pick backend/model/effort for a task profile (JSON out)
   run              route + execute in an isolated git worktree, record ledger (JSON out)
   compare          run the same card on two executors and record a best-of-two comparison
+  regress          run or compare a regression-card suite
   review           cross-family read-only review of a finished run
   consult          ask multiple executors the same question in read-only mode
   lessons          preview, propose, and escalate executor lessons
@@ -34,6 +35,7 @@ Nothing that reads another tool's login/auth file is enabled by default.
 """
 import argparse
 import base64
+import concurrent.futures
 import contextlib
 import datetime as dt
 import glob
@@ -53,6 +55,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -306,8 +309,8 @@ def lesson_yaml_scalar(raw, allow_list=False):
     return value
 
 
-def parse_lesson_yaml(text):
-    """Parse one strict lesson mapping from the repository's small YAML subset."""
+def parse_lesson_yaml(text, require_lesson=True):
+    """Parse a mapping from the repository's small YAML subset."""
     lesson, applies, active_map = {}, {}, None
     for number, original in enumerate(text.splitlines(), 1):
         content = lesson_yaml_comment(original).rstrip()
@@ -347,14 +350,15 @@ def parse_lesson_yaml(text):
             applies[key] = values
         else:
             raise ValueError(f"line {number}: unsupported indentation or nested mapping")
-    missing = LESSON_FIELDS - lesson.keys()
-    if missing:
-        raise ValueError("missing required field(s): " + ", ".join(sorted(missing)))
-    if (not isinstance(lesson["id"], str)
-            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", lesson["id"])):
-        raise ValueError("id must contain only letters, digits, dot, underscore, or hyphen")
-    for key in LESSON_APPLIES_TO_FIELDS:
-        lesson["applies_to"].setdefault(key, [])
+    if require_lesson:
+        missing = LESSON_FIELDS - lesson.keys()
+        if missing:
+            raise ValueError("missing required field(s): " + ", ".join(sorted(missing)))
+        if (not isinstance(lesson["id"], str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", lesson["id"])):
+            raise ValueError("id must contain only letters, digits, dot, underscore, or hyphen")
+        for key in LESSON_APPLIES_TO_FIELDS:
+            lesson["applies_to"].setdefault(key, [])
     return lesson
 
 
@@ -4484,6 +4488,7 @@ def cmd_run(args, policy):
                    "branch": fin.get("branch"), "verify": verify,
                    "files_changed": changed,
                    "card_type": card_type, "rework_of": rework_of,
+                   **({"regress_label": args.regress_label} if getattr(args, "regress_label", None) else {}),
                    "lessons_injected": lessons_injected,
                    "patterns_injected": patterns_injected,
                    "reasons": decision.get("reasons"), **routing_fields})
@@ -6188,7 +6193,7 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                         with open(os.path.join(rdir, "task.md"), "w") as f:
                             f.write(task)
                         spec = {k: req.get(k) for k in ("title", "verify", "verify_baseline", "budget_minutes", "base",
-                                                        "card_type", "rework_of", "paths")}
+                                                        "card_type", "rework_of", "paths", "regress_label")}
                         provider = execution_provider(lane["backend"], policy=load_policy(), lane=lane)
                         spec.update({"run_id": rid, "task": task, "started": NOW(), "provider": provider})
                         spec["_event_file"] = os.path.join(rdir, f"events.1.{lane['backend']}.jsonl")
@@ -6797,6 +6802,7 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
                    "branch": fin.get("branch"), "verify": verify,
                    "files_changed": changed,
                    "card_type": spec.get("card_type"), "rework_of": spec.get("rework_of"),
+                   **({"regress_label": spec["regress_label"]} if spec.get("regress_label") else {}),
                    "lessons_injected": spec.get("lessons_injected", []),
                    "patterns_injected": spec.get("patterns_injected", [])})
     set_status(rdir, state="finished", status=status, finished=NOW(), commit=fin.get("commit"), lane=lane["name"])
@@ -6941,6 +6947,7 @@ def lane_do_run(lane, spec, child, server, current):
                            "lane": lane["name"], "backend": lane["backend"], "model": lane["model"],
                            "error_class": error_class, "card_type": spec.get("card_type"),
                            "rework_of": spec.get("rework_of"),
+                           **({"regress_label": spec["regress_label"]} if spec.get("regress_label") else {}),
                            **exec_pass_fields(False, False, bool(spec.get("verify")), None)})
             return status
         return lane_finalize_run(lane, spec, ws, None, {}, error_class, 1, evp)
@@ -9589,6 +9596,362 @@ def cmd_compare(args, policy):
                       "proposal": report.get("proposal")}, ensure_ascii=False, indent=2))
 
 
+REGRESS_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
+
+
+def regress_knowledge_repo(policy):
+    return os.path.realpath(os.path.expanduser(str((policy.get("knowledge") or {}).get("repo") or
+                                                   DEFAULT_KNOWLEDGE_REPO)))
+
+
+def regress_card_meta(path):
+    with open(path, encoding="utf-8") as stream:
+        meta = parse_lesson_yaml(stream.read(), require_lesson=False)
+    meta = {key.replace("-", "_"): value for key, value in meta.items()}
+    if "expected_outcome" not in meta and "expected" in meta:
+        meta["expected_outcome"] = meta["expected"]
+    required = ("id", "card_type", "repo", "base_commit", "verify", "difficulty", "est_minutes")
+    missing = [key for key in required if key not in meta]
+    if missing:
+        raise ValueError("missing required field(s): " + ", ".join(missing))
+    if not isinstance(meta["id"], str) or not REGRESS_ID_RE.fullmatch(meta["id"]):
+        raise ValueError("id must contain only letters, digits, dot, underscore, or hyphen")
+    if not isinstance(meta["card_type"], str) or not meta["card_type"].strip():
+        raise ValueError("card_type must be a non-empty string")
+    if not isinstance(meta["repo"], str) or not meta["repo"].strip():
+        raise ValueError("repo must be a non-empty string")
+    if not isinstance(meta["base_commit"], str) or not meta["base_commit"].strip():
+        raise ValueError("base_commit must be a non-empty string")
+    if not isinstance(meta["verify"], str) or not meta["verify"].strip():
+        raise ValueError("verify must be a non-empty string")
+    if (not isinstance(meta["difficulty"], int) or isinstance(meta["difficulty"], bool)
+            or not 1 <= meta["difficulty"] <= 5):
+        raise ValueError("difficulty must be an integer from 1 to 5")
+    if isinstance(meta["est_minutes"], str) and re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", meta["est_minutes"]):
+        meta["est_minutes"] = float(meta["est_minutes"])
+    if (not isinstance(meta["est_minutes"], (int, float)) or isinstance(meta["est_minutes"], bool)
+            or not math.isfinite(meta["est_minutes"]) or meta["est_minutes"] < 0):
+        raise ValueError("est_minutes must be a non-negative number")
+    if "verify_fails_on_base" in meta and not isinstance(meta["verify_fails_on_base"], bool):
+        raise ValueError("verify_fails_on_base must be a boolean")
+    if "expected_outcome" in meta and not isinstance(meta["expected_outcome"], str):
+        raise ValueError("expected_outcome must be a string")
+    meta.setdefault("verify_fails_on_base", False)
+    return meta
+
+
+def regress_resolve_card(card_dir, policy):
+    meta_path = os.path.join(card_dir, "meta.yaml")
+    card_path = os.path.join(card_dir, "card.md")
+    meta = regress_card_meta(meta_path)
+    if meta["id"] != os.path.basename(card_dir):
+        raise ValueError(f"card id {meta['id']!r} does not match directory {os.path.basename(card_dir)!r}")
+    with open(card_path, encoding="utf-8") as stream:
+        task = stream.read()
+    if not task.strip():
+        raise ValueError("card.md is empty")
+    repos = (policy.get("regress") or {}).get("repos") or {}
+    repo_path = repos.get(meta["repo"])
+    if not isinstance(repo_path, str) or not repo_path.strip():
+        raise ValueError(f"no path configured for regression repo {meta['repo']!r} in policy.regress.repos")
+    repo_path = os.path.realpath(os.path.expanduser(repo_path))
+    rc, top, error = git(["rev-parse", "--show-toplevel"], repo_path)
+    if rc:
+        raise ValueError(f"regression repo is not a git checkout: {repo_path} ({error.strip()[:200]})")
+    repo_path = os.path.realpath(top.strip())
+    rc, base, error = git(["rev-parse", "--verify", "--end-of-options",
+                           f"{meta['base_commit']}^{{commit}}"], repo_path)
+    if rc:
+        raise ValueError(f"base_commit is unavailable for {meta['id']}: {error.strip()[:200]}")
+    meta["base_commit"] = base.strip()
+    validate_card_type(policy, meta["card_type"])
+    return {"id": meta["id"], "path": card_dir, "task": task, "meta": meta, "repo_path": repo_path}
+
+
+def regress_load_cards(args, policy):
+    root = os.path.join(regress_knowledge_repo(policy), "regression")
+    requested = [value.strip() for value in (args.cards or "").split(",") if value.strip()]
+    if args.cards and not requested:
+        raise ValueError("--cards requires at least one card id")
+    if len(requested) != len(set(requested)):
+        raise ValueError("--cards contains duplicate ids")
+    ids = requested or sorted(name for name in os.listdir(root)
+                              if os.path.isdir(os.path.join(root, name)))
+    if not ids:
+        raise ValueError(f"no regression cards found in {root}")
+    cards = []
+    for card_id in ids:
+        if not REGRESS_ID_RE.fullmatch(card_id):
+            raise ValueError(f"invalid regression card id: {card_id!r}")
+        card_dir = os.path.realpath(os.path.join(root, card_id))
+        if os.path.commonpath((root, card_dir)) != root or not os.path.isdir(card_dir):
+            raise ValueError(f"regression card not found: {card_id}")
+        cards.append(regress_resolve_card(card_dir, policy))
+    return cards
+
+
+def regress_worktree_path(repo, run_id, policy):
+    repo = os.path.realpath(repo)
+    if (policy.get("workspace") or {}).get("sibling_worktrees", True):
+        return os.path.join(os.path.dirname(repo), f".openswarm-wt-{os.path.basename(repo)}-{run_id}")
+    return os.path.join(WORKTREES, f"{os.path.basename(repo)}-{run_id}")
+
+
+def regress_cleanup_worktree(repo, run_id, policy):
+    repo = os.path.realpath(repo)
+    worktree = regress_worktree_path(repo, run_id, policy)
+    remove_branch = False
+    if os.path.exists(worktree):
+        rc, _, error = git(["worktree", "remove", "--force", worktree], repo, timeout=60)
+        if rc and os.path.exists(worktree):
+            raise RuntimeError(f"regression worktree cleanup failed: {error.strip()[:200]}")
+        remove_branch = True
+    if remove_branch:
+        git(["branch", "-D", f"openswarm/{run_id}"], repo)
+
+
+def regress_usage_tokens(result):
+    if not isinstance(result, dict):
+        return None
+    attempts = result.get("attempts") if isinstance(result.get("attempts"), list) else []
+    usages = [(attempt.get("meta") or {}).get("usage") for attempt in attempts
+              if isinstance(attempt, dict) and isinstance((attempt.get("meta") or {}).get("usage"), dict)]
+    if not usages and isinstance(result.get("usage"), dict):
+        usages = [result["usage"]]
+    explicit = [next((usage.get(key) for key in ("total", "total_tokens", "totalTokens")
+                      if isinstance(usage.get(key), (int, float)) and not isinstance(usage.get(key), bool)
+                      and usage.get(key) >= 0), None) for usage in usages]
+    if any(value is not None for value in explicit):
+        return int(sum(value for value in explicit if value is not None))
+    inputs = [next((usage.get(key) for key in ("input", "input_tokens", "inputTokens", "prompt_tokens")
+                    if isinstance(usage.get(key), (int, float)) and not isinstance(usage.get(key), bool)
+                    and usage.get(key) >= 0), None) for usage in usages]
+    outputs = [next((usage.get(key) for key in ("output", "output_tokens", "outputTokens", "completion_tokens")
+                     if isinstance(usage.get(key), (int, float)) and not isinstance(usage.get(key), bool)
+                     and usage.get(key) >= 0), None) for usage in usages]
+    if not any(value is not None for value in inputs + outputs):
+        return None
+    return int(sum(value for value in inputs + outputs if value is not None))
+
+
+def regress_select_backend(card, selector, policy):
+    if selector["kind"] == "backend":
+        return selector["backend"], selector.get("model"), None
+    if selector.get("routing") != "weighted":
+        return None, None, None
+    profile = {"type": "impl", "difficulty": card["meta"]["difficulty"]}
+    state = get_state(policy)
+    decision = route(profile, state, policy)
+    advice = routing_advice(profile, card["meta"]["card_type"], state, policy, decision)
+    if advice and advice.get("backend"):
+        return advice["backend"], advice.get("model"), advice
+    return None, None, advice
+
+
+def regress_run_backend(card, selector, label, policy):
+    rid = new_run_id()
+    while os.path.exists(os.path.join(RUNS, rid)):
+        rid = new_run_id()
+    run_dir = os.path.join(RUNS, rid)
+    os.makedirs(run_dir, exist_ok=False)
+    with open(os.path.join(run_dir, "task.md"), "w", encoding="utf-8") as stream:
+        stream.write(card["task"])
+    backend, model, advice = regress_select_backend(card, selector, policy)
+    started = time.monotonic()
+    result = None
+    error = None
+    base_verify = None
+    meta = card["meta"]
+    try:
+        if meta["verify_fails_on_base"]:
+            base_verify = verify_in_worktree(card["repo_path"], meta["base_commit"], meta["verify"],
+                                             max(60, min(600, meta["est_minutes"] * 60 + 300)))
+        run_args = argparse.Namespace(
+            run_id=rid, prompt=None, task_file=None, title=card["task"].strip().splitlines()[0][:72],
+            type="impl", difficulty=meta["difficulty"], context_tokens=0, backend=backend, model=model,
+            effort=None, card_type=meta["card_type"], rework_of=None, paths=[], cwd=card["repo_path"],
+            base=meta["base_commit"], no_worktree=False, verify_baseline=False, verify=meta["verify"],
+            keep_worktree=True, no_fallback=bool(selector.get("force_backend")), budget_minutes=meta["est_minutes"],
+            detach=False, dry_run=False, executor=None, no_auto_review=True, regress_label=label)
+        try:
+            cmd_run(run_args, policy)
+        except SystemExit:
+            pass
+        result = jload(os.path.join(run_dir, "result.json"))
+        if not isinstance(result, dict):
+            raise RuntimeError("normal run path did not write result.json")
+    except (OSError, RuntimeError, ValueError, BudgetExceeded) as exception:
+        error = short(exception, 500)
+        result = result if isinstance(result, dict) else {}
+    finally:
+        worktree = regress_worktree_path(card["repo_path"], rid, policy)
+        if os.path.isdir(worktree):
+            try:
+                if not (result or {}).get("verify"):
+                    verify_result = run_verify(meta["verify"], worktree,
+                                               max(60, min(600, meta["est_minutes"] * 60 + 300)))
+                else:
+                    verify_result = result["verify"]
+            except Exception as exception:
+                verify_result = {"cmd": meta["verify"], "rc": 1, "error": short(exception, 300)}
+        else:
+            verify_result = {"cmd": meta["verify"], "rc": 1, "error": "run worktree unavailable"}
+        regress_cleanup_worktree(card["repo_path"], rid, policy)
+    result = result or {}
+    verify_rc = verify_result.get("rc") if isinstance(verify_result, dict) else None
+    record = {"id": card["id"], "repo": meta["repo"], "base_commit": meta["base_commit"],
+              "card_type": meta["card_type"], "expected_outcome": meta.get("expected_outcome"),
+              "verify_fails_on_base": meta["verify_fails_on_base"], "base_verify": base_verify,
+              "verify": verify_result, "pass": verify_rc == 0,
+              "seconds": result.get("seconds", round(time.monotonic() - started, 3)),
+              "tokens": regress_usage_tokens(result), "run_id": rid, "backend": result.get("backend") or backend,
+              "model": result.get("model") or model,
+              "routing_advice": advice}
+    if error:
+        record["error"] = error
+    return record
+
+
+def regress_run_lane(card, lane_name, label, policy):
+    lane = lanes_by_name([lane_name])[0]
+    rc, lane_repo, error = git(["rev-parse", "--show-toplevel"], lane["repo"])
+    if rc:
+        raise ValueError(f"lane {lane_name} repo is unavailable: {error.strip()[:200]}")
+    lane_repo = os.path.realpath(lane_repo.strip())
+    if lane_repo != card["repo_path"]:
+        raise ValueError(f"lane {lane_name} repo does not match card repo {card['meta']['repo']!r}")
+    meta = card["meta"]
+    base_verify = None
+    if meta["verify_fails_on_base"]:
+        base_verify = verify_in_worktree(card["repo_path"], meta["base_commit"], meta["verify"],
+                                         max(60, min(600, meta["est_minutes"] * 60 + 300)))
+    rid = new_run_id()
+    budget = meta["est_minutes"]
+    check_budget(policy, [(lane["backend"], budget)])
+    response = lane_call(lane_name, {"op": "assign", "run_id": rid, "task": card["task"],
+                                     "title": card["task"].strip().splitlines()[0][:72],
+                                     "verify": meta["verify"], "budget_minutes": budget,
+                                     "base": meta["base_commit"], "card_type": meta["card_type"],
+                                     "paths": [], "regress_label": label})
+    if not response.get("ok"):
+        raise RuntimeError(response.get("error") or f"lane {lane_name} rejected card")
+    deadline = time.monotonic() + max(60, budget * 60 + 300)
+    result_path = os.path.join(RUNS, rid, "result.json")
+    while time.monotonic() < deadline:
+        result = jload(result_path)
+        if isinstance(result, dict):
+            verify_result = result.get("verify") or {}
+            return {"id": card["id"], "repo": meta["repo"], "base_commit": meta["base_commit"],
+                    "card_type": meta["card_type"], "expected_outcome": meta.get("expected_outcome"),
+                    "verify_fails_on_base": meta["verify_fails_on_base"], "base_verify": base_verify,
+                    "verify": verify_result,
+                    "pass": verify_result.get("rc") == 0, "seconds": result.get("seconds", 0),
+                    "tokens": regress_usage_tokens(result), "run_id": rid, "lane": lane_name,
+                    "backend": result.get("backend"), "model": result.get("model")}
+        time.sleep(0.2)
+    lane_call(lane_name, {"op": "abort"})
+    raise RuntimeError(f"lane {lane_name} did not finish run {rid} before its budget expired")
+
+
+def regress_totals(cards):
+    seconds = [card["seconds"] for card in cards
+               if isinstance(card.get("seconds"), (int, float)) and not isinstance(card.get("seconds"), bool)]
+    known_tokens = [card["tokens"] for card in cards
+                    if isinstance(card.get("tokens"), (int, float)) and not isinstance(card.get("tokens"), bool)]
+    return {"cards": len(cards), "pass_count": sum(card.get("pass") is True for card in cards),
+            "median_seconds": statistics.median(seconds) if seconds else None,
+            "tokens": sum(known_tokens), "tokens_known_cards": len(known_tokens)}
+
+
+def cmd_regress_run(args, policy):
+    cards = regress_load_cards(args, policy)
+    if args.parallel < 1:
+        raise ValueError("--parallel must be at least 1")
+    concurrency = policy.get("concurrency") or {}
+    total_cap = concurrency.get("total")
+    if isinstance(total_cap, int) and total_cap > 0 and args.parallel > total_cap:
+        raise ValueError(f"--parallel exceeds policy.concurrency.total cap ({total_cap})")
+    if args.backend:
+        parts = args.backend.split(":", 1)
+        backend = canonical_backend(parts[0])
+        if backend not in PLANNERS:
+            raise ValueError(f"unsupported regression backend: {parts[0]}")
+        if len(parts) == 2 and not parts[1].strip():
+            raise ValueError("--backend model must not be empty")
+        selector = {"kind": "backend", "backend": backend, "model": parts[1] if len(parts) > 1 else None,
+                    "force_backend": True}
+    elif args.lane:
+        lanes_by_name([args.lane])
+        selector = {"kind": "lane", "lane": args.lane}
+    else:
+        selector = {"kind": "routing", "routing": args.routing}
+    label = args.label or dt.datetime.now().strftime("%H%M%S")
+    if not REGRESS_ID_RE.fullmatch(label):
+        raise ValueError("--label must contain only letters, digits, dot, underscore, or hyphen")
+    date = policy_day(policy)[0]
+    results_dir = os.path.join(regress_knowledge_repo(policy), "regression", "results")
+    os.makedirs(results_dir, exist_ok=True)
+    output_path = os.path.join(results_dir, f"{date}-{label}.json")
+    if os.path.exists(output_path):
+        raise ValueError(f"regression results already exist: {output_path}")
+
+    actual_parallel = 1 if selector["kind"] == "lane" else min(args.parallel, len(cards))
+    if selector["kind"] == "lane":
+        records = []
+        for card in cards:
+            try:
+                records.append(regress_run_lane(card, selector["lane"], label, policy))
+            except Exception as error:
+                records.append({"id": card["id"], "pass": False, "run_id": None,
+                                "seconds": 0, "tokens": None, "error": short(error, 500)})
+    else:
+        records = [None] * len(cards)
+        parallel = min(args.parallel, len(cards))
+        with contextlib.redirect_stdout(io.StringIO()):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as pool:
+                futures = {pool.submit(regress_run_backend, card, selector, label, policy): index
+                           for index, card in enumerate(cards)}
+                for future in concurrent.futures.as_completed(futures):
+                    index = futures[future]
+                    try:
+                        records[index] = future.result()
+                    except Exception as error:
+                        records[index] = {"id": cards[index]["id"], "pass": False, "run_id": None,
+                                          "seconds": 0, "tokens": None, "error": short(error, 500)}
+    report = {"created_at": dt.datetime.now(dt.timezone.utc).isoformat(), "date": date, "label": label,
+              "selector": selector, "parallel": actual_parallel, "cards": records,
+              "totals": regress_totals(records)}
+    jsave(output_path, report)
+    print(json.dumps({"results": output_path, **report}, indent=2, ensure_ascii=False))
+
+
+def regress_read_result(path):
+    expanded = os.path.expanduser(path)
+    with open(expanded, encoding="utf-8") as stream:
+        result = json.load(stream)
+    if not isinstance(result, dict) or not isinstance(result.get("cards"), list):
+        raise ValueError(f"invalid regression result file: {path}")
+    return result
+
+
+def cmd_regress_compare(args):
+    before, after = regress_read_result(args.before), regress_read_result(args.after)
+    a_cards = {card.get("id"): card for card in before["cards"] if isinstance(card, dict)}
+    b_cards = {card.get("id"): card for card in after["cards"] if isinstance(card, dict)}
+    rows = []
+    for card_id in sorted(set(a_cards) | set(b_cards), key=str):
+        a, b = a_cards.get(card_id, {}), b_cards.get(card_id, {})
+        rows.append({"id": card_id, "a_pass": a.get("pass"), "b_pass": b.get("pass"),
+                     "a_seconds": a.get("seconds"), "b_seconds": b.get("seconds"),
+                     "a_tokens": a.get("tokens"), "b_tokens": b.get("tokens")})
+    a_totals = regress_totals(list(a_cards.values()))
+    b_totals = regress_totals(list(b_cards.values()))
+    report = {"A": a_totals, "B": b_totals, "cards": rows,
+              "verdict": "B not worse" if b_totals.get("pass_count", 0) >= a_totals.get("pass_count", 0)
+              else "B worse"}
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+
+
 def main():
     ap = argparse.ArgumentParser(prog="openswarm", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -9669,6 +10032,20 @@ def main():
     sp.add_argument("--verify", help="acceptance command run on both worktrees")
     sp.add_argument("--card-type", help="optional task card type from knowledge/card-types.yaml")
     sp.add_argument("--budget-minutes", type=float, help="per-run hard wall-clock budget")
+
+    sp = sub.add_parser("regress", help="run or compare a regression-card suite")
+    regress_sub = sp.add_subparsers(dest="regress_cmd", required=True)
+    rp = regress_sub.add_parser("run", help="run regression cards from knowledge.repo/regression")
+    selector = rp.add_mutually_exclusive_group(required=True)
+    selector.add_argument("--backend", help="force BACKEND or BACKEND:MODEL for every card")
+    selector.add_argument("--lane", help="run cards on one configured resident lane")
+    selector.add_argument("--routing", choices=("static", "weighted"), help="use static or weighted routing")
+    rp.add_argument("--cards", help="comma-separated card ids; defaults to every card")
+    rp.add_argument("--label", help="result label (defaults to the current local time)")
+    rp.add_argument("--parallel", type=int, default=1, help="maximum concurrent cards (default: 1)")
+    rp = regress_sub.add_parser("compare", help="compare two regression result files")
+    rp.add_argument("before", metavar="A.json")
+    rp.add_argument("after", metavar="B.json")
 
     sp = sub.add_parser("review", help="review a finished run with a cross-family read-only executor")
     sp.add_argument("run_id")
@@ -9910,6 +10287,15 @@ def main():
             sys.exit(3)
         except (OSError, RuntimeError, ValueError) as error:
             print(f"openswarm: compare failed: {bus_redact(str(error))}", file=sys.stderr)
+            sys.exit(2)
+    elif a.cmd == "regress":
+        try:
+            if a.regress_cmd == "run":
+                cmd_regress_run(a, policy)
+            else:
+                cmd_regress_compare(a)
+        except (BudgetExceeded, OSError, RuntimeError, ValueError) as error:
+            print(f"openswarm: regress failed: {bus_redact(str(error))}", file=sys.stderr)
             sys.exit(2)
     elif a.cmd == "review":
         try:
