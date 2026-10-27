@@ -199,6 +199,29 @@ accepted recurrence proposals still under `proposals/`. Each draft maps its root
 and includes evidence links plus the required accompanying test. `proposals/escalate-seen.json` makes runs
 idempotent; escalation never edits lessons or enforcement code.
 
+## Curated patterns
+
+Active patterns live in `<knowledge.repo>/skills/<id>.md`; see [`skills/README.md`](skills/README.md) for the front matter
+and body format. `run` and lane dispatches add up to three matching active patterns after lessons, capped at 1,500
+characters total. `lessons preview` shows both selected lessons and patterns. Injected pattern IDs are recorded in
+`patterns_injected` in the run ledger.
+
+Draft candidates from compare winner proposals and repeated peer-review findings with:
+
+```bash
+openswarm patterns propose [--since DAYS]
+```
+
+Check active patterns against similar runs from the last 30 days with:
+
+```bash
+openswarm patterns retire-check
+```
+
+Retirement proposals require at least eight injected and eight control runs for the same card type and backend, with
+both `exec_pass` and `accepted` rates available. Both commands write reviewable drafts under
+`<knowledge.repo>/proposals/<date>/`; they do not edit the pattern catalog.
+
 ## Routing weights (record-only)
 
 `openswarm routing weights` summarizes ledger runs by backend, model and card type. It writes
@@ -443,7 +466,7 @@ Cursor CLI is a fourth executor, opt-in only (`--backend cursor`).
 
 | Path | What |
 | --- | --- |
-| `bin/openswarm` | The CLI: `probe`, `status`, `route`, `run`, `review`, `lessons`, `lane`, `fleet`, `batch`, `verify-remote`, `watch`, `runs`, `report`, `retro`, `stop`, `ingest-claude`, `ledger` |
+| `bin/openswarm` | The CLI: `probe`, `status`, `route`, `run`, `review`, `lessons`, `patterns`, `lane`, `fleet`, `batch`, `verify-remote`, `watch`, `runs`, `report`, `retro`, `stop`, `ingest-claude`, `ledger` |
 | `SKILL.md` | Claude Code skill: the planner's operating manual |
 | `policy.json` | Defaults: thresholds, difficulty map, model caps, local data sources |
 | `backends/*.json` | One manifest per executor: invocation, quota source, data boundary |

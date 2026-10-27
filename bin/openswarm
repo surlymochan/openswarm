@@ -15,6 +15,7 @@ Subcommands:
   review           cross-family read-only review of a finished run
   consult          ask multiple executors the same question in read-only mode
   lessons          preview, propose, and escalate executor lessons
+  patterns         propose reusable patterns and check active patterns for retirement
   lane             manage long-lived Codex app-server / Cursor ACP / Pi RPC executor lanes
   fleet            inspect hosts and forward openswarm commands over local / SSH / instabox transports
   batch            queue task cards across fleet hosts and collect their branches
@@ -210,6 +211,10 @@ LESSONS_MAX_CHARS = 3000
 LESSONS_HEADER = "Lessons (L3 entries are reminders):\n"
 LESSON_FIELDS = {"id", "rule", "guard_level", "applies_to"}
 LESSON_APPLIES_TO_FIELDS = {"card_types", "paths", "backends"}
+PATTERNS_MAX_COUNT = 3
+PATTERNS_MAX_CHARS = 1500
+PATTERNS_HEADER = "Patterns:\n"
+PATTERN_APPLIES_TO_FIELDS = {"card_types", "paths", "backends"}
 
 
 def lesson_yaml_comment(line):
@@ -422,6 +427,477 @@ def add_lessons_to_prompt(prompt, policy, card_type=None, backend=None, card_tex
         else:
             prompt += separator
     return prompt, ids
+
+
+def parse_pattern_markdown(text):
+    """Parse the deliberately small YAML front matter used by curated patterns."""
+    lines = text.splitlines()
+    if not lines or lines[0] != "---":
+        raise ValueError("pattern must start with YAML front matter")
+    try:
+        end = lines.index("---", 1)
+    except ValueError as error:
+        raise ValueError("pattern front matter is not closed") from error
+    pattern, applies, active_map = {}, {}, None
+    for number, original in enumerate(lines[1:end], 2):
+        content = lesson_yaml_comment(original).rstrip()
+        if not content.strip():
+            continue
+        if "\t" in content:
+            raise ValueError(f"line {number}: tabs are not supported")
+        indent = len(content) - len(content.lstrip(" "))
+        stripped = content.strip()
+        if indent == 0:
+            active_map = None
+            match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_-]*):(?:[ \t]*(.*))?", stripped)
+            if not match:
+                raise ValueError(f"line {number}: expected a front matter key and scalar")
+            key, raw = match.group(1), (match.group(2) or "").strip()
+            if key in pattern:
+                raise ValueError(f"line {number}: duplicate key {key!r}")
+            if key == "applies_to":
+                if raw:
+                    raise ValueError(f"line {number}: applies_to must be a nested mapping")
+                pattern[key] = applies
+                active_map = "applies_to"
+            else:
+                pattern[key] = lesson_yaml_scalar(raw)
+        elif indent == 2 and active_map == "applies_to":
+            match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_-]*):[ \t]*(.*)", stripped)
+            if not match:
+                raise ValueError(f"line {number}: expected an applies_to list")
+            key, raw = match.group(1), match.group(2).strip()
+            if key not in PATTERN_APPLIES_TO_FIELDS:
+                raise ValueError(f"line {number}: unsupported applies_to key {key!r}")
+            if key in applies:
+                raise ValueError(f"line {number}: duplicate applies_to key {key!r}")
+            values = lesson_yaml_scalar(raw, allow_list=True)
+            if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+                raise ValueError(f"line {number}: applies_to.{key} must be an inline list")
+            applies[key] = values
+        else:
+            raise ValueError(f"line {number}: unsupported indentation or nested mapping")
+    required = {"id", "title", "applies_to", "source", "status"}
+    missing = required - pattern.keys()
+    if missing:
+        raise ValueError("missing required field(s): " + ", ".join(sorted(missing)))
+    if not isinstance(pattern["id"], str) or not re.fullmatch(r"P-\d{4,}", pattern["id"]):
+        raise ValueError("id must use the P-0001 pattern ID format")
+    if not isinstance(pattern["title"], str) or not isinstance(pattern["source"], str):
+        raise ValueError("title and source must be strings")
+    if pattern["status"] not in ("active", "retired"):
+        raise ValueError("status must be active or retired")
+    for key in PATTERN_APPLIES_TO_FIELDS:
+        applies.setdefault(key, [])
+    body = "\n".join(lines[end + 1:]).strip()
+    if not body:
+        raise ValueError("pattern body must not be empty")
+    pattern["body"] = body
+    return pattern
+
+
+def select_patterns(policy, card_type=None, backend=None, card_text="", paths=None):
+    repo = os.path.expanduser(str((policy.get("knowledge") or {}).get("repo") or DEFAULT_KNOWLEDGE_REPO))
+    directory = os.path.join(repo, "skills")
+    try:
+        filenames = sorted(name for name in os.listdir(directory) if name.endswith(".md") and name != "README.md")
+    except FileNotFoundError:
+        return "", []
+    except OSError as error:
+        print(f"openswarm: warning: cannot read patterns directory {directory}: {error}", file=sys.stderr)
+        return "", []
+    matched = []
+    for filename in filenames:
+        path = os.path.join(directory, filename)
+        try:
+            with open(path, encoding="utf-8") as stream:
+                pattern = parse_pattern_markdown(stream.read())
+        except (OSError, ValueError) as error:
+            print(f"openswarm: warning: skipping pattern file {path}: {error}", file=sys.stderr)
+            continue
+        if pattern["status"] != "active":
+            continue
+        applies = pattern["applies_to"]
+        if applies["card_types"] and card_type not in applies["card_types"]:
+            continue
+        if applies["backends"] and backend not in applies["backends"]:
+            continue
+        if applies["paths"] and not any(lesson_path_matches(item, card_text, paths) for item in applies["paths"]):
+            continue
+        path_literals = [sum(char not in "*?[]" for char in item) for item in applies["paths"]]
+        dimensions = sum(bool(applies[key]) for key in PATTERN_APPLIES_TO_FIELDS)
+        selector_size = sum(len(applies[key]) for key in PATTERN_APPLIES_TO_FIELDS)
+        specificity = (-dimensions, -max(path_literals, default=0), selector_size, pattern["id"])
+        matched.append((specificity, pattern))
+    matched.sort(key=lambda item: item[0])
+
+    lines, ids = [], []
+    rendered = PATTERNS_HEADER.rstrip()
+    for _, pattern in matched:
+        if len(ids) >= PATTERNS_MAX_COUNT:
+            break
+        prefix = f"[{pattern['id']}] {pattern['title']}\n"
+        separator = "\n\n" if ids else "\n"
+        remaining = PATTERNS_MAX_CHARS - len(rendered) - len(separator) - len(prefix)
+        if remaining <= 0:
+            continue
+        body = pattern["body"]
+        if len(body) > remaining:
+            body = body[:max(0, remaining - 1)].rstrip() + "…"
+        lines.append(prefix + body)
+        ids.append(pattern["id"])
+        rendered += separator + lines[-1]
+        if len(rendered) >= PATTERNS_MAX_CHARS:
+            break
+    return (rendered, ids) if ids else ("", [])
+
+
+def add_patterns_to_prompt(prompt, policy, card_type=None, backend=None, card_text="", paths=None):
+    block, ids = select_patterns(policy, card_type, backend, card_text, paths)
+    if block:
+        separator = "\n\n" + block + "\n\n"
+        report_at = prompt.rfind(REPORT_INSTRUCTION)
+        if report_at >= 0:
+            prompt = prompt[:report_at] + separator + prompt[report_at:]
+        else:
+            prompt += separator
+    return prompt, ids
+
+
+def pattern_knowledge_repo(policy):
+    return os.path.expanduser(str((policy.get("knowledge") or {}).get("repo") or DEFAULT_KNOWLEDGE_REPO))
+
+
+def pattern_yaml_quote(value):
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def pattern_draft_text(pattern_id, title, applies_to, source, body):
+    lines = ["---", "proposal_type: pattern_draft", f"id: {pattern_yaml_quote(pattern_id)}",
+             f"title: {pattern_yaml_quote(title)}", "applies_to:"]
+    for key in ("card_types", "paths", "backends"):
+        values = ", ".join(pattern_yaml_quote(item) for item in applies_to.get(key, []))
+        lines.append(f"  {key}: [{values}]")
+    lines.extend([f"source: {pattern_yaml_quote(source)}", "status: active", "---", body.strip(), ""])
+    return "\n".join(lines)
+
+
+def pattern_next_id(repo):
+    highest = 0
+    for base in (os.path.join(repo, "skills"), os.path.join(repo, "proposals")):
+        for path in glob.glob(os.path.join(base, "**", "*.md"), recursive=True):
+            try:
+                with open(path, encoding="utf-8") as stream:
+                    text = stream.read(2000)
+            except OSError:
+                continue
+            for match in re.finditer(r"(?m)^id:\s*[\"']?P-(\d+)", text):
+                highest = max(highest, int(match.group(1)))
+    return highest + 1
+
+
+def pattern_existing_sources(repo):
+    sources = set()
+    for path in glob.glob(os.path.join(repo, "proposals", "**", "*.md"), recursive=True):
+        try:
+            with open(path, encoding="utf-8") as stream:
+                lines = stream.readlines()
+        except OSError:
+            continue
+        if not lines or lines[0].strip() != "---":
+            continue
+        for line in lines[1:]:
+            if line.strip() == "---":
+                break
+            match = re.fullmatch(r"source:\s*(.*)\s*", line.strip())
+            if match:
+                try:
+                    sources.add(lesson_yaml_scalar(match.group(1)))
+                except ValueError:
+                    pass
+                break
+    return sources
+
+
+def pattern_proposal_timestamp(path, report=None):
+    if isinstance(report, dict):
+        timestamp = to_epoch(report.get("created_at"))
+        if timestamp is not None:
+            return timestamp
+    date_match = re.fullmatch(r"\d{4}-\d{2}-\d{2}", os.path.basename(os.path.dirname(path)))
+    if date_match:
+        try:
+            return dt.datetime.fromisoformat(date_match.group(0)).timestamp()
+        except ValueError:
+            pass
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0
+
+
+def pattern_report_for_proposal(path):
+    filename = os.path.basename(path)
+    match = re.fullmatch(r"pattern-(.+)\.md", filename)
+    compare_id = match.group(1) if match else None
+    if not compare_id or compare_id.startswith("draft-"):
+        return compare_id, None
+    report = jload(os.path.join(RUNS, compare_id, "compare.json"))
+    return compare_id, report if isinstance(report, dict) else None
+
+
+def pattern_apply_paths(paths):
+    values = set()
+    for path in paths:
+        if not isinstance(path, str) or not path.strip():
+            continue
+        value = path.strip().replace("\\", "/")
+        if value.startswith("./"):
+            value = value[2:]
+        if value:
+            values.add(value)
+    values = sorted(values)
+    if not values:
+        return []
+    roots = {value.split("/", 1)[0] for value in values}
+    if len(roots) == 1 and any("/" in value for value in values):
+        return [next(iter(roots)) + "/**"]
+    return values if len(values) == 1 else []
+
+
+def pattern_compare_draft(source_path, output_dir, compare_id, report):
+    report = report or {}
+    card_type = report.get("card_type")
+    title = str(report.get("title") or "").strip()
+    winner_label = report.get("winner_label")
+    winner = (report.get("runs") or {}).get(str(winner_label or "").lower(), {})
+    winner_result = winner.get("result") if isinstance(winner.get("result"), dict) else {}
+    backend = winner.get("backend")
+    display = f"{card_type} cards" if card_type else "similar cards"
+    draft_title = (f"Reuse the winning {backend} approach for {display}" if backend
+                   else f"Review the winning approach for {display}")
+    notes = [" ".join(str(note).split()) for note in report.get("diff_notes") or [] if str(note).strip()]
+    if not notes:
+        try:
+            with open(source_path, encoding="utf-8") as stream:
+                proposal = stream.read()
+        except OSError:
+            proposal = ""
+        section = re.search(r"(?ms)^## Proposed pattern\s*\n+(.*?)(?:\n## |\Z)", proposal)
+        note = " ".join((section.group(1) if section else "").split())
+        notes = [note] if note else ["Inspect the comparison evidence before adopting its approach."]
+    examples = []
+    nested = winner_result.get("result")
+    if isinstance(nested, dict):
+        examples.extend(nested.get("files_changed") or [])
+    if isinstance(winner_result.get("files_changed"), list):
+        examples.extend(winner_result["files_changed"])
+    example_target = os.path.relpath(source_path, output_dir).replace(os.sep, "/")
+    context = f" for {card_type} cards" if card_type else ""
+    if title:
+        context += f" like {title!r}"
+    body_lines = [f"When to use: Review this approach for similar tasks{context}.", "Pattern:"]
+    body_lines.extend(f"- {note[:220]}" for note in notes[:2])
+    body_lines.extend(["- Verify the winner's changed paths and checks before reusing its approach.",
+                       "- Adapt the approach to the current card and preserve relevant tests.",
+                       f"Example: [compare proposal]({example_target})"])
+    body = "\n".join(body_lines)
+    applies = {"card_types": [card_type] if isinstance(card_type, str) and card_type else [],
+               "paths": pattern_apply_paths(examples), "backends": [backend] if isinstance(backend, str) and backend else []}
+    return draft_title, applies, f"compare {compare_id}", body
+
+
+def pattern_review_groups(repo, cutoff):
+    groups = {}
+    for entry in ledger_entries():
+        timestamp = to_epoch(entry.get("ts"))
+        if timestamp is None or timestamp < cutoff:
+            continue
+        run_id = entry.get("run_id") or entry.get("id")
+        if not run_id:
+            continue
+        review_path = os.path.join(RUNS, str(run_id), "review.json")
+        review = jload(review_path)
+        if not isinstance(review, dict) or not isinstance(review.get("findings"), list):
+            continue
+        for finding in review["findings"]:
+            if not isinstance(finding, dict) or not isinstance(finding.get("title"), str):
+                continue
+            title = " ".join(finding["title"].split()).strip()
+            key = re.sub(r"[^a-z0-9]+", " ", title.casefold()).strip()
+            if not key:
+                continue
+            group = groups.setdefault(key, {"title": title, "runs": {}})
+            group["runs"][str(run_id)] = {"entry": entry, "path": review_path, "finding": finding}
+    return {key: group for key, group in groups.items() if len(group["runs"]) >= 2}
+
+
+def pattern_review_draft(group_key, group, output_dir):
+    records = list(group["runs"].items())
+    run_ids = sorted(group["runs"])
+    sample = records[0][1]
+    finding = sample["finding"]
+    paths = [item["finding"].get("path") for item in group["runs"].values()]
+    card_types = sorted({str(item["entry"].get("card_type")) for item in group["runs"].values()
+                         if item["entry"].get("card_type")})
+    backends = sorted({str(item["entry"].get("backend")) for item in group["runs"].values()
+                       if item["entry"].get("backend")})
+    body_text = " ".join(str(finding.get("body") or "").split())[:350]
+    if not body_text:
+        body_text = group["title"]
+    review_path = sample["path"]
+    pr_url = (sample["entry"].get("pr") or {}).get("url") if isinstance(sample["entry"].get("pr"), dict) else None
+    if pr_url:
+        example = f"[review evidence]({pr_url})"
+    else:
+        example_path = os.path.relpath(review_path, output_dir).replace(os.sep, "/")
+        example = f"[review run {run_ids[0]}]({example_path})"
+    body = "\n".join(("When to use: Check for this issue when working in similar code paths.", "Pattern:",
+                       f"- {group['title']}.", f"- {body_text}", "- Add a regression test for the reported case.",
+                       f"Example: {example}"))
+    applies = {"card_types": card_types, "paths": pattern_apply_paths(paths), "backends": backends}
+    source_hash = hashlib.sha256(group_key.encode("utf-8")).hexdigest()[:12]
+    return group["title"], applies, f"review finding {source_hash} ({', '.join(run_ids)})", body, source_hash
+
+
+def cmd_patterns_propose(args, policy):
+    if not math.isfinite(args.since) or args.since <= 0:
+        raise ValueError("--since must be a positive number of days")
+    repo = pattern_knowledge_repo(policy)
+    proposals_root = os.path.join(repo, "proposals")
+    date = policy_day(policy)[0]
+    output_dir = os.path.join(proposals_root, date)
+    os.makedirs(output_dir, exist_ok=True)
+    cutoff = NOW() - args.since * 86400
+    existing_sources = pattern_existing_sources(repo)
+    next_number = pattern_next_id(repo)
+    written, skipped = [], 0
+
+    compare_paths = sorted(glob.glob(os.path.join(proposals_root, "*", "pattern-*.md")))
+    for source_path in compare_paths:
+        try:
+            with open(source_path, encoding="utf-8") as stream:
+                source_text = stream.read()
+        except OSError:
+            continue
+        if source_text.startswith("---\n") and "proposal_type: pattern_draft" in source_text.split("---", 2)[1]:
+            continue
+        compare_id, report = pattern_report_for_proposal(source_path)
+        if not compare_id or pattern_proposal_timestamp(source_path, report) < cutoff:
+            continue
+        source = f"compare {compare_id}"
+        if source in existing_sources:
+            skipped += 1
+            continue
+        pattern_id = f"P-{next_number:04d}"
+        next_number += 1
+        title, applies, source, body = pattern_compare_draft(source_path, output_dir, compare_id, report)
+        destination = os.path.join(output_dir, f"pattern-draft-compare-{compare_id}.md")
+        if os.path.exists(destination):
+            skipped += 1
+            continue
+        with open(destination, "x", encoding="utf-8") as stream:
+            stream.write(pattern_draft_text(pattern_id, title, applies, source, body))
+        existing_sources.add(source)
+        written.append(destination)
+
+    for group_key, group in sorted(pattern_review_groups(repo, cutoff).items()):
+        title, applies, source, body, source_hash = pattern_review_draft(group_key, group, output_dir)
+        if source in existing_sources:
+            skipped += 1
+            continue
+        pattern_id = f"P-{next_number:04d}"
+        next_number += 1
+        destination = os.path.join(output_dir, f"pattern-draft-review-{source_hash}.md")
+        if os.path.exists(destination):
+            skipped += 1
+            continue
+        with open(destination, "x", encoding="utf-8") as stream:
+            stream.write(pattern_draft_text(pattern_id, title, applies, source, body))
+        existing_sources.add(source)
+        written.append(destination)
+    print(json.dumps({"proposals": written, "count": len(written), "skipped": skipped}, ensure_ascii=False))
+
+
+def pattern_rates(entries, field):
+    values = [entry[field] for entry in entries if isinstance(entry.get(field), bool)]
+    return (sum(values) / len(values), len(values)) if values else (None, 0)
+
+
+def cmd_patterns_retire_check(args, policy):
+    repo = pattern_knowledge_repo(policy)
+    skills_dir = os.path.join(repo, "skills")
+    try:
+        filenames = sorted(name for name in os.listdir(skills_dir) if name.endswith(".md") and name != "README.md")
+    except FileNotFoundError:
+        filenames = []
+    cutoff = NOW() - 30 * 86400
+    recent = [entry for entry in ledger_entries()
+              if (to_epoch(entry.get("ts")) or 0) >= cutoff]
+    date = policy_day(policy)[0]
+    output_dir = os.path.join(repo, "proposals", date)
+    written, checked, insufficient = [], 0, 0
+    for filename in filenames:
+        path = os.path.join(skills_dir, filename)
+        try:
+            with open(path, encoding="utf-8") as stream:
+                pattern = parse_pattern_markdown(stream.read())
+        except (OSError, ValueError) as error:
+            print(f"openswarm: warning: skipping pattern file {path}: {error}", file=sys.stderr)
+            continue
+        if pattern["status"] != "active":
+            continue
+        checked += 1
+        groups = {}
+        for entry in recent:
+            card_type, backend = entry.get("card_type"), entry.get("backend")
+            if not isinstance(card_type, str) or not card_type or not isinstance(backend, str) or not backend:
+                continue
+            key = (card_type, backend)
+            injected_ids = entry.get("patterns_injected")
+            has_pattern = isinstance(injected_ids, list) and pattern["id"] in injected_ids
+            groups.setdefault(key, {"injected": [], "control": []})[
+                "injected" if has_pattern else "control"].append(entry)
+        comparisons, supported = [], []
+        for (card_type, backend), group in sorted(groups.items()):
+            injected, control = group["injected"], group["control"]
+            if len(injected) < 8 or len(control) < 8:
+                continue
+            exec_injected, n_exec_injected = pattern_rates(injected, "exec_pass")
+            exec_control, n_exec_control = pattern_rates(control, "exec_pass")
+            accepted_injected, n_accepted_injected = pattern_rates(injected, "accepted")
+            accepted_control, n_accepted_control = pattern_rates(control, "accepted")
+            if min(n_exec_injected, n_exec_control, n_accepted_injected, n_accepted_control) < 8:
+                continue
+            comparison = {"card_type": card_type, "backend": backend, "injected_n": len(injected),
+                          "control_n": len(control), "exec_pass": [exec_injected, exec_control],
+                          "accepted": [accepted_injected, accepted_control]}
+            comparisons.append(comparison)
+            supported.append(exec_injected <= exec_control and accepted_injected <= accepted_control)
+        if not comparisons:
+            insufficient += 1
+            continue
+        if not all(supported):
+            continue
+        os.makedirs(output_dir, exist_ok=True)
+        destination = os.path.join(output_dir, f"retire-{pattern['id']}.md")
+        if os.path.exists(destination):
+            continue
+        lines = ["---", "proposal_type: retire_pattern", f"id: {pattern_yaml_quote(pattern['id'])}",
+                 f"title: {pattern_yaml_quote(pattern['title'])}", "status: proposed", "---", "",
+                 f"Consider retiring `{pattern['id']}`: injected runs did not outperform similar runs without it.", "",
+                 "| Card type | Backend | Injected n | Control n | exec_pass injected/control | accepted injected/control |",
+                 "| --- | --- | ---: | ---: | ---: | ---: |"]
+        for row in comparisons:
+            lines.append(f"| {row['card_type']} | {row['backend']} | {row['injected_n']} | {row['control_n']} | "
+                         f"{row['exec_pass'][0]:.3f} / {row['exec_pass'][1]:.3f} | "
+                         f"{row['accepted'][0]:.3f} / {row['accepted'][1]:.3f} |")
+        lines.append("")
+        with open(destination, "x", encoding="utf-8") as stream:
+            stream.write("\n".join(lines))
+        written.append(destination)
+    print(json.dumps({"patterns_checked": checked, "retirement_proposals": written,
+                      "insufficient_samples": insufficient}, ensure_ascii=False))
 
 
 LESSON_ROOT_CAUSE_KEYWORDS = (
@@ -3890,6 +4366,8 @@ def cmd_run(args, policy):
                    f"`tests` instead of treating it as a code failure.\n")
     prompt, lessons_injected = add_lessons_to_prompt(
         prompt, policy, card_type, decision["backend"], task, getattr(args, "paths", None))
+    prompt, patterns_injected = add_patterns_to_prompt(
+        prompt, policy, card_type, decision["backend"], task, getattr(args, "paths", None))
     attempts, tried = [], []
     budget_denial = None
     deadline = NOW() + budget_min * 60
@@ -4007,6 +4485,7 @@ def cmd_run(args, policy):
                    "files_changed": changed,
                    "card_type": card_type, "rework_of": rework_of,
                    "lessons_injected": lessons_injected,
+                   "patterns_injected": patterns_injected,
                    "reasons": decision.get("reasons"), **routing_fields})
     set_status(rdir, state="finished", status=status, finished=NOW(), commit=fin.get("commit"))
     if not getattr(args, "no_auto_review", False):
@@ -6318,7 +6797,8 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
                    "branch": fin.get("branch"), "verify": verify,
                    "files_changed": changed,
                    "card_type": spec.get("card_type"), "rework_of": spec.get("rework_of"),
-                   "lessons_injected": spec.get("lessons_injected", [])})
+                   "lessons_injected": spec.get("lessons_injected", []),
+                   "patterns_injected": spec.get("patterns_injected", [])})
     set_status(rdir, state="finished", status=status, finished=NOW(), commit=fin.get("commit"), lane=lane["name"])
     return out
 
@@ -6362,6 +6842,8 @@ def lane_do_run(lane, spec, child, server, current):
                        f"`{spec['verify']}`. If your sandbox blocks running it (ports, network, missing deps), say so in "
                        "`tests` instead of treating it as a code failure.\n")
         prompt, spec["lessons_injected"] = add_lessons_to_prompt(
+            prompt, load_policy(), spec.get("card_type"), lane["backend"], task, spec.get("paths"))
+        prompt, spec["patterns_injected"] = add_patterns_to_prompt(
             prompt, load_policy(), spec.get("card_type"), lane["backend"], task, spec.get("paths"))
         models = []
         for model in [lane["model"], *(lane.get("fallback_models") or [])]:
@@ -8580,6 +9062,7 @@ def append_ledger(entry):
         "merged": None,
         "defect_within_7d": None,
         "lessons_injected": entry.get("lessons_injected") if isinstance(entry.get("lessons_injected"), list) else [],
+        "patterns_injected": entry.get("patterns_injected") if isinstance(entry.get("patterns_injected"), list) else [],
     }
     record = bus_sanitize(record)
     os.makedirs(DATA, exist_ok=True)
@@ -9131,6 +9614,12 @@ def main():
     lp.add_argument("--out", help="proposal output directory (default: knowledge.repo/proposals/<date>)")
     lp.add_argument("--dry-run", action="store_true", help="print proposals without writing proposal or seen files")
 
+    sp = sub.add_parser("patterns", help="curate reusable executor patterns")
+    patterns_sub = sp.add_subparsers(dest="patterns_cmd", required=True)
+    pp = patterns_sub.add_parser("propose", help="draft patterns from compare winners and repeated peer-review findings")
+    pp.add_argument("--since", type=float, default=30, help="only inspect evidence from the last DAYS (default: 30)")
+    patterns_sub.add_parser("retire-check", help="propose retirement when active patterns do not improve outcomes")
+
     def add_profile(p, include_bus=False):
         p.add_argument("--type", default="impl",
                        help="impl|refactor|debug|test|docs|mechanical|review|research|migration|format|rename")
@@ -9373,9 +9862,11 @@ def main():
             sys.exit(result)
     elif a.cmd == "lessons":
         if a.lessons_cmd == "preview":
-            block, _ = select_lessons(policy, a.card_type, a.backend, paths=a.paths)
-            if block:
-                print(block)
+            lesson_block, _ = select_lessons(policy, a.card_type, a.backend, paths=a.paths)
+            pattern_block, _ = select_patterns(policy, a.card_type, a.backend, paths=a.paths)
+            blocks = [block for block in (lesson_block, pattern_block) if block]
+            if blocks:
+                print("\n\n".join(blocks))
         elif a.lessons_cmd == "escalate":
             try:
                 cmd_lessons_escalate(a, policy)
@@ -9388,6 +9879,15 @@ def main():
             except (BusError, ValueError) as error:
                 print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False), file=sys.stderr)
                 sys.exit(2)
+    elif a.cmd == "patterns":
+        try:
+            if a.patterns_cmd == "propose":
+                cmd_patterns_propose(a, policy)
+            else:
+                cmd_patterns_retire_check(a, policy)
+        except (ValueError, OSError) as error:
+            print(json.dumps({"ok": False, "error": bus_redact(str(error))}, ensure_ascii=False), file=sys.stderr)
+            sys.exit(2)
     elif a.cmd == "route":
         validate_card_type(policy, a.card_type)
         st = get_state(policy, a.refresh)

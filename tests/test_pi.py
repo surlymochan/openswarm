@@ -130,6 +130,14 @@ class PiBackend(unittest.TestCase):
         with open(os.path.join(lessons, "L-0100.yaml"), "w") as stream:
             stream.write("id: L-0100\nrule: Keep the generated helper covered by a test.\nguard_level: L2\n"
                          "applies_to:\n  card_types: [feature]\n  paths: [src/*.py]\n  backends: [pi]\n")
+        skills = os.path.join(knowledge, "skills")
+        os.makedirs(skills)
+        with open(os.path.join(skills, "P-0100.md"), "w") as stream:
+            stream.write("---\nid: P-0100\ntitle: Validate arithmetic inputs\napplies_to:\n"
+                         "  card_types: [feature]\n  paths: [src/*.py]\n  backends: [pi]\n"
+                         "source: \"PR #10\"\nstatus: active\n---\n"
+                         "When to use: when changing arithmetic helpers.\nPattern:\n- Check types.\n"
+                         "Example: [arithmetic PR](https://example.invalid/pr/10)\n")
         policy = xs.deep_merge(POLICY, {"knowledge": {"repo": knowledge}})
         code = self.dispatch(policy=policy, card_type="feature", rework_of="previous-run", paths=["src/add.py"])
         self.assertEqual(code, 0)
@@ -143,6 +151,7 @@ class PiBackend(unittest.TestCase):
         self.assertEqual(entry["card_type"], "feature")
         self.assertEqual(entry["rework_of"], "previous-run")
         self.assertEqual(entry["lessons_injected"], ["L-0100"])
+        self.assertEqual(entry["patterns_injected"], ["P-0100"])
         self.assertEqual(entry["run_id"], entry["id"])
         self.assertEqual(entry["area"], ["add.py"])
         self.assertEqual(entry["tokens"], {"input": 120, "output": 45, "total": 165})
@@ -159,6 +168,7 @@ class PiBackend(unittest.TestCase):
             argv = json.load(fh)
         prompt = argv[-1]
         self.assertIn("[L-0100] Keep the generated helper covered by a test.", prompt)
+        self.assertIn("[P-0100] Validate arithmetic inputs", prompt)
         self.assertEqual(argv[argv.index("--mode") + 1], "json")
         self.assertEqual(argv[argv.index("--tools") + 1], "read,bash,edit,write,grep,find,ls")
         self.assertIn("-p", argv)
