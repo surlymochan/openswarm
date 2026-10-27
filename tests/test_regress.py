@@ -114,6 +114,36 @@ class RegressTests(unittest.TestCase):
         self.assertIn("L-9001", ledger[0]["lessons_injected"])
         self.assertEqual(len(self.git("worktree", "list", "--porcelain").split("worktree ")), 2)
 
+    def test_unknown_verify_fails_on_base_is_stored_as_null(self):
+        meta_path = self.regression / "pass" / "meta.yaml"
+        content = meta_path.read_text(encoding="utf-8").replace("verify_fails_on_base: false", "verify_fails_on_base: unknown")
+        meta_path.write_text(content, encoding="utf-8")
+
+        self.assertIsNone(xs.regress_card_meta(str(meta_path))["verify_fails_on_base"])
+
+    def test_bad_verify_fails_on_base_is_reported_for_only_that_card(self):
+        self.write_card("bad", "true", False)
+        bad_meta = self.regression / "bad" / "meta.yaml"
+        content = bad_meta.read_text(encoding="utf-8").replace("verify_fails_on_base: false", "verify_fails_on_base: maybe")
+        bad_meta.write_text(content, encoding="utf-8")
+        args = type("Args", (), {"cards": "bad,pass", "label": "bad-meta", "parallel": 1,
+                                  "backend": "codex:test-model", "lane": None, "routing": None})()
+        output = io.StringIO()
+        state = {"codex": {"limits": {"codex": {"windows": []}}}}
+        with mock.patch.object(xs, "load_policy", return_value=self.policy), \
+                mock.patch.object(xs, "get_state", return_value=state), \
+                mock.patch.object(xs, "route", side_effect=self.route), \
+                mock.patch.object(xs, "run_executor_with_rate_limit", side_effect=self.execute), \
+                mock.patch.object(xs, "run_verify", side_effect=self.verify), \
+                mock.patch.object(xs, "probe", return_value=state), contextlib.redirect_stdout(output):
+            xs.cmd_regress_run(args, self.policy)
+
+        report = json.loads(output.getvalue())
+        rows = {card["id"]: card for card in report["cards"]}
+        self.assertFalse(rows["bad"]["pass"])
+        self.assertIn("verify_fails_on_base must be true, false, or 'unknown'", rows["bad"]["error"])
+        self.assertTrue(rows["pass"]["pass"])
+
     def test_weighted_selection_is_temporary_and_uses_advice(self):
         args = type("Args", (), {"cards": "pass", "label": "weighted", "parallel": 1,
                                   "backend": None, "lane": None, "routing": "weighted"})()

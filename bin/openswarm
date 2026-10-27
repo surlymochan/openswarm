@@ -9632,8 +9632,10 @@ def regress_card_meta(path):
     if (not isinstance(meta["est_minutes"], (int, float)) or isinstance(meta["est_minutes"], bool)
             or not math.isfinite(meta["est_minutes"]) or meta["est_minutes"] < 0):
         raise ValueError("est_minutes must be a non-negative number")
-    if "verify_fails_on_base" in meta and not isinstance(meta["verify_fails_on_base"], bool):
-        raise ValueError("verify_fails_on_base must be a boolean")
+    if meta.get("verify_fails_on_base") == "unknown":
+        meta["verify_fails_on_base"] = None
+    elif "verify_fails_on_base" in meta and not isinstance(meta["verify_fails_on_base"], bool):
+        raise ValueError("verify_fails_on_base must be true, false, or 'unknown'")
     if "expected_outcome" in meta and not isinstance(meta["expected_outcome"], str):
         raise ValueError("expected_outcome must be a string")
     meta.setdefault("verify_fails_on_base", False)
@@ -9686,7 +9688,10 @@ def regress_load_cards(args, policy):
         card_dir = os.path.realpath(os.path.join(root, card_id))
         if os.path.commonpath((root, card_dir)) != root or not os.path.isdir(card_dir):
             raise ValueError(f"regression card not found: {card_id}")
-        cards.append(regress_resolve_card(card_dir, policy))
+        try:
+            cards.append(regress_resolve_card(card_dir, policy))
+        except (OSError, RuntimeError, ValueError) as error:
+            cards.append({"id": card_id, "load_error": short(error, 500)})
     return cards
 
 
@@ -9895,22 +9900,24 @@ def cmd_regress_run(args, policy):
     if os.path.exists(output_path):
         raise ValueError(f"regression results already exist: {output_path}")
 
+    runnable = [(index, card) for index, card in enumerate(cards) if "load_error" not in card]
+    records = [({"id": card["id"], "pass": False, "run_id": None, "seconds": 0,
+                "tokens": None, "error": card["load_error"]} if "load_error" in card else None)
+               for card in cards]
     actual_parallel = 1 if selector["kind"] == "lane" else min(args.parallel, len(cards))
     if selector["kind"] == "lane":
-        records = []
-        for card in cards:
+        for index, card in runnable:
             try:
-                records.append(regress_run_lane(card, selector["lane"], label, policy))
+                records[index] = regress_run_lane(card, selector["lane"], label, policy)
             except Exception as error:
-                records.append({"id": card["id"], "pass": False, "run_id": None,
-                                "seconds": 0, "tokens": None, "error": short(error, 500)})
+                records[index] = {"id": card["id"], "pass": False, "run_id": None,
+                                  "seconds": 0, "tokens": None, "error": short(error, 500)}
     else:
-        records = [None] * len(cards)
         parallel = min(args.parallel, len(cards))
         with contextlib.redirect_stdout(io.StringIO()):
             with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as pool:
                 futures = {pool.submit(regress_run_backend, card, selector, label, policy): index
-                           for index, card in enumerate(cards)}
+                           for index, card in runnable}
                 for future in concurrent.futures.as_completed(futures):
                     index = futures[future]
                     try:
