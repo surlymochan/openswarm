@@ -4081,6 +4081,15 @@ def exec_agy(d, st, prompt, wd, rdir, timeout, evp):
 
 PI_USAGE_KEYS = ("input", "output", "cacheRead", "cacheWrite")
 PI_TOOLS = "read,bash,edit,write,grep,find,ls"
+PI_READ_ONLY_TOOLS = "read,grep,find,ls"
+
+
+def pi_tool_allowlist(read_only=False):
+    return PI_READ_ONLY_TOOLS if read_only else PI_TOOLS
+
+
+def run_is_read_only(*, read_only=False, card_type=None, task_type=None):
+    return bool(read_only) or task_type in READ_ONLY_CARD_TYPES or card_type in READ_ONLY_CARD_TYPES
 
 
 def pi_usage(events_path):
@@ -4117,7 +4126,10 @@ def pi_usage(events_path):
 
 
 def exec_pi(d, st, prompt, wd, rdir, timeout, evp):
-    """pi -p --mode json [--provider P] [--model M] --tools read,bash,edit,write,grep,find,ls <prompt>
+    """pi -p --mode json [--provider P] [--model M] --tools <allowlist> <prompt>
+
+    Writable runs use PI_TOOLS; read-only runs use PI_READ_ONLY_TOOLS only. Tool allowlists are not an OS
+    sandbox — prompt injection or bugs in permitted tools can still cause harm.
 
     stdin is /dev/null (run_proc) and cwd is the worktree. Quota is unknown; usage is summed from message_end events.
     """
@@ -4137,7 +4149,7 @@ def exec_pi(d, st, prompt, wd, rdir, timeout, evp):
         cmd += ["--model", d["model"]]
     if d.get("_resume_session"):
         cmd.append("--continue")
-    cmd += ["--tools", PI_TOOLS, prompt]
+    cmd += ["--tools", pi_tool_allowlist(d.get("read_only")), prompt]
     rc = run_proc(cmd, wd, os.environ.copy(), timeout, evp)
     usage, text, errors = pi_usage(evp)
     final = extract_json(text) if isinstance(text, str) else None
@@ -4564,6 +4576,8 @@ def cmd_run(args, policy):
         jsave(f"{rdir}/result.json", out)
         print(json.dumps(out, indent=2, ensure_ascii=False))
         sys.exit(2)
+    decision["read_only"] = run_is_read_only(read_only=getattr(args, "read_only", False),
+                                             card_type=card_type, task_type=prof.get("type"))
     advice = routing_advice(prof, card_type, st, policy, decision)
     routing_fields = {"routing_advice": advice} if advice is not None else {}
     if args.dry_run:
@@ -6242,8 +6256,9 @@ def lane_prepare_workspace(lane, rid, base_rev=None):
 
 
 class LaneChild:
-    def __init__(self, lane, cwd, policy):
+    def __init__(self, lane, cwd, policy, pi_tools=None):
         self.lane, self.cwd = lane, cwd
+        self.pi_tools = None
         _tmpdir, self.env = configure_executor_environment(cwd)
         self.events = queue.Queue()
         self.backlog = []
@@ -6264,6 +6279,9 @@ class LaneChild:
             if lane.get("provider"):
                 cmd += ["--provider", lane["provider"]]
             cmd += ["--model", lane["model"]]
+            if pi_tools is not None:
+                cmd += ["--tools", pi_tools]
+            self.pi_tools = pi_tools
         elif backend == "hermes":
             binary = lane.get("binary") or hermes_bin(policy)
             if not binary:
@@ -6475,11 +6493,38 @@ class AgyChild:
                 pass
 
 
-def lane_child(lane, cwd, policy):
+def lane_pi_tools_for_spec(spec):
+    if run_is_read_only(read_only=spec.get("read_only"), card_type=spec.get("card_type")):
+        return PI_READ_ONLY_TOOLS
+    return None
+
+
+def lane_refresh_pi_child_for_tools(lane, child, policy, spec, event_file):
+    if lane.get("backend") != "pi":
+        return child, False
+    want = lane_pi_tools_for_spec(spec)
+    if child and child.pi_tools == want:
+        return child, False
+    wt = os.path.join(lane_root(lane["name"]), "wt")
+    if event_file:
+        lane_record_event(event_file, {"type": "pi_tools_restarted",
+                                       "previous": getattr(child, "pi_tools", None) if child else None,
+                                       "current": want})
+    if child:
+        try:
+            child.close()
+        except Exception:
+            pass
+    new_child = LaneChild(lane, wt, policy, pi_tools=want)
+    lane_write_state(lane["name"], child_pid=new_child.pid, last_error=None)
+    return new_child, True
+
+
+def lane_child(lane, cwd, policy, pi_tools=None):
     """The resident child of a lane: a long-lived RPC/ACP process, or one agy process per turn."""
     if lane["backend"] == "agy":
         return AgyChild(lane, cwd, policy)
-    return LaneChild(lane, cwd, policy)
+    return LaneChild(lane, cwd, policy, pi_tools=pi_tools)
 
 
 def lane_refresh_codex_child_if_stale(lane, child, policy, event_file):
@@ -7411,6 +7456,11 @@ def cmd_lane_serve(lane, policy):
                         RUNS, spec["run_id"], f"events.1.{lane['backend']}.jsonl")
                     active_lane = lanes_by_name([lane["name"]])[0]
                     child, _ = lane_refresh_codex_child_if_stale(active_lane, child, policy, evp)
+                if lane["backend"] == "pi" and child:
+                    evp = spec.get("_event_file") or os.path.join(
+                        RUNS, spec["run_id"], f"events.1.{lane['backend']}.jsonl")
+                    active_lane = lanes_by_name([lane["name"]])[0]
+                    child, _ = lane_refresh_pi_child_for_tools(active_lane, child, policy, spec, evp)
                 lane_do_run(lanes_by_name([lane["name"]])[0], spec, child, server, current)
             finally:
                 down_after = bool(spec.get("down_requested"))

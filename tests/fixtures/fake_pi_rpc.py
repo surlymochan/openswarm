@@ -23,6 +23,8 @@ def record(event):
             stream.write(json.dumps(event) + "\n")
 
 
+record({"type": "startup", "argv": sys.argv})
+
 prompt_count = 0
 rate_mode = None
 for line in sys.stdin:

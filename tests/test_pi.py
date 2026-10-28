@@ -58,7 +58,7 @@ def ns(**kw):
 
 class PiBackend(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="openswarm-pi-")
+        self.tmp = tempfile.mkdtemp(prefix="openswarm-pi-", dir="/tmp")
         self.script = os.path.join(self.tmp, "pi")
         with open(self.script, "w") as f:
             f.write(textwrap.dedent(FAKE))
@@ -66,7 +66,10 @@ class PiBackend(unittest.TestCase):
         self.log = os.path.join(self.tmp, "argv.json")
         self.cwd = os.path.join(self.tmp, "work")
         os.makedirs(self.cwd)
-        self._env = {k: os.environ.get(k) for k in ("OPENSWARM_PI_BIN", "OPENSWARM_STATE_FILE", "FAKE_PI_MODE", "FAKE_PI_LOG")}
+        self._env = {k: os.environ.get(k) for k in ("OPENSWARM_PI_BIN", "OPENSWARM_STATE_FILE", "FAKE_PI_MODE", "FAKE_PI_LOG",
+                                                    "TMPDIR", "TMP", "TEMP")}
+        for key in ("TMPDIR", "TMP", "TEMP"):
+            os.environ.pop(key, None)
         os.environ["OPENSWARM_PI_BIN"] = self.script
         os.environ["OPENSWARM_STATE_FILE"] = _load.FIXTURE_STATE
         os.environ["FAKE_PI_LOG"] = self.log
@@ -80,7 +83,8 @@ class PiBackend(unittest.TestCase):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        if hasattr(self, "tmp"):
+            shutil.rmtree(self.tmp, ignore_errors=True)
 
     def route(self, prof, policy=None):
         with open(_load.FIXTURE_STATE) as f:
@@ -176,6 +180,36 @@ class PiBackend(unittest.TestCase):
         self.assertTrue(os.path.isdir(sessions))
         self.assertFalse(os.path.commonpath([sessions, self.cwd]) == self.cwd)
         self.assertNotIn("--model", argv)
+
+    def test_read_only_one_shot_uses_read_only_tool_allowlist(self):
+        code = self.dispatch(read_only=True, type="review", prompt="review only")
+        self.assertEqual(code, 0)
+        with open(self.log) as fh:
+            argv = json.load(fh)
+        tools = argv[argv.index("--tools") + 1]
+        self.assertEqual(tools, xs.PI_READ_ONLY_TOOLS)
+        for forbidden in ("bash", "edit", "write"):
+            self.assertNotIn(forbidden, tools.split(","))
+
+    def test_writable_one_shot_keeps_full_tool_allowlist(self):
+        rdir = os.path.join(self.tmp, "run")
+        os.makedirs(rdir)
+        evp = os.path.join(rdir, "events.jsonl")
+        xs.exec_pi({"backend": "pi", "model": None, "read_only": False}, {}, "ok", self.cwd, rdir, 5, evp)
+        with open(self.log) as fh:
+            argv = json.load(fh)
+        self.assertEqual(argv[argv.index("--tools") + 1], xs.PI_TOOLS)
+
+    def test_exec_pi_read_only_rejects_writable_tools_in_allowlist(self):
+        rdir = os.path.join(self.tmp, "run-ro")
+        os.makedirs(rdir)
+        evp = os.path.join(rdir, "events.jsonl")
+        xs.exec_pi({"backend": "pi", "model": None, "read_only": True}, {}, "review", self.cwd, rdir, 5, evp)
+        with open(self.log) as fh:
+            argv = json.load(fh)
+        tools = argv[argv.index("--tools") + 1]
+        self.assertEqual(tools, xs.PI_READ_ONLY_TOOLS)
+        self.assertNotIn("bash", tools)
 
     def test_error_event_fails_the_attempt(self):
         os.environ["FAKE_PI_MODE"] = "rate"

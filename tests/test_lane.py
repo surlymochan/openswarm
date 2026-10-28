@@ -701,6 +701,32 @@ class LaneTests(unittest.TestCase):
         self.assertEqual(result["status"], "done")
         self.assertIsNone(result["commit"])
 
+    def test_pi_read_only_lane_restarts_rpc_with_read_only_tools(self):
+        self.set_config("pi")
+        self.start_lane()
+        run_id = self.assign("LANE_TEST_NO_CHANGE read-only review", "--read-only")
+        state = self.wait_run(run_id)
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual(state["status"], "done")
+        self.assertEqual(result["status"], "done")
+        messages = [json.loads(line) for line in pathlib.Path(self.env["FAKE_PI_RPC_LOG"]).read_text().splitlines()]
+        startups = [row for row in messages if row.get("type") == "startup"]
+        self.assertTrue(startups)
+        argv = startups[-1]["argv"]
+        self.assertIn("--tools", argv)
+        tools = argv[argv.index("--tools") + 1]
+        self.assertEqual(tools, "read,grep,find,ls")
+        self.assertNotIn("bash", tools.split(","))
+
+    def test_pi_writable_lane_rpc_keeps_default_tools(self):
+        self.set_config("pi")
+        self.start_lane()
+        run_id = self.assign("add the fixture change")
+        self.wait_run(run_id)
+        messages = [json.loads(line) for line in pathlib.Path(self.env["FAKE_PI_RPC_LOG"]).read_text().splitlines()]
+        argv = next(row["argv"] for row in messages if row.get("type") == "startup")
+        self.assertNotIn("--tools", argv)
+
     def test_codex_io_lost_fails_run(self):
         self.start_lane()
         run_id = self.assign("LANE_TEST_IO_LOST stale shell output")
