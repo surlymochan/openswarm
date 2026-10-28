@@ -162,16 +162,22 @@ class PeerReviewTests(unittest.TestCase):
         invalid = "I could not format JSON. ghp_12345678901234567890"
         valid = json.dumps({"conversation_id": "b71c8819-baae-4a9a-ab6a-fd65e1932b43",
                             "response": "```json\n{\"findings\": [], \"verdict\": \"approve\"}\n```"})
-        completed = [
-            subprocess.CompletedProcess([], 0, invalid, ""),
-            subprocess.CompletedProcess([], 0, valid, ""),
-        ]
-        with mock.patch.object(xs.subprocess, "run", side_effect=completed) as run:
+        valid_payload = json.dumps({"findings": [], "verdict": "approve"})
+        commands = []
+
+        def fake_run_proc(cmd, cwd, env, timeout, out_path):
+            commands.append(cmd)
+            body = invalid if len(commands) == 1 else json.dumps({"response": valid_payload, "model": "agy-test"})
+            with open(out_path, "w", encoding="utf-8") as stream:
+                stream.write(body)
+            return 0
+
+        with mock.patch.object(xs, "run_proc", side_effect=fake_run_proc):
             payload = xs.invoke_reviewer({"backend": "agy", "binary": "/fake/agy", "model": "test"},
                                          "review the diff", str(self.repo), str(self.run_dir), {})
         self.assertEqual(payload, {"findings": [], "verdict": "approve"})
-        self.assertEqual(run.call_count, 2)
-        self.assertIn("Return only JSON", run.call_args_list[1].args[0][run.call_args_list[1].args[0].index("-p") + 1])
+        self.assertEqual(len(commands), 2)
+        self.assertIn("Return only JSON", commands[1][commands[1].index("-p") + 1])
         raw = (self.run_dir / "review.raw.txt").read_text(encoding="utf-8")
         self.assertIn("attempt 1", raw)
         self.assertIn("attempt 2", raw)
@@ -180,11 +186,14 @@ class PeerReviewTests(unittest.TestCase):
         self.assertNotIn("b71c8819-baae-4a9a-ab6a-fd65e1932b43", raw)
 
     def test_failed_review_still_saves_raw_output(self):
-        completed = [
-            subprocess.CompletedProcess([], 0, "not json", ""),
-            subprocess.CompletedProcess([], 0, "still not json", ""),
-        ]
-        with mock.patch.object(xs.subprocess, "run", side_effect=completed):
+        bodies = ["not json", "still not json"]
+
+        def fake_run_proc(cmd, cwd, env, timeout, out_path):
+            with open(out_path, "w", encoding="utf-8") as stream:
+                stream.write(bodies.pop(0))
+            return 0
+
+        with mock.patch.object(xs, "run_proc", side_effect=fake_run_proc):
             with self.assertRaisesRegex(RuntimeError, "after repair retry"):
                 xs.invoke_reviewer({"backend": "agy", "binary": "/fake/agy"}, "review", str(self.repo),
                                    str(self.run_dir), {})
@@ -194,15 +203,38 @@ class PeerReviewTests(unittest.TestCase):
 
     def test_agy_permission_denial_is_reported_without_a_paid_format_retry(self):
         output = json.dumps({"response": "", "denied_actions": [{"action": "command"}]})
-        completed = subprocess.CompletedProcess([], 0, output, "agy: no output produced; command permission denied")
-        with mock.patch.object(xs.subprocess, "run", return_value=completed) as run:
+        calls = []
+
+        def fake_run_proc(cmd, cwd, env, timeout, out_path):
+            calls.append(out_path)
+            with open(out_path, "w", encoding="utf-8") as stream:
+                stream.write(output)
+            with open(out_path + ".err", "w", encoding="utf-8") as stream:
+                stream.write("agy: no output produced; command permission denied")
+            return 0
+
+        with mock.patch.object(xs, "run_proc", side_effect=fake_run_proc):
             with self.assertRaisesRegex(RuntimeError, "tool action was denied"):
                 xs.invoke_reviewer({"backend": "agy", "binary": "/fake/agy"}, "review", str(self.repo),
                                    str(self.run_dir), {})
-        self.assertEqual(run.call_count, 1)
+        self.assertEqual(len(calls), 1)
         raw = (self.run_dir / "review.raw.txt").read_text(encoding="utf-8")
         self.assertIn("denied_actions", raw)
         self.assertIn("permission denied", raw)
+
+    def test_unconfirmed_termination_quarantines_run_dir_and_preserves_raw(self):
+        def fake_run_proc(cmd, cwd, env, timeout, out_path):
+            with open(out_path, "w", encoding="utf-8") as stream:
+                stream.write("partial output")
+            raise xs.TerminationUnconfirmed("observed executor termination unconfirmed; workspace quarantined")
+
+        with mock.patch.object(xs, "run_proc", side_effect=fake_run_proc):
+            with self.assertRaises(xs.TerminationUnconfirmed):
+                xs.invoke_reviewer({"backend": "agy", "binary": "/fake/agy"}, "review", str(self.repo),
+                                   str(self.run_dir), {})
+        self.assertTrue((self.run_dir / "quarantine.json").is_file())
+        raw = (self.run_dir / "review.raw.txt").read_text(encoding="utf-8")
+        self.assertIn("partial output", raw)
 
 
 if __name__ == "__main__":

@@ -3727,6 +3727,41 @@ class TerminationUnconfirmed(RuntimeError):
     """Observed executor processes could not be confirmed stopped; preserve the workspace."""
 
 
+TERMINATION_UNCONFIRMED_ERROR = (
+    "Observed executor termination unconfirmed; workspace quarantined. "
+    "Escaped unobserved processes cannot be ruled out."
+)
+
+
+def quarantine_executor_workspace(rdir, *, context=None):
+    os.makedirs(rdir, exist_ok=True)
+    jsave(os.path.join(rdir, "quarantine.json"),
+          {"error_class": "termination_unconfirmed", "error": TERMINATION_UNCONFIRMED_ERROR,
+           "context": context, "quarantined_at": dt.datetime.now(dt.timezone.utc).isoformat()})
+    set_status(rdir, state="quarantined", status="failed", error_class="termination_unconfirmed")
+
+
+def read_executor_capture(out_path, structured_output_path=None):
+    stdout, stderr = "", ""
+    try:
+        with open(out_path, encoding="utf-8", errors="replace") as stream:
+            stdout = stream.read()
+    except OSError:
+        pass
+    try:
+        with open(out_path + ".err", encoding="utf-8", errors="replace") as stream:
+            stderr = stream.read()
+    except OSError:
+        pass
+    if structured_output_path and os.path.isfile(structured_output_path):
+        try:
+            with open(structured_output_path, encoding="utf-8") as stream:
+                stdout = stream.read()
+        except OSError:
+            pass
+    return stdout, stderr
+
+
 def run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
     _tmpdir, env = configure_executor_environment(cwd, env)
     try:
@@ -4808,7 +4843,7 @@ def cmd_run(args, policy):
             decision["read_only"] = True
     if err_class == "termination_unconfirmed":
         out = {"id": rid, "status": "failed", "error_class": err_class,
-               "error": "Observed executor termination unconfirmed; workspace quarantined. Escaped unobserved processes cannot be ruled out.",
+               "error": TERMINATION_UNCONFIRMED_ERROR,
                "workspace": ws, "attempts": attempts, "run_dir": rdir}
         jsave(f"{rdir}/result.json", out)
         set_status(rdir, state="quarantined", status="failed", error_class=err_class)
@@ -5163,11 +5198,6 @@ def invoke_reviewer(reviewer, prompt, repo, rdir, policy):
     os.makedirs(rdir, exist_ok=True)
     raw_attempts = []
 
-    def output_text(value):
-        if isinstance(value, bytes):
-            return value.decode("utf-8", errors="replace")
-        return value or ""
-
     def save_raw():
         path = os.path.join(rdir, "review.raw.txt")
         with open(path, "w", encoding="utf-8") as stream:
@@ -5192,24 +5222,28 @@ def invoke_reviewer(reviewer, prompt, repo, rdir, policy):
                 except FileNotFoundError:
                     pass
                 command = review_command(reviewer, active_prompt, repo, scratch_dir, policy)
+                evp = os.path.join(scratch_dir, f"events-{attempt}")
+                file_output = output_path if reviewer.get("backend") == "codex" else None
                 try:
-                    completed = subprocess.run(command, cwd=repo, stdin=subprocess.DEVNULL,
-                                               capture_output=True, text=True, timeout=timeout, check=False)
-                except subprocess.TimeoutExpired as error:
-                    raw = (open(output_path, encoding="utf-8").read() if os.path.isfile(output_path)
-                           else output_text(error.stdout))
-                    stderr = output_text(error.stderr)
+                    rc = run_proc(command, repo, os.environ.copy(), timeout, evp)
+                except TerminationUnconfirmed:
+                    stdout, stderr = read_executor_capture(evp, file_output)
+                    raw = stdout or stderr
                     raw_attempts.append(f"--- attempt {attempt} ---\n{raw}"
                                         + (f"\n[stderr]\n{stderr}" if stderr else ""))
-                    raise RuntimeError(f"reviewer timed out after {timeout}s") from error
-                raw = (open(output_path, encoding="utf-8").read() if os.path.isfile(output_path)
-                       else output_text(completed.stdout))
-                stderr = output_text(completed.stderr)
+                    quarantine_executor_workspace(rdir, context="peer_review")
+                    raise
+                except ExecutorStartError as error:
+                    raise RuntimeError(f"reviewer could not start: {error}") from error
+                stdout, stderr = read_executor_capture(evp, file_output)
+                raw = stdout or stderr
                 raw_attempts.append(f"--- attempt {attempt} ---\n{raw}"
                                     + (f"\n[stderr]\n{stderr}" if stderr else ""))
-                if completed.returncode:
+                if rc == 124:
+                    raise RuntimeError(f"reviewer timed out after {timeout}s")
+                if rc:
                     detail = bus_redact((stderr or raw).strip())[-500:]
-                    raise RuntimeError(f"reviewer exited with status {completed.returncode}"
+                    raise RuntimeError(f"reviewer exited with status {rc}"
                                        + (f": {detail}" if detail else ""))
                 execution_error = review_execution_error(raw, stderr)
                 if execution_error:

@@ -23,7 +23,7 @@ import openswarm_consult as consult  # noqa: E402
 xs = _load.load()
 POLICY = xs.load_policy()
 FAKE = r"""#!/usr/bin/env python3
-import json, os, sys, time
+import json, os, subprocess, sys, time
 argv = sys.argv[1:]
 backend = "codex" if argv[:1] == ["exec"] else ("agy" if "--output-format" in argv else "pi")
 log_dir = os.environ["FAKE_CONSULT_LOG_DIR"]
@@ -39,6 +39,11 @@ if os.environ.get("FAKE_CONSULT_TIMEOUT_BACKEND") == backend:
     time.sleep(30)
 if os.environ.get("FAKE_CONSULT_SLEEP_SECONDS"):
     time.sleep(float(os.environ["FAKE_CONSULT_SLEEP_SECONDS"]))
+if os.environ.get("FAKE_CONSULT_SPAWN_CHILD"):
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+    with open(os.path.join(log_dir, "child.pid"), "w") as stream:
+        stream.write(str(child.pid))
+    time.sleep(0.5)
 body = {"opinion": "Keep the current contract", "confidence": "high",
         "evidence": ["README.md:10"], "risks": []}
 repair_requested = any("Return only JSON" in value for value in argv)
@@ -82,13 +87,14 @@ class ConsultTests(unittest.TestCase):
         self.policy = xs.deep_merge(POLICY, {"concurrency": {"codex": 2, "agy": 2, "pi": 2, "total": 8}})
         self.env_keys = ("FAKE_CONSULT_LOG_DIR", "FAKE_CONSULT_BARRIER", "FAKE_CONSULT_TIMEOUT_BACKEND",
                          "FAKE_CONSULT_MALFORMED_BACKEND", "FAKE_CONSULT_REPAIR_BACKEND",
-                         "FAKE_CONSULT_SLEEP_SECONDS")
+                         "FAKE_CONSULT_SLEEP_SECONDS", "FAKE_CONSULT_SPAWN_CHILD")
         self.old_env = {key: os.environ.get(key) for key in self.env_keys}
         os.environ["FAKE_CONSULT_LOG_DIR"] = self.logs
         os.environ.pop("FAKE_CONSULT_TIMEOUT_BACKEND", None)
         os.environ.pop("FAKE_CONSULT_MALFORMED_BACKEND", None)
         os.environ.pop("FAKE_CONSULT_REPAIR_BACKEND", None)
         os.environ.pop("FAKE_CONSULT_SLEEP_SECONDS", None)
+        os.environ.pop("FAKE_CONSULT_SPAWN_CHILD", None)
         os.environ.pop("FAKE_CONSULT_BARRIER", None)
         self.cwd_patch = mock.patch("openswarm_consult.os.getcwd", return_value=self.repo)
         self.cwd_patch.start()
@@ -246,6 +252,35 @@ class ConsultTests(unittest.TestCase):
         self.assertIn("attempt 1", agy_answer["raw"])
         self.assertIn("attempt 2", agy_answer["raw"])
         self.assertIn("opinion", agy_answer["raw"])
+
+    def test_unconfirmed_executor_termination_quarantines_answer_dir(self):
+        profile = {"backend": "codex", "binary": self.script, "model": "codex-test",
+                   "family": "OpenAI", "lane": None, "cwd": self.repo}
+        with mock.patch.object(xs, "run_proc", side_effect=xs.TerminationUnconfirmed("quarantined")):
+            result_dir = os.path.join(self.tmp, "answer-quarantine")
+            row = consult._ask_one(xs, profile, "question", result_dir, xs.NOW() + 5, self.policy, "q1")
+        self.assertFalse(row["valid"])
+        self.assertTrue(row.get("quarantined"))
+        self.assertIn("Escaped unobserved processes", row["error"])
+        self.assertTrue(os.path.isfile(os.path.join(result_dir, "quarantine.json")))
+
+    def test_consult_stops_detached_descendant_via_run_proc(self):
+        os.environ["FAKE_CONSULT_SPAWN_CHILD"] = "1"
+        profile = {"backend": "codex", "binary": self.script, "model": "codex-test",
+                   "family": "OpenAI", "lane": None, "cwd": self.repo}
+        result_dir = os.path.join(self.tmp, "answer-child")
+        row = consult._ask_one(xs, profile, consult.make_prompt("q?", []), result_dir, xs.NOW() + 10,
+                               self.policy, "child-test")
+        self.assertTrue(row["valid"])
+        marker = os.path.join(self.logs, "child.pid")
+        if os.path.isfile(marker):
+            with open(marker, encoding="utf-8") as stream:
+                pid = int(stream.read())
+            try:
+                self.assertFalse(xs.pid_alive(pid))
+            finally:
+                if xs.pid_alive(pid):
+                    xs.kill_tree(pid, grace=0.1)
 
     def test_context_file_is_included_in_the_shared_prompt(self):
         path = os.path.join(self.tmp, "context.md")

@@ -5,8 +5,6 @@ import json
 import math
 import os
 import re
-import signal
-import subprocess
 import sys
 import threading
 import time
@@ -266,24 +264,6 @@ def _agy_execution_error(raw, stderr):
     return None
 
 
-def _kill_process(process):
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except (OSError, ProcessLookupError):
-        try:
-            process.terminate()
-        except OSError:
-            pass
-    try:
-        process.wait(timeout=0.5)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (OSError, ProcessLookupError):
-            process.kill()
-        process.wait()
-
-
 def _ask_one(core, profile, prompt, run_dir, deadline, policy, reservation_id):
     row = {key: profile.get(key) for key in ("backend", "model", "family", "lane")}
     row.update({"valid": False, "answer": None, "raw": ""})
@@ -316,17 +296,28 @@ def _ask_one(core, profile, prompt, run_dir, deadline, policy, reservation_id):
                 except FileNotFoundError:
                     pass
             remaining = max(0.01, deadline - core.NOW())
-            process = subprocess.Popen(command, cwd=profile["cwd"], stdin=subprocess.DEVNULL,
-                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+            evp = os.path.join(run_dir, f"events-{attempt}")
+            file_output = profile.get("output_path")
             try:
-                stdout, stderr = process.communicate(timeout=remaining)
+                rc = core.run_proc(command, profile["cwd"], os.environ.copy(), remaining, evp)
+            except core.TerminationUnconfirmed:
+                stdout, stderr = core.read_executor_capture(evp, file_output)
                 stdout, stderr = _decode_output(stdout), _decode_output(stderr)
-            except subprocess.TimeoutExpired as error:
-                _kill_process(process)
-                stdout, stderr = process.communicate()
-                stdout = _decode_output(stdout) or _decode_output(error.output)
-                stderr = _decode_output(stderr) or _decode_output(error.stderr)
-                raw = _response_text(profile["backend"], stdout, profile.get("output_path")) or stderr
+                raw = _response_text(profile["backend"], stdout, file_output) or stderr
+                raw_attempts.append(f"--- attempt {attempt} ---\n{raw}"
+                                    + (f"\n[stderr]\n{stderr}" if stderr else ""))
+                row["raw"] = "\n\n".join(raw_attempts)
+                row["error"] = core.TERMINATION_UNCONFIRMED_ERROR
+                row["quarantined"] = True
+                core.quarantine_executor_workspace(run_dir, context="consult")
+                return row
+            except core.ExecutorStartError as error:
+                row["error"] = f"executor could not start: {error}"
+                return row
+            stdout, stderr = core.read_executor_capture(evp, file_output)
+            stdout, stderr = _decode_output(stdout), _decode_output(stderr)
+            if rc == 124:
+                raw = _response_text(profile["backend"], stdout, file_output) or stderr
                 raw_attempts.append(f"--- attempt {attempt} ---\n{raw}")
                 row["raw"] = "\n\n".join(raw_attempts)
                 row["error"] = "deadline exceeded"
@@ -352,8 +343,7 @@ def _ask_one(core, profile, prompt, run_dir, deadline, policy, reservation_id):
                                  "Return only JSON, with no prose or markdown, using exactly this shape: "
                                  + json.dumps(CONSULT_SCHEMA, ensure_ascii=False))
             else:
-                row["error"] = error or (f"executor exited with status {process.returncode}"
-                                          if process.returncode else "invalid response")
+                row["error"] = error or (f"executor exited with status {rc}" if rc else "invalid response")
                 if stderr.strip():
                     row["stderr"] = stderr[-2000:]
         return row

@@ -121,13 +121,13 @@ class PiFailClosed(unittest.TestCase):
         import openswarm_consult as consult
         with tempfile.TemporaryDirectory(dir=os.getcwd()) as run:
             profile = {"backend": "pi", "binary": "pi", "cwd": run}
-            with mock.patch.object(xs, "RUNS", run), mock.patch.object(consult.subprocess, "Popen") as launch, \
+            with mock.patch.object(xs, "RUNS", run), mock.patch.object(xs, "run_proc") as launch, \
                  mock.patch.object(xs, "reserve_provider_slot", return_value=True), \
                  mock.patch.object(xs, "set_status"):
                 row = consult._ask_one(xs, profile, "review", run, xs.NOW() + 5, {}, "test")
                 self.assertIn("cannot be verified", row["error"])
                 launch.assert_not_called()
-            with mock.patch.object(xs.subprocess, "run") as launch:
+            with mock.patch.object(xs, "run_proc") as launch:
                 with self.assertRaisesRegex(RuntimeError, "cannot be verified"):
                     xs.invoke_reviewer(profile, "review", run, run, {})
                 launch.assert_not_called()
