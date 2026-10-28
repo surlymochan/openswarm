@@ -3343,7 +3343,8 @@ def run_executor_with_rate_limit(backend, decision, state, prompt, wd, rdir, bud
         except Exception as error:
             rc, final, meta, err_text = 1, None, {"usage": {}}, f"executor failed: {short(error, 500)}"
             open(event_file, "a").close()
-            error_class = "executor_exception"
+            error_class = ("termination_unconfirmed" if isinstance(error, TerminationUnconfirmed) else
+                           "exec_error" if isinstance(error, ExecutorStartError) else "executor_exception")
         else:
             error_class = executor_error_class(rc, final, err_text)
         seconds = round(NOW() - started, 3)
@@ -3386,6 +3387,8 @@ def descendants(pid):
     while todo:
         cur = todo.pop()
         rc, txt, _ = sh(["pgrep", "-P", str(cur)], timeout=5)
+        if rc not in (0, 1):
+            raise TerminationUnconfirmed("executor descendant discovery failed; workspace quarantined")
         kids = [int(x) for x in txt.split()] if rc == 0 else []
         out += kids
         todo += kids
@@ -3716,17 +3719,37 @@ def enforced_risk(event, policy, worktree):
     return None
 
 
+class ExecutorStartError(RuntimeError):
+    """The executor was not started."""
+
+
+class TerminationUnconfirmed(RuntimeError):
+    """Observed executor processes could not be confirmed stopped; preserve the workspace."""
+
+
 def run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
     _tmpdir, env = configure_executor_environment(cwd, env)
     try:
-        return _run_proc(cmd, cwd, env, timeout, out_path, abort_re)
-    finally:
+        result = _run_proc(cmd, cwd, env, timeout, out_path, abort_re)
+    except TerminationUnconfirmed:
+        raise
+    except BaseException:
         cleanup_executor_tmp(cwd)
+        raise
+    cleanup_executor_tmp(cwd)
+    return result
 
 
-def terminate_executor(p, grace=3):
+def terminate_executor(p, grace=3, observed=None):
     """Stop the observed tree and refuse retry if any observed process remains."""
-    procs = kill_tree(p.pid, grace=grace)
+    observed = set(observed or ())
+    try:
+        procs = set(kill_tree(p.pid, grace=grace)) | observed
+        for pid in observed:
+            if pid_alive(pid):
+                procs.update(kill_tree(pid, grace=grace))
+    except (TerminationUnconfirmed, OSError, subprocess.SubprocessError):
+        return False
     try:
         p.wait(timeout=5)
     except subprocess.TimeoutExpired:
@@ -3739,15 +3762,20 @@ def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
     silently (e.g. opencode on a plan usage limit) — kill it early and return 75 so the caller can fall back."""
     rdir = os.path.dirname(out_path)
     with open(out_path, "w") as out, open(out_path + ".err", "w") as err:
-        p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=out, stderr=err, stdin=subprocess.DEVNULL,
-                             start_new_session=True)
+        try:
+            p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=out, stderr=err, stdin=subprocess.DEVNULL,
+                                 start_new_session=True)
+        except OSError as error:
+            raise ExecutorStartError(str(error)) from error
         try:
             set_status(rdir, executor_pid=p.pid, events=out_path, attempt_started=NOW())
             end = NOW() + timeout
             policy = load_policy()
             offset, pending = 0, ""
             io_streak = 0
+            observed = set()
             while True:
+                observed.update(descendants(p.pid))
                 done = p.poll() is not None
                 with open(out_path, errors="replace") as events:
                     events.seek(offset)
@@ -3771,33 +3799,36 @@ def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
                                 ev.write(json.dumps({"type": "error", "error": lost, "streak": io_streak},
                                                     ensure_ascii=False) + "\n")
                             set_status(rdir, last_error="codex shell returned exit 0 with empty output repeatedly")
-                            if not terminate_executor(p, grace=0.1):
-                                raise RuntimeError("executor process tree termination unconfirmed")
+                            if not terminate_executor(p, grace=0.1, observed=observed):
+                                raise TerminationUnconfirmed("observed executor termination unconfirmed; workspace quarantined")
                             return 134
                     if block:
                         set_status(rdir, risk_blocks=[block], stop_requested=True)
-                        if not terminate_executor(p, grace=0.1):
-                            raise RuntimeError("executor process tree termination unconfirmed")
+                        if not terminate_executor(p, grace=0.1, observed=observed):
+                            raise TerminationUnconfirmed("observed executor termination unconfirmed; workspace quarantined")
                         return 133
                 if done:
+                    if not terminate_executor(p, grace=0.1, observed=observed):
+                        raise TerminationUnconfirmed("observed executor termination unconfirmed; workspace quarantined")
                     return p.returncode
                 if NOW() >= end:
-                    if not terminate_executor(p):
-                        raise RuntimeError("executor process tree termination unconfirmed")
+                    if not terminate_executor(p, observed=observed):
+                        raise TerminationUnconfirmed("observed executor termination unconfirmed; workspace quarantined")
                     return 124
                 if abort_re is not None:
                     try:
                         with open(out_path + ".err", errors="ignore") as f:
                             f.seek(max(0, os.path.getsize(out_path + ".err") - 65536))
                             if abort_re.search(f.read()):
-                                if not terminate_executor(p):
-                                    raise RuntimeError("executor process tree termination unconfirmed")
+                                if not terminate_executor(p, observed=observed):
+                                    raise TerminationUnconfirmed("observed executor termination unconfirmed; workspace quarantined")
                                 return 75
                     except OSError:
                         pass
                 time.sleep(0.05)
-        except BaseException:
-            terminate_executor(p, grace=0.1)
+        except BaseException as error:
+            if not terminate_executor(p, grace=0.1, observed=locals().get("observed", set())):
+                raise TerminationUnconfirmed("observed executor termination unconfirmed; workspace quarantined") from error
             raise
 
 
@@ -3824,8 +3855,8 @@ def exec_codex(d, st, prompt, wd, rdir, timeout, evp):
     schema = f"{rdir}/schema.json"
     jsave(schema, RESULT_SCHEMA)
     last = f"{rdir}/last.json"
+    sandbox = "read-only" if d.get("read_only") else load_policy()["codex"]["sandbox"]
     if d.get("_resume_session"):
-        sandbox = load_policy()["codex"]["sandbox"]
         cmd = [st["codex"]["binary"], *codex_executor_flags(), "exec", "resume", d["_resume_session"], "-m", d["model"],
                "-c", f'model_reasoning_effort="{d["effort"]}"', "-c", f'sandbox_mode="{sandbox}"',
                "-c", 'approval_policy="never"', "--json", "--skip-git-repo-check",
@@ -3833,7 +3864,7 @@ def exec_codex(d, st, prompt, wd, rdir, timeout, evp):
     else:
         cmd = [st["codex"]["binary"], *codex_executor_flags(), "exec", "-m", d["model"],
                "-c", f'model_reasoning_effort="{d["effort"]}"',
-               "-s", load_policy()["codex"]["sandbox"], "-C", wd, "--json", "--skip-git-repo-check",
+               "-s", sandbox, "-C", wd, "--json", "--skip-git-repo-check",
                "--output-schema", schema, "-o", last, prompt]
     rc = run_proc(cmd, wd, os.environ.copy(), timeout, evp)
     usage, thread, errors = {}, None, []
@@ -4136,10 +4167,6 @@ def pi_read_only_tools_or_error(read_only):
             return None, f"pi read-only tool allowlist includes forbidden tool {forbidden}"
     return None, "pi read-only effective capabilities cannot be verified before prompting"
 
-
-def fallback_forbidden_for_read_only(decision):
-    # Other executors do not all enforce the Pi tool restriction.
-    return bool(decision.get("read_only"))
 
 
 def run_detached_child_argv(rid, args, title, budget_min, cwd):
@@ -4752,13 +4779,16 @@ def cmd_run(args, policy):
             result = final
             break
         if final is not None or err_class not in ("rate_limit", "exec_error", "model_unavailable") or not policy["run"]["fallback"] \
-                or args.no_fallback or fallback_forbidden_for_read_only(decision) or prof.get("backend") or deadline - NOW() < 120 \
+                or args.no_fallback or prof.get("backend") or deadline - NOW() < 120 \
                 or (jload(f"{rdir}/status.json", {}) or {}).get("stop_requested"):
             result = final
             break
         st = probe(policy)
-        nxt = route(prof, st, policy, exclude=tried if err_class == "rate_limit" else ([] if err_class == "model_unavailable" else [b]))
-        if not nxt["ok"]:
+        excluded = tried if err_class == "rate_limit" else ([] if err_class == "model_unavailable" else [b])
+        if decision.get("read_only"):
+            excluded = list(set(excluded) | {"pi", "agy", "cursor", "ocgo", "deepseek"})
+        nxt = route(prof, st, policy, exclude=excluded)
+        if not nxt["ok"] or (decision.get("read_only") and nxt.get("backend") != "codex"):
             result = final
             break
         # A fallback can change backends; retain the spent reservation and check the new cap.
@@ -4776,6 +4806,14 @@ def cmd_run(args, policy):
         decision = nxt
         if locked_read_only:
             decision["read_only"] = True
+    if err_class == "termination_unconfirmed":
+        out = {"id": rid, "status": "failed", "error_class": err_class,
+               "error": "Observed executor termination unconfirmed; workspace quarantined. Escaped unobserved processes cannot be ruled out.",
+               "workspace": ws, "attempts": attempts, "run_dir": rdir}
+        jsave(f"{rdir}/result.json", out)
+        set_status(rdir, state="quarantined", status="failed", error_class=err_class)
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        sys.exit(1)
     set_status(rdir, state="finalizing")
     st_after = probe(policy) if decision["backend"] == "codex" else st
     attempts[-1]["quota_after"] = quota_used(st_after, decision)
@@ -4957,7 +4995,7 @@ def choose_review_backend(run_backend, policy, available=None):
     for requested in prefer:
         backend = canonical_backend(str(requested))
         reviewer = available.get(backend)
-        if reviewer and review_family_compatible(run_backend, backend):
+        if reviewer and backend != "pi" and review_family_compatible(run_backend, backend):
             return dict(reviewer)
     raise ValueError(f"no available cross-family reviewer for run backend {run_backend or 'unknown'}")
 
@@ -5233,6 +5271,8 @@ def perform_peer_review(run_id, by, policy):
     available = review_available(policy)
     if by:
         backend, model = parse_review_by(by)
+        if backend == "pi":
+            raise ValueError(pi_read_only_tools_or_error(True)[1])
         if not review_family_compatible(result.get("backend"), backend):
             raise ValueError(f"reviewer {backend} is not cross-family for run backend {result.get('backend')}")
         reviewer = available.get(backend)
@@ -8967,6 +9007,10 @@ def pid_alive(pid):
         return False
     try:
         os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
         return True
     except (OSError, TypeError, ValueError, OverflowError):
         return False

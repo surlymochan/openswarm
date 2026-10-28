@@ -1,5 +1,6 @@
 """Host-only checks for Pi's unverified capability boundary."""
 import os
+from pathlib import Path
 import subprocess
 import sys
 import tempfile
@@ -44,6 +45,46 @@ class PiFailClosed(unittest.TestCase):
             self.assertFalse(xs.terminate_executor(proc, grace=0))
         kill_group.assert_any_call(200, xs.signal.SIGTERM)
         kill_process.assert_any_call(200, xs.signal.SIGKILL)
+
+    def test_normal_exit_stops_observed_independent_session_child(self):
+        with tempfile.TemporaryDirectory(dir=os.getcwd()) as run:
+            marker = os.path.join(run, "child")
+            code = ("import subprocess, sys, time\n"
+                    "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True)\n"
+                    "open(sys.argv[1], 'w').write(str(p.pid))\n"
+                    "time.sleep(0.4)\n")
+            try:
+                rc = xs._run_proc([sys.executable, "-c", code, marker], run, os.environ.copy(), 5,
+                                  os.path.join(run, "events"))
+                self.assertEqual(rc, 0)
+                pid = int(Path(marker).read_text())
+                self.assertFalse(xs.pid_alive(pid))
+            finally:
+                if os.path.exists(marker):
+                    pid = int(Path(marker).read_text())
+                    if xs.pid_alive(pid):
+                        os.kill(pid, 9)
+
+    def test_unconfirmed_normal_exit_raises_and_preserves_temp(self):
+        with tempfile.TemporaryDirectory(dir=os.getcwd()) as run, \
+             mock.patch.object(xs, "terminate_executor", return_value=False), \
+             mock.patch.object(xs, "executor_worktree_root", return_value=run), \
+             mock.patch.object(xs, "git", return_value=(1, "", "")):
+            with self.assertRaisesRegex(xs.TerminationUnconfirmed, "quarantined"):
+                xs.run_proc([sys.executable, "-c", "pass"], run, os.environ.copy(), 5,
+                            os.path.join(run, "events"))
+            self.assertTrue(os.path.isdir(os.path.join(run, ".openswarm-tmp")))
+
+    def test_codex_read_only_start_uses_read_only_sandbox(self):
+        with tempfile.TemporaryDirectory(dir=os.getcwd()) as run, \
+             mock.patch.object(xs, "run_proc", return_value=1) as launch:
+            open(os.path.join(run, "events.err"), "w").close()
+            open(os.path.join(run, "events"), "w").close()
+            xs.exec_codex({"model": "test", "effort": "low", "read_only": True},
+                          {"codex": {"binary": "codex"}}, "review", run, run, 5,
+                          os.path.join(run, "events"))
+            command = launch.call_args.args[0]
+            self.assertEqual(command[command.index("-s") + 1], "read-only")
 
     def test_read_only_never_launches_one_shot(self):
         with tempfile.TemporaryDirectory(dir=os.getcwd()) as run:
@@ -148,6 +189,17 @@ class PiFailClosed(unittest.TestCase):
                 xs.lane_refresh_pi_child_for_tools({"backend": "pi"}, child, {}, {"card_type": "review"}, None)
         child.close.assert_not_called()
         launch.assert_not_called()
+
+    def test_spawn_failure_is_a_pre_start_error(self):
+        with tempfile.TemporaryDirectory(dir=os.getcwd()) as run, \
+             mock.patch.object(xs.subprocess, "Popen", side_effect=OSError("missing")):
+            with self.assertRaisesRegex(xs.ExecutorStartError, "missing"):
+                xs._run_proc(["missing"], run, {}, 5, os.path.join(run, "events"))
+
+    def test_descendant_discovery_failure_is_uncertain(self):
+        with mock.patch.object(xs, "sh", return_value=(2, "", "failed")):
+            with self.assertRaises(xs.TerminationUnconfirmed):
+                xs.descendants(123)
 
     def test_executor_startup_exception_is_recorded(self):
         with tempfile.TemporaryDirectory(dir=os.getcwd()) as run, \

@@ -187,13 +187,14 @@ class PiBackend(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertFalse(os.path.exists(self.log))
 
-    def test_read_only_failure_does_not_fallback(self):
+    def test_read_only_falls_back_only_to_enforced_codex(self):
         policy = xs.deep_merge(POLICY, {"routing": {"default_order": ["pi", "codex", "ocgo", "deepseek"]}})
-        with mock.patch.object(xs, "fallback_forbidden_for_read_only", wraps=xs.fallback_forbidden_for_read_only) as guard:
+        codex = mock.Mock(return_value=(1, None, {"usage": {}}, "stub failed"))
+        with mock.patch.dict(xs.EXECUTORS, {"codex": codex}):
             self.assertNotEqual(self.dispatch(policy=policy, backend=None, read_only=True), 0)
-        guard.assert_called()
         _, result = self.last_result()
-        self.assertEqual([attempt["backend"] for attempt in result["attempts"]], ["pi"])
+        self.assertEqual([attempt["backend"] for attempt in result["attempts"]], ["pi", "codex"])
+        self.assertTrue(codex.call_args.args[0]["read_only"])
         self.assertFalse(os.path.exists(self.log))
 
     def test_writable_one_shot_keeps_full_tool_allowlist(self):

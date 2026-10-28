@@ -16,7 +16,7 @@ xs = _load.load()
 
 class PeerReviewTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="openswarm-review-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="openswarm-review-", dir=os.getcwd())
         self.root = Path(self.tmp.name)
         self.data = self.root / "data"
         self.runs = self.data / "runs"
@@ -60,16 +60,16 @@ class PeerReviewTests(unittest.TestCase):
         findings = [{"severity": "P1", "path": "module.py", "line": 1,
                      "title": "Value is not preserved", "body": "The changed value breaks the contract."}]
         with mock.patch.object(xs, "review_available", return_value={
-                "pi": {"backend": "pi", "binary": "/fake/pi", "model": "pi-model"}}), \
+                "agy": {"backend": "agy", "binary": "/fake/agy", "model": "agy-model"}}), \
                 mock.patch.object(xs, "invoke_reviewer", return_value={"findings": findings, "verdict": "changes"}) as invoke:
-            payload = xs.perform_peer_review("run-1", None, {"review": {"prefer": ["codex", "pi"]}})
+            payload = xs.perform_peer_review("run-1", None, {"review": {"prefer": ["codex", "agy"]}})
 
         self.assertEqual(payload, {"findings": findings, "verdict": "changes"})
         self.assertIn("Diff:", invoke.call_args.args[1])
         saved = json.loads((self.run_dir / "review.json").read_text(encoding="utf-8"))
-        self.assertEqual(saved["by"], "pi:pi-model")
+        self.assertEqual(saved["by"], "agy:agy-model")
         ledger = json.loads(Path(xs.LEDGER).read_text(encoding="utf-8"))
-        self.assertEqual(ledger["peer_review"], {"by": "pi:pi-model", "verdict": "changes",
+        self.assertEqual(ledger["peer_review"], {"by": "agy:agy-model", "verdict": "changes",
                                                   "p0": 0, "p1": 1, "p2": 0})
         self.assertEqual(ledger["review_findings"], {"p0": 0, "p1": 1, "p2": 0})
 
@@ -81,6 +81,15 @@ class PeerReviewTests(unittest.TestCase):
         self.assertEqual(xs.choose_review_backend("pi", policy, available)["backend"], "codex")
         self.assertTrue(xs.review_family_compatible("gemini", "codex"))
         self.assertFalse(xs.review_family_compatible("codex", "codex"))
+
+    def test_disabled_pi_is_skipped_and_explicit_pi_rejected(self):
+        available = {backend: {"backend": backend, "binary": "/fake/" + backend}
+                     for backend in ("pi", "cursor")}
+        policy = {"review": {"prefer": ["pi", "cursor"]}}
+        self.assertEqual(xs.choose_review_backend("codex", policy, available)["backend"], "cursor")
+        with mock.patch.object(xs, "review_available", return_value=available):
+            with self.assertRaisesRegex(ValueError, "cannot be verified"):
+                xs.perform_peer_review("run-1", "pi", policy)
 
     def test_reviewer_commands_are_read_only(self):
         policy = {"pi": {"provider": "fixture"}}
