@@ -4092,6 +4092,64 @@ def run_is_read_only(*, read_only=False, card_type=None, task_type=None):
     return bool(read_only) or task_type in READ_ONLY_CARD_TYPES or card_type in READ_ONLY_CARD_TYPES
 
 
+def resolve_run_read_only(*, args, card_type=None, prof=None, rdir=None):
+    """Resolve read-only mode from CLI flags, queued run status, or profile/card type."""
+    if getattr(args, "read_only", False):
+        return True
+    if rdir:
+        status = jload(os.path.join(rdir, "status.json"), {}) or {}
+        if status.get("read_only") is True:
+            return True
+        card_type = card_type or status.get("card_type")
+        saved = status.get("profile") or {}
+        if prof is None:
+            prof = saved
+        elif saved.get("type") and getattr(args, "type", "impl") == "impl":
+            prof = {**saved, **prof}
+    prof = prof or {}
+    return run_is_read_only(read_only=False, card_type=card_type, task_type=prof.get("type"))
+
+
+def pi_read_only_tools_or_error(read_only):
+    tools = pi_tool_allowlist(read_only)
+    if not read_only:
+        return tools, None
+    if tools != PI_READ_ONLY_TOOLS:
+        return None, "pi read-only tool allowlist is misconfigured"
+    for forbidden in ("bash", "edit", "write"):
+        if forbidden in tools.split(","):
+            return None, f"pi read-only tool allowlist includes forbidden tool {forbidden}"
+    return tools, None
+
+
+def run_detached_child_argv(rid, args, title, budget_min, cwd):
+    """Build argv for a background run child; must preserve read-only and routing flags."""
+    child = [sys.executable, os.path.realpath(__file__), "run", "--run-id", rid,
+             "--cwd", os.path.abspath(cwd), "--title", title, "--budget-minutes", str(budget_min)]
+    for flag in ("type", "difficulty", "context_tokens", "backend", "model", "effort"):
+        v = getattr(args, flag, None)
+        if v:
+            child += [f"--{flag.replace('_', '-')}", str(v)]
+    for flag in ("card_type", "rework_of"):
+        v = getattr(args, flag, None)
+        if v:
+            child += [f"--{flag.replace('_', '-')}", str(v)]
+    if getattr(args, "paths", None):
+        child += ["--paths", *args.paths]
+    if getattr(args, "verify", None):
+        child += ["--verify", args.verify]
+    if getattr(args, "base", None):
+        child += ["--base", args.base]
+    if getattr(args, "verify_baseline", False):
+        child.append("--verify-baseline")
+    for flag in ("no_worktree", "keep_worktree", "no_fallback"):
+        if getattr(args, flag):
+            child.append(f"--{flag.replace('_', '-')}")
+    if getattr(args, "read_only", False):
+        child.append("--read-only")
+    return child
+
+
 def pi_usage(events_path):
     """Sum assistant `message_end` usage from a Pi `--mode json` stream. Returns (usage, final_text, errors)."""
     usage = {k: 0 for k in PI_USAGE_KEYS}
@@ -4149,7 +4207,13 @@ def exec_pi(d, st, prompt, wd, rdir, timeout, evp):
         cmd += ["--model", d["model"]]
     if d.get("_resume_session"):
         cmd.append("--continue")
-    cmd += ["--tools", pi_tool_allowlist(d.get("read_only")), prompt]
+    tools, enforce_err = pi_read_only_tools_or_error(bool(d.get("read_only")))
+    if enforce_err:
+        open(evp, "w").close()
+        with open(evp + ".err", "w") as f:
+            f.write(enforce_err + "\n")
+        return 127, None, {"usage": {k: 0 for k in PI_USAGE_KEYS}}, enforce_err
+    cmd += ["--tools", tools, prompt]
     rc = run_proc(cmd, wd, os.environ.copy(), timeout, evp)
     usage, text, errors = pi_usage(evp)
     final = extract_json(text) if isinstance(text, str) else None
@@ -4576,8 +4640,8 @@ def cmd_run(args, policy):
         jsave(f"{rdir}/result.json", out)
         print(json.dumps(out, indent=2, ensure_ascii=False))
         sys.exit(2)
-    decision["read_only"] = run_is_read_only(read_only=getattr(args, "read_only", False),
-                                             card_type=card_type, task_type=prof.get("type"))
+    decision["read_only"] = resolve_run_read_only(args=args, card_type=card_type, prof=prof,
+                                                  rdir=rdir if args.run_id else None)
     advice = routing_advice(prof, card_type, st, policy, decision)
     routing_fields = {"routing_advice": advice} if advice is not None else {}
     if args.dry_run:
@@ -4592,29 +4656,11 @@ def cmd_run(args, policy):
         set_status(rdir, state="budget_rejected")
         budget_error(error)
     if args.detach and not args.run_id:
+        read_only = resolve_run_read_only(args=args, card_type=card_type, prof=prof, rdir=rdir)
         set_status(rdir, id=rid, state="queued", title=title, profile=prof, started=NOW(),
-                   budget_minutes=budget_min, cwd=os.path.abspath(args.cwd))
-        child = [sys.executable, os.path.realpath(__file__), "run", "--run-id", rid,
-                 "--cwd", os.path.abspath(args.cwd), "--title", title, "--budget-minutes", str(budget_min)]
-        for flag in ("type", "difficulty", "context_tokens", "backend", "model", "effort"):
-            v = getattr(args, flag, None)
-            if v:
-                child += [f"--{flag.replace('_', '-')}", str(v)]
-        for flag in ("card_type", "rework_of"):
-            v = getattr(args, flag, None)
-            if v:
-                child += [f"--{flag.replace('_', '-')}", str(v)]
-        if getattr(args, "paths", None):
-            child += ["--paths", *args.paths]
-        if getattr(args, "verify", None):
-            child += ["--verify", args.verify]
-        if getattr(args, "base", None):
-            child += ["--base", args.base]
-        if getattr(args, "verify_baseline", False):
-            child.append("--verify-baseline")
-        for flag in ("no_worktree", "keep_worktree", "no_fallback"):
-            if getattr(args, flag):
-                child.append(f"--{flag.replace('_', '-')}")
+                   budget_minutes=budget_min, cwd=os.path.abspath(args.cwd),
+                   read_only=read_only, card_type=card_type)
+        child = run_detached_child_argv(rid, args, title, budget_min, args.cwd)
         with open(f"{rdir}/run.out", "w") as out:
             p = subprocess.Popen(child, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                  start_new_session=True)
@@ -4705,7 +4751,10 @@ def cmd_run(args, policy):
         if ws["mode"] == "worktree":  # discard partial edits from the failed attempt before retrying
             git(["reset", "-q", "--hard"], ws["root"])
             git(["clean", "-qfd"], ws["root"])
+        locked_read_only = decision.get("read_only")
         decision = nxt
+        if locked_read_only:
+            decision["read_only"] = True
     set_status(rdir, state="finalizing")
     st_after = probe(policy) if decision["backend"] == "codex" else st
     attempts[-1]["quota_after"] = quota_used(st_after, decision)
@@ -4714,7 +4763,7 @@ def cmd_run(args, policy):
     fin = finalize_workspace(ws, title, decision["backend"], rdir, keep=True)
     changed = changed_paths(ws.get("repo") or ws.get("path"), ws.get("base"), fin.get("commit"),
                             (result or {}).get("files_changed"))
-    read_only = getattr(args, "read_only", False) or prof.get("type") in READ_ONLY_CARD_TYPES or card_type in READ_ONLY_CARD_TYPES
+    read_only = resolve_run_read_only(args=args, card_type=card_type, prof=prof, rdir=rdir)
     read_only_output = read_only and read_only_output_exists(ws.get("path"), (result or {}).get("files_changed"))
     verify = None
     prepare_error = None
@@ -6515,7 +6564,12 @@ def lane_refresh_pi_child_for_tools(lane, child, policy, spec, event_file):
             child.close()
         except Exception:
             pass
-    new_child = LaneChild(lane, wt, policy, pi_tools=want)
+    try:
+        new_child = LaneChild(lane, wt, policy, pi_tools=want)
+    except Exception as error:
+        if want == PI_READ_ONLY_TOOLS:
+            raise RuntimeError(f"pi read-only RPC could not be started: {short(error, 300)}") from error
+        raise
     lane_write_state(lane["name"], child_pid=new_child.pid, last_error=None)
     return new_child, True
 

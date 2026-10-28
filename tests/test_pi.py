@@ -2,7 +2,8 @@
 
 Covers json event parsing, usage on result.json and the ledger, budget kill, routing opt-in.
 """
-import argparse, contextlib, io, json, os, shutil, stat, sys, tempfile, textwrap, unittest
+import argparse, contextlib, io, json, os, shutil, stat, subprocess, sys, tempfile, textwrap, unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _load  # noqa: E402
@@ -210,6 +211,71 @@ class PiBackend(unittest.TestCase):
         tools = argv[argv.index("--tools") + 1]
         self.assertEqual(tools, xs.PI_READ_ONLY_TOOLS)
         self.assertNotIn("bash", tools)
+
+    def test_exec_pi_read_only_fails_closed_when_allowlist_not_enforced(self):
+        rdir = os.path.join(self.tmp, "run-ro-fail")
+        os.makedirs(rdir)
+        evp = os.path.join(rdir, "events.jsonl")
+        with mock.patch.object(xs, "pi_tool_allowlist", return_value=xs.PI_TOOLS):
+            rc, final, _meta, err = xs.exec_pi({"backend": "pi", "model": None, "read_only": True}, {}, "review",
+                                                 self.cwd, rdir, 5, evp)
+        self.assertEqual(rc, 127)
+        self.assertIsNone(final)
+        self.assertIn("read-only", err)
+
+    def test_detach_forwards_read_only_and_child_pi_uses_read_only_tools(self):
+        open(self.log, "w").close()
+        captured = []
+        real_popen = subprocess.Popen
+
+        def capture_run_child(argv, **kwargs):
+            if "--run-id" in argv:
+                captured.append(list(argv))
+                return mock.Mock(pid=4242)
+            return real_popen(argv, **kwargs)
+
+        with mock.patch.object(xs.subprocess, "Popen", side_effect=capture_run_child), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            xs.cmd_run(ns(cwd=self.cwd, detach=True, read_only=True, backend="pi", type="impl",
+                          prompt="read-only detached review"), POLICY)
+        payload = json.loads(out.getvalue())
+        self.assertEqual(payload["state"], "started")
+        self.assertTrue(captured)
+        child_argv = captured[0]
+        self.assertIn("--read-only", child_argv)
+        open(self.log, "w").close()
+        proc = subprocess.run(child_argv, env=os.environ.copy(), cwd=self.cwd,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        self.assertEqual(proc.returncode, 0, "detached child should finish successfully")
+        with open(self.log) as fh:
+            argv = json.load(fh)
+        tools = argv[argv.index("--tools") + 1]
+        self.assertEqual(tools, xs.PI_READ_ONLY_TOOLS)
+        self.assertEqual(tools, "read,grep,find,ls")
+
+    def test_detach_child_read_only_from_status_without_cli_flag(self):
+        open(self.log, "w").close()
+        captured = []
+
+        def capture_run_child(argv, **kwargs):
+            if "--run-id" in argv:
+                captured.append(list(argv))
+                return mock.Mock(pid=4243)
+            return subprocess.Popen(argv, **kwargs)
+
+        with mock.patch.object(xs.subprocess, "Popen", side_effect=capture_run_child), \
+                contextlib.redirect_stdout(io.StringIO()):
+            xs.cmd_run(ns(cwd=self.cwd, detach=True, read_only=True, backend="pi", type="impl",
+                          prompt="persist read-only in status"), POLICY)
+        child_argv = [arg for arg in captured[0] if arg != "--read-only"]
+        self.assertNotIn("--read-only", child_argv)
+        open(self.log, "w").close()
+        proc = subprocess.run(child_argv, env=os.environ.copy(), cwd=self.cwd,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        self.assertEqual(proc.returncode, 0)
+        with open(self.log) as fh:
+            argv = json.load(fh)
+        self.assertEqual(argv[argv.index("--tools") + 1], xs.PI_READ_ONLY_TOOLS)
 
     def test_error_event_fails_the_attempt(self):
         os.environ["FAKE_PI_MODE"] = "rate"

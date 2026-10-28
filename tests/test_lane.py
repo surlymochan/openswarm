@@ -727,6 +727,25 @@ class LaneTests(unittest.TestCase):
         argv = next(row["argv"] for row in messages if row.get("type") == "startup")
         self.assertNotIn("--tools", argv)
 
+    def test_pi_lane_writable_then_read_only_restarts_rpc(self):
+        self.set_config("pi")
+        self.start_lane()
+        first = self.assign("add the fixture change")
+        self.wait_run(first)
+        log_path = pathlib.Path(self.env["FAKE_PI_RPC_LOG"])
+        writable_argv = next(row["argv"] for row in map(json.loads, log_path.read_text().splitlines())
+                             if row.get("type") == "startup")
+        self.assertNotIn("--tools", writable_argv)
+        second = self.assign("LANE_TEST_NO_CHANGE read-only follow-up", "--read-only")
+        self.wait_run(second)
+        messages = [json.loads(line) for line in log_path.read_text().splitlines()]
+        read_only_argv = next(row["argv"] for row in reversed(messages) if row.get("type") == "startup")
+        tools = read_only_argv[read_only_argv.index("--tools") + 1]
+        self.assertEqual(tools, "read,grep,find,ls")
+        events_path = self.data / "runs" / second / "events.1.pi.jsonl"
+        events = [json.loads(line) for line in events_path.read_text().splitlines()]
+        self.assertTrue(any(event.get("type") == "pi_tools_restarted" for event in events))
+
     def test_codex_io_lost_fails_run(self):
         self.start_lane()
         run_id = self.assign("LANE_TEST_IO_LOST stale shell output")
