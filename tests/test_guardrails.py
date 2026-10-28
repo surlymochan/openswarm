@@ -130,9 +130,16 @@ class GuardrailsTests(unittest.TestCase):
             self.assertIsNone(xs.enforced_risk({"type": "tool_execution_start", "args": {"command": command}}, {}, str(self.root)))
         self.assertTrue(xs.rm_outside_worktree("cd /tmp && rm -rf file", str(self.root)))
         self.assertTrue(xs.rm_outside_worktree("bash -lc 'rm -rf /outside'", str(self.root)))
-        self.assertTrue(xs.rm_outside_worktree("cd /tmp && bash -lc 'rm file'", str(self.root)))
+        self.assertTrue(xs.rm_outside_worktree("cd /var/lib && bash -lc 'rm file'", str(self.root)))
         self.assertTrue(xs.enforced_risk({"type": "tool_execution_start", "args": {"command": "bash -lc 'git push origin'"}}, {}, str(self.root)))
         self.assertEqual(xs.enforced_risk({"type": "tool_execution_start", "args": {"command": "cat .env"}}, {}, str(self.root))["risk"], "secret print")
+
+    def test_rm_guard_allows_single_scratch_files_in_tmp_only(self):
+        for command in ("rm -f /tmp/t-sqlite.ts", "rm /tmp/cjs-test.log", "cd /tmp && rm -f probe.json"):
+            self.assertFalse(xs.rm_outside_worktree(command, str(self.root)), command)
+        for command in ("rm -rf /tmp/cjs-test", "rm -r /tmp/x.log", "rm -f /tmp/*.log", "rm -f /tmp/a/b.log",
+                        "rm -f /etc/hosts", "rm -f /tmp", "rm --recursive -f /tmp/x"):
+            self.assertTrue(xs.rm_outside_worktree(command, str(self.root)), command)
 
     def test_rm_guard_accepts_worktree_subdirectories_and_executor_tmp(self):
         nested = self.root / "nested"

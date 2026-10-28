@@ -3530,6 +3530,7 @@ def rm_outside_worktree_class(command, worktree):
             continue
         operands = iter(words[1:])
         options = True
+        recursive = False
         for target in operands:
             if target in (">", ">>", "<", "<<", "2>", "2>>"):
                 next(operands, None)
@@ -3538,11 +3539,26 @@ def rm_outside_worktree_class(command, worktree):
                 options = False
                 continue
             if options and target.startswith("-"):
+                recursive = recursive or target == "--recursive" or (
+                    not target.startswith("--") and any(flag in target for flag in "rR"))
                 continue
             path_class = rm_target_path_class(target, cwd, root)
-            if path_class == "outside":
+            if path_class == "outside" and not (not recursive and is_scratch_tmp_file(target, cwd)):
                 return path_class
     return None
+
+
+SCRATCH_TMP_DIRS = ("/tmp", "/private/tmp", "/var/tmp")
+
+
+def is_scratch_tmp_file(target, cwd):
+    """A single, non-glob file directly inside /tmp: executors often clean up their own probe files there."""
+    if any(ch in target for ch in "*?[{~$"):
+        return False
+    path = os.path.normpath(os.path.join(cwd, target))
+    if os.path.dirname(path) not in SCRATCH_TMP_DIRS or os.path.basename(path) in ("", ".", ".."):
+        return False
+    return not os.path.isdir(path)
 
 
 def rm_outside_worktree(command, worktree):
