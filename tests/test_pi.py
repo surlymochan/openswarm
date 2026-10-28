@@ -59,7 +59,7 @@ def ns(**kw):
 
 class PiBackend(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="openswarm-pi-", dir="/tmp")
+        self.tmp = tempfile.mkdtemp(prefix="openswarm-pi-", dir=os.getcwd())
         self.script = os.path.join(self.tmp, "pi")
         with open(self.script, "w") as f:
             f.write(textwrap.dedent(FAKE))
@@ -182,15 +182,19 @@ class PiBackend(unittest.TestCase):
         self.assertFalse(os.path.commonpath([sessions, self.cwd]) == self.cwd)
         self.assertNotIn("--model", argv)
 
-    def test_read_only_one_shot_uses_read_only_tool_allowlist(self):
+    def test_read_only_one_shot_rejects_before_launch(self):
         code = self.dispatch(read_only=True, type="review", prompt="review only")
-        self.assertEqual(code, 0)
-        with open(self.log) as fh:
-            argv = json.load(fh)
-        tools = argv[argv.index("--tools") + 1]
-        self.assertEqual(tools, xs.PI_READ_ONLY_TOOLS)
-        for forbidden in ("bash", "edit", "write"):
-            self.assertNotIn(forbidden, tools.split(","))
+        self.assertNotEqual(code, 0)
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_read_only_failure_does_not_fallback(self):
+        policy = xs.deep_merge(POLICY, {"routing": {"default_order": ["pi", "codex", "ocgo", "deepseek"]}})
+        with mock.patch.object(xs, "fallback_forbidden_for_read_only", wraps=xs.fallback_forbidden_for_read_only) as guard:
+            self.assertNotEqual(self.dispatch(policy=policy, backend=None, read_only=True), 0)
+        guard.assert_called()
+        _, result = self.last_result()
+        self.assertEqual([attempt["backend"] for attempt in result["attempts"]], ["pi"])
+        self.assertFalse(os.path.exists(self.log))
 
     def test_writable_one_shot_keeps_full_tool_allowlist(self):
         rdir = os.path.join(self.tmp, "run")
@@ -205,12 +209,12 @@ class PiBackend(unittest.TestCase):
         rdir = os.path.join(self.tmp, "run-ro")
         os.makedirs(rdir)
         evp = os.path.join(rdir, "events.jsonl")
-        xs.exec_pi({"backend": "pi", "model": None, "read_only": True}, {}, "review", self.cwd, rdir, 5, evp)
-        with open(self.log) as fh:
-            argv = json.load(fh)
-        tools = argv[argv.index("--tools") + 1]
-        self.assertEqual(tools, xs.PI_READ_ONLY_TOOLS)
-        self.assertNotIn("bash", tools)
+        with mock.patch.object(xs, "pi_tool_allowlist", return_value=xs.PI_TOOLS):
+            rc, _, _, err = xs.exec_pi({"backend": "pi", "model": None, "read_only": True}, {},
+                                        "review", self.cwd, rdir, 5, evp)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("misconfigured", err)
+        self.assertFalse(os.path.exists(self.log))
 
     def test_exec_pi_read_only_fails_closed_when_allowlist_not_enforced(self):
         rdir = os.path.join(self.tmp, "run-ro-fail")
@@ -223,7 +227,7 @@ class PiBackend(unittest.TestCase):
         self.assertIsNone(final)
         self.assertIn("read-only", err)
 
-    def test_detach_forwards_read_only_and_child_pi_uses_read_only_tools(self):
+    def test_detach_forwards_read_only_and_child_rejects(self):
         open(self.log, "w").close()
         captured = []
         real_popen = subprocess.Popen
@@ -246,12 +250,8 @@ class PiBackend(unittest.TestCase):
         open(self.log, "w").close()
         proc = subprocess.run(child_argv, env=os.environ.copy(), cwd=self.cwd,
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
-        self.assertEqual(proc.returncode, 0, "detached child should finish successfully")
-        with open(self.log) as fh:
-            argv = json.load(fh)
-        tools = argv[argv.index("--tools") + 1]
-        self.assertEqual(tools, xs.PI_READ_ONLY_TOOLS)
-        self.assertEqual(tools, "read,grep,find,ls")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(os.path.getsize(self.log), 0)
 
     def test_detach_child_read_only_from_status_without_cli_flag(self):
         open(self.log, "w").close()
@@ -272,10 +272,8 @@ class PiBackend(unittest.TestCase):
         open(self.log, "w").close()
         proc = subprocess.run(child_argv, env=os.environ.copy(), cwd=self.cwd,
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
-        self.assertEqual(proc.returncode, 0)
-        with open(self.log) as fh:
-            argv = json.load(fh)
-        self.assertEqual(argv[argv.index("--tools") + 1], xs.PI_READ_ONLY_TOOLS)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(os.path.getsize(self.log), 0)
 
     def test_error_event_fails_the_attempt(self):
         os.environ["FAKE_PI_MODE"] = "rate"

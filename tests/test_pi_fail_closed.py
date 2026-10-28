@@ -1,5 +1,7 @@
 """Host-only checks for Pi's unverified capability boundary."""
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -10,6 +12,27 @@ xs = _load.load()
 
 
 class PiFailClosed(unittest.TestCase):
+    def test_kill_tree_stops_process_and_descendant(self):
+        code = ("import signal, subprocess, sys, time\n"
+                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                "def stop(*args):\n child.terminate(); child.wait(); sys.exit(0)\n"
+                "signal.signal(signal.SIGTERM, stop)\n"
+                "print(child.pid, flush=True)\n"
+                "time.sleep(60)\n")
+        proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE,
+                                text=True, start_new_session=True)
+        try:
+            child_pid = int(proc.stdout.readline())
+            xs.kill_tree(proc.pid, grace=0.2)
+            proc.wait(timeout=3)
+            self.assertFalse(xs.pid_alive(proc.pid))
+            self.assertFalse(xs.pid_alive(child_pid))
+        finally:
+            if proc.poll() is None:
+                xs.kill_tree(proc.pid, grace=0.2)
+                proc.wait(timeout=3)
+            proc.stdout.close()
+
     def test_read_only_never_launches_one_shot(self):
         with tempfile.TemporaryDirectory(dir=os.getcwd()) as run:
             event = os.path.join(run, "events")
@@ -35,6 +58,26 @@ class PiFailClosed(unittest.TestCase):
         with mock.patch.object(xs, "lane_root", return_value="."), mock.patch.object(xs, "LaneChild") as launch:
             with self.assertRaisesRegex(RuntimeError, "did not terminate"):
                 xs.lane_refresh_pi_child_for_tools({"backend": "pi", "name": "a"}, child, {}, {}, None)
+        launch.assert_not_called()
+
+    def test_lane_start_failure_does_not_return_replacement(self):
+        child = mock.Mock(pi_tools="old")
+        child.alive.return_value = False
+        with mock.patch.object(xs, "lane_root", return_value="."), \
+             mock.patch.object(xs, "LaneChild", side_effect=OSError("startup failed")) as launch, \
+             mock.patch.object(xs, "lane_write_state") as state:
+            with self.assertRaisesRegex(OSError, "startup failed"):
+                xs.lane_refresh_pi_child_for_tools({"backend": "pi", "name": "a"}, child, {}, {}, None)
+        child.close.assert_called_once()
+        launch.assert_called_once()
+        state.assert_not_called()
+
+    def test_read_only_card_type_also_rejects_live_child(self):
+        child = mock.Mock(pi_tools=None)
+        with mock.patch.object(xs, "LaneChild") as launch:
+            with self.assertRaisesRegex(RuntimeError, "cannot be verified"):
+                xs.lane_refresh_pi_child_for_tools({"backend": "pi"}, child, {}, {"card_type": "review"}, None)
+        child.close.assert_not_called()
         launch.assert_not_called()
 
     def test_executor_startup_exception_is_recorded(self):

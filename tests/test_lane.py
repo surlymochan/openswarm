@@ -701,22 +701,19 @@ class LaneTests(unittest.TestCase):
         self.assertEqual(result["status"], "done")
         self.assertIsNone(result["commit"])
 
-    def test_pi_read_only_lane_restarts_rpc_with_read_only_tools(self):
+    def test_pi_read_only_lane_rejects_without_prompt(self):
         self.set_config("pi")
         self.start_lane()
+        self.wait_for(lambda: pathlib.Path(self.env["FAKE_PI_RPC_LOG"]).exists(), description="Pi startup log")
         run_id = self.assign("LANE_TEST_NO_CHANGE read-only review", "--read-only")
         state = self.wait_run(run_id)
         result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
-        self.assertEqual(state["status"], "done")
-        self.assertEqual(result["status"], "done")
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(result["status"], "failed")
         messages = [json.loads(line) for line in pathlib.Path(self.env["FAKE_PI_RPC_LOG"]).read_text().splitlines()]
         startups = [row for row in messages if row.get("type") == "startup"]
-        self.assertTrue(startups)
-        argv = startups[-1]["argv"]
-        self.assertIn("--tools", argv)
-        tools = argv[argv.index("--tools") + 1]
-        self.assertEqual(tools, "read,grep,find,ls")
-        self.assertNotIn("bash", tools.split(","))
+        self.assertEqual(len(startups), 1)
+        self.assertFalse(any(row.get("type") == "prompt" for row in messages))
 
     def test_pi_writable_lane_rpc_keeps_default_tools(self):
         self.set_config("pi")
@@ -727,7 +724,7 @@ class LaneTests(unittest.TestCase):
         argv = next(row["argv"] for row in messages if row.get("type") == "startup")
         self.assertNotIn("--tools", argv)
 
-    def test_pi_lane_writable_then_read_only_restarts_rpc(self):
+    def test_pi_lane_writable_then_read_only_does_not_prompt(self):
         self.set_config("pi")
         self.start_lane()
         first = self.assign("add the fixture change")
@@ -737,14 +734,11 @@ class LaneTests(unittest.TestCase):
                              if row.get("type") == "startup")
         self.assertNotIn("--tools", writable_argv)
         second = self.assign("LANE_TEST_NO_CHANGE read-only follow-up", "--read-only")
-        self.wait_run(second)
+        state = self.wait_run(second)
+        self.assertEqual(state["status"], "failed")
         messages = [json.loads(line) for line in log_path.read_text().splitlines()]
-        read_only_argv = next(row["argv"] for row in reversed(messages) if row.get("type") == "startup")
-        tools = read_only_argv[read_only_argv.index("--tools") + 1]
-        self.assertEqual(tools, "read,grep,find,ls")
-        events_path = self.data / "runs" / second / "events.1.pi.jsonl"
-        events = [json.loads(line) for line in events_path.read_text().splitlines()]
-        self.assertTrue(any(event.get("type") == "pi_tools_restarted" for event in events))
+        self.assertEqual(sum(row.get("type") == "startup" for row in messages), 1)
+        self.assertFalse(any("read-only follow-up" in row.get("message", "") for row in messages))
 
     def test_codex_io_lost_fails_run(self):
         self.start_lane()

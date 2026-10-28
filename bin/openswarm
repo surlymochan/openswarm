@@ -4195,8 +4195,8 @@ def pi_usage(events_path):
 def exec_pi(d, st, prompt, wd, rdir, timeout, evp):
     """pi -p --mode json [--provider P] [--model M] --tools <allowlist> <prompt>
 
-    Writable runs use PI_TOOLS; read-only runs use PI_READ_ONLY_TOOLS only. Tool allowlists are not an OS
-    sandbox — prompt injection or bugs in permitted tools can still cause harm.
+    Writable runs use PI_TOOLS. Read-only runs are rejected until effective capabilities can be verified
+    before prompting; tool allowlists are not an OS sandbox.
 
     stdin is /dev/null (run_proc) and cwd is the worktree. Quota is unknown; usage is summed from message_end events.
     """
