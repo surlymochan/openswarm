@@ -3510,7 +3510,7 @@ def executor_worktree_root(path):
     return path
 
 
-def configure_executor_environment(worktree, env=None):
+def _configure_executor_environment(worktree, env=None):
     """Create and locally exclude the executor temp directory, returning its path and environment."""
     root = executor_worktree_root(worktree)
     tmp_root = os.path.join(root, ".openswarm-tmp")
@@ -3519,8 +3519,18 @@ def configure_executor_environment(worktree, env=None):
     os.makedirs(tmp_root, exist_ok=True)
     with os.scandir(tmp_root) as entries:
         for entry in entries:
-            if entry.is_dir(follow_symlinks=False) and os.path.exists(os.path.join(entry.path, "quarantine.json")):
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            if os.path.exists(os.path.join(entry.path, "quarantine.json")):
                 raise TerminationUnconfirmed(TERMINATION_UNCONFIRMED_ERROR)
+            active = os.path.join(entry.path, ".active")
+            if os.path.exists(active):
+                with open(active, "r") as held:
+                    try:
+                        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        continue
+                    raise TerminationUnconfirmed(TERMINATION_UNCONFIRMED_ERROR)
     tmpdir = tempfile.mkdtemp(prefix="invocation-", dir=tmp_root)
 
     try:
@@ -3545,6 +3555,23 @@ def configure_executor_environment(worktree, env=None):
     for name in ("TMPDIR", "TMP", "TEMP"):
         executor_env[name] = tmpdir
     return tmpdir, executor_env
+
+
+@contextlib.contextmanager
+def executor_admission_gate(worktree):
+    root = executor_worktree_root(worktree)
+    tmp_root = os.path.join(root, ".openswarm-tmp")
+    if os.path.lexists(tmp_root) and (os.path.islink(tmp_root) or not os.path.isdir(tmp_root)):
+        raise ExecutorStartError("executor temp root is not a directory")
+    os.makedirs(tmp_root, exist_ok=True)
+    with open(os.path.join(tmp_root, ".admission.lock"), "a") as gate:
+        fcntl.flock(gate, fcntl.LOCK_EX)
+        yield
+
+
+def configure_executor_environment(worktree, env=None):
+    with executor_admission_gate(worktree):
+        return _configure_executor_environment(worktree, env)
 
 
 def cleanup_executor_tmp(tmpdir):
@@ -3762,26 +3789,56 @@ def read_executor_capture(out_path, structured_output_path=None):
 
 
 def run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
-    tmpdir, env = configure_executor_environment(cwd, env)
+    with executor_admission_gate(cwd):
+        tmpdir, env = _configure_executor_environment(cwd, env)
+        try:
+            active = open(os.path.join(tmpdir, ".active"), "w")
+            fcntl.flock(active, fcntl.LOCK_EX)
+            active.write(json.dumps({"output": os.path.abspath(out_path)}))
+            active.flush()
+            os.fsync(active.fileno())
+            for path in (tmpdir, os.path.dirname(tmpdir)):
+                directory = os.open(path, os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+        except BaseException:
+            cleanup_executor_tmp(tmpdir)
+            raise
     try:
         result = _run_proc(cmd, cwd, env, timeout, out_path, abort_re)
     except TerminationUnconfirmed:
-        marker = os.path.join(tmpdir, "quarantine.json")
-        with open(marker, "w", encoding="utf-8") as stream:
-            json.dump({"error_class": "termination_unconfirmed", "output": os.path.abspath(out_path)}, stream)
-            stream.flush()
-            os.fsync(stream.fileno())
-        for path in (tmpdir, os.path.dirname(tmpdir)):
-            directory = os.open(path, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+        try:
+            with executor_admission_gate(cwd):
+                try:
+                    marker = os.path.join(tmpdir, "quarantine.json")
+                    with open(marker, "w", encoding="utf-8") as stream:
+                        json.dump({"error_class": "termination_unconfirmed", "output": os.path.abspath(out_path)}, stream)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    for path in (tmpdir, os.path.dirname(tmpdir)):
+                        directory = os.open(path, os.O_RDONLY)
+                        try:
+                            os.fsync(directory)
+                        finally:
+                            os.close(directory)
+                except OSError:
+                    # The unlocked active record is itself a persistent fail-closed marker.
+                    pass
+                finally:
+                    active.close()
+        except OSError:
+            active.close()
         raise
     except BaseException:
-        cleanup_executor_tmp(tmpdir)
+        with executor_admission_gate(cwd):
+            cleanup_executor_tmp(tmpdir)
+            active.close()
         raise
-    cleanup_executor_tmp(tmpdir)
+    with executor_admission_gate(cwd):
+        cleanup_executor_tmp(tmpdir)
+        active.close()
     return result
 
 
@@ -3804,14 +3861,45 @@ def terminate_executor(p, grace=3, observed=None):
 
 def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
     """Run an executor. abort_re: pattern that, once seen in stderr, means the executor will only retry
-    silently (e.g. opencode on a plan usage limit) — kill it early and return 75 so the caller can fall back."""
+    silently (e.g. opencode on a plan usage limit) — kill it early and return completed(75) so the caller can fall back."""
     rdir = os.path.dirname(out_path)
     with open(out_path, "w") as out, open(out_path + ".err", "w") as err:
         try:
-            p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=out, stderr=err, stdin=subprocess.DEVNULL,
+            p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
                                  start_new_session=True)
         except OSError as error:
             raise ExecutorStartError(str(error)) from error
+        overflow = threading.Event()
+        def capture(source, path):
+            total = 0
+            try:
+                with open(path, "ab", buffering=0) as target:
+                    while True:
+                        chunk = source.read1(65536)
+                        if not chunk:
+                            break
+                        remaining = max(0, 1024 * 1024 - total)
+                        target.write(chunk[:remaining])
+                        total += len(chunk)
+                        if total > 1024 * 1024:
+                            overflow.set()
+                            break
+            except (OSError, ValueError):
+                overflow.set()
+            finally:
+                source.close()
+        readers = [threading.Thread(target=capture, args=(source, path), daemon=True)
+                   for source, path in ((p.stdout, out_path), (p.stderr, out_path + ".err"))]
+        for reader in readers:
+            reader.start()
+        def completed(code):
+            for reader in readers:
+                reader.join(timeout=0.5)
+            if any(reader.is_alive() for reader in readers):
+                raise TerminationUnconfirmed(TERMINATION_UNCONFIRMED_ERROR)
+            if overflow.is_set():
+                raise RuntimeError("executor output exceeds capture limit")
+            return code
         try:
             set_status(rdir, executor_pid=p.pid, events=out_path, attempt_started=NOW())
             end = NOW() + timeout
@@ -3822,6 +3910,11 @@ def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
             while True:
                 observed.update(descendants(p.pid))
                 done = p.poll() is not None
+                if done:
+                    for reader in readers:
+                        reader.join(timeout=0.1)
+                if overflow.is_set():
+                    raise RuntimeError("executor output exceeds capture limit")
                 with open(out_path, errors="replace") as events:
                     events.seek(offset)
                     chunk = events.read(65536)
@@ -3843,26 +3936,25 @@ def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
                     if isinstance(event, dict):
                         io_streak, lost = codex_track_io_lost(io_streak, event)
                         if lost:
-                            with open(out_path, "a") as ev:
-                                ev.write(json.dumps({"type": "error", "error": lost, "streak": io_streak},
-                                                    ensure_ascii=False) + "\n")
+                            # The capture is bounded even when the monitor emits an error.
+                            # Status carries the diagnostic; do not append to the capture file.
                             set_status(rdir, last_error="codex shell returned exit 0 with empty output repeatedly")
                             if not terminate_executor(p, grace=0.1, observed=observed):
                                 raise TerminationUnconfirmed("observed executor termination unconfirmed; workspace quarantined")
-                            return 134
+                            return completed(134)
                     if block:
                         set_status(rdir, risk_blocks=[block], stop_requested=True)
                         if not terminate_executor(p, grace=0.1, observed=observed):
                             raise TerminationUnconfirmed("observed executor termination unconfirmed; workspace quarantined")
-                        return 133
+                        return completed(133)
                 if done and not chunk:
                     if not terminate_executor(p, grace=0.1, observed=observed):
                         raise TerminationUnconfirmed("observed executor termination unconfirmed; workspace quarantined")
-                    return p.returncode
+                    return completed(p.returncode)
                 if NOW() >= end:
                     if not terminate_executor(p, observed=observed):
                         raise TerminationUnconfirmed("observed executor termination unconfirmed; workspace quarantined")
-                    return 124
+                    return completed(124)
                 if abort_re is not None:
                     try:
                         with open(out_path + ".err", errors="ignore") as f:
@@ -3870,7 +3962,7 @@ def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
                             if abort_re.search(f.read()):
                                 if not terminate_executor(p, observed=observed):
                                     raise TerminationUnconfirmed("observed executor termination unconfirmed; workspace quarantined")
-                                return 75
+                                return completed(75)
                     except OSError:
                         pass
                 time.sleep(0.05)
@@ -5244,11 +5336,14 @@ def invoke_reviewer(reviewer, prompt, repo, rdir, policy):
                 rc = run_proc(command, repo, os.environ.copy(), timeout, evp)
             except TerminationUnconfirmed:
                 preserve_scratch = True
-                quarantine_executor_workspace(rdir, context="peer_review")
                 stdout, stderr = read_executor_capture(evp, file_output)
                 raw = stdout or stderr
                 raw_attempts.append(f"--- attempt {attempt} ---\n{raw}"
                                     + (f"\n[stderr]\n{stderr}" if stderr else ""))
+                try:
+                    quarantine_executor_workspace(rdir, context="peer_review")
+                except OSError:
+                    pass
                 raise
             except ExecutorStartError as error:
                 raise RuntimeError(f"reviewer could not start: {error}") from error

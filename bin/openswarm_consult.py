@@ -301,13 +301,16 @@ def _ask_one(core, profile, prompt, run_dir, deadline, policy, reservation_id):
             try:
                 rc = core.run_proc(command, profile["cwd"], os.environ.copy(), remaining, evp)
             except core.TerminationUnconfirmed:
-                core.quarantine_executor_workspace(run_dir, context="consult")
                 stdout, stderr = core.read_executor_capture(evp, file_output)
                 stdout, stderr = _decode_output(stdout), _decode_output(stderr)
                 raw = _response_text(profile["backend"], stdout, file_output) or stderr
                 raw_attempts.append(f"--- attempt {attempt} ---\n{raw}"
                                     + (f"\n[stderr]\n{stderr}" if stderr else ""))
                 row["raw"] = "\n\n".join(raw_attempts)
+                try:
+                    core.quarantine_executor_workspace(run_dir, context="consult")
+                except OSError:
+                    pass
                 row["error"] = core.TERMINATION_UNCONFIRMED_ERROR
                 row["quarantined"] = True
                 return row

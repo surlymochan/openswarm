@@ -222,6 +222,19 @@ class PeerReviewTests(unittest.TestCase):
         self.assertIn("denied_actions", raw)
         self.assertIn("permission denied", raw)
 
+    def test_quarantine_marker_failure_still_preserves_review_evidence(self):
+        def uncertain(cmd, cwd, env, timeout, out_path):
+            Path(out_path).write_text("partial evidence")
+            raise xs.TerminationUnconfirmed("uncertain")
+        with mock.patch.object(xs, "run_proc", side_effect=uncertain), \
+             mock.patch.object(xs, "quarantine_executor_workspace", side_effect=OSError("disk failure")):
+            with self.assertRaises(xs.TerminationUnconfirmed):
+                xs.invoke_reviewer({"backend": "agy", "binary": "/fake/agy"}, "review", str(self.repo),
+                                   str(self.run_dir), {})
+        self.assertIn("partial evidence", (self.run_dir / "review.raw.txt").read_text())
+        scratch, = self.run_dir.glob(".peer-review-*")
+        self.assertEqual((scratch / "events-1").read_text(), "partial evidence")
+
     def test_unconfirmed_termination_quarantines_run_dir_and_preserves_raw(self):
         def fake_run_proc(cmd, cwd, env, timeout, out_path):
             with open(out_path, "w", encoding="utf-8") as stream:

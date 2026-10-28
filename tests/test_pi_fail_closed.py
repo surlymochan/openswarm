@@ -1,5 +1,7 @@
 """Host-only checks for Pi's unverified capability boundary."""
 import os
+import io
+import builtins
 from pathlib import Path
 import subprocess
 import sys
@@ -55,6 +57,70 @@ class PiFailClosed(unittest.TestCase):
                     xs.run_proc(["later"], run, {}, 1, os.path.join(run, "later"))
                 launch.assert_not_called()
 
+    def test_flood_capture_limits_both_files(self):
+        for fd in (1, 2):
+            with self.subTest(fd=fd), tempfile.TemporaryDirectory(dir=os.getcwd()) as run:
+                code = f"import os; os.write({fd}, b'x' * 4000000)"
+                with self.assertRaisesRegex(RuntimeError, "output exceeds"):
+                    xs.run_proc([sys.executable, "-c", code], run, os.environ.copy(), 10,
+                                os.path.join(run, "events"))
+                for suffix in ("", ".err"):
+                    self.assertLessEqual(os.path.getsize(os.path.join(run, "events" + suffix)), 1024 * 1024)
+                self.assertFalse(list(Path(run, ".openswarm-tmp").glob("invocation-*")))
+
+    def test_admission_waits_for_quarantine_transition(self):
+        with tempfile.TemporaryDirectory(dir=os.getcwd()) as run, \
+             mock.patch.object(xs, "executor_worktree_root", return_value=run), \
+             mock.patch.object(xs, "git", return_value=(1, "", "")):
+            writing, release, admitted = threading.Event(), threading.Event(), threading.Event()
+            errors = []
+            real_dump = xs.json.dump
+            def delayed_dump(*args, **kwargs):
+                writing.set()
+                self.assertTrue(release.wait(5))
+                return real_dump(*args, **kwargs)
+            def invoke(name):
+                try:
+                    xs.run_proc([name], run, {}, 1, os.path.join(run, name))
+                except xs.TerminationUnconfirmed:
+                    errors.append(name)
+            def execute(cmd, *args):
+                if cmd[0] == "first":
+                    raise xs.TerminationUnconfirmed("uncertain")
+                admitted.set()
+                return 0
+            with mock.patch.object(xs, "_run_proc", side_effect=execute), \
+                 mock.patch.object(xs.json, "dump", side_effect=delayed_dump):
+                first = threading.Thread(target=invoke, args=("first",))
+                first.start()
+                self.assertTrue(writing.wait(5))
+                second = threading.Thread(target=invoke, args=("second",))
+                second.start()
+                self.assertFalse(admitted.wait(0.1))
+                release.set()
+                first.join(5)
+                second.join(5)
+            self.assertFalse(first.is_alive() or second.is_alive())
+            self.assertCountEqual(errors, ["first", "second"])
+            self.assertFalse(admitted.is_set())
+
+    def test_marker_failure_leaves_fail_closed_active_record(self):
+        with tempfile.TemporaryDirectory(dir=os.getcwd()) as run, \
+             mock.patch.object(xs, "executor_worktree_root", return_value=run), \
+             mock.patch.object(xs, "git", return_value=(1, "", "")), \
+             mock.patch.object(xs, "_run_proc", side_effect=xs.TerminationUnconfirmed("uncertain")):
+            real_open = builtins.open
+            def fail_marker(path, *args, **kwargs):
+                if str(path).endswith("quarantine.json"):
+                    raise OSError("disk failure")
+                return real_open(path, *args, **kwargs)
+            with mock.patch("builtins.open", side_effect=fail_marker), self.assertRaises(xs.TerminationUnconfirmed):
+                xs.run_proc(["first"], run, {}, 1, os.path.join(run, "events"))
+            records = list(Path(run, ".openswarm-tmp").glob("invocation-*/.active"))
+            self.assertEqual(len(records), 1)
+            with self.assertRaises(xs.TerminationUnconfirmed):
+                xs.run_proc(["second"], run, {}, 1, os.path.join(run, "events2"))
+
     def test_capture_is_bounded(self):
         with tempfile.TemporaryDirectory(dir=os.getcwd()) as run:
             output = Path(run, "events")
@@ -66,6 +132,7 @@ class PiFailClosed(unittest.TestCase):
             entered, release, terminated = threading.Event(), threading.Event(), threading.Event()
             proc = mock.Mock(pid=123, returncode=0)
             proc.poll.return_value = None
+            proc.stdout, proc.stderr = io.BytesIO(), io.BytesIO()
             result = []
             def discover(pid):
                 entered.set()
