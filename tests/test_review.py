@@ -233,8 +233,16 @@ class PeerReviewTests(unittest.TestCase):
                 xs.invoke_reviewer({"backend": "agy", "binary": "/fake/agy"}, "review", str(self.repo),
                                    str(self.run_dir), {})
         self.assertTrue((self.run_dir / "quarantine.json").is_file())
+        scratch = list(self.run_dir.glob(".peer-review-*"))
+        self.assertEqual(len(scratch), 1)
+        self.assertEqual((scratch[0] / "events-1").read_text(), "partial output")
         raw = (self.run_dir / "review.raw.txt").read_text(encoding="utf-8")
         self.assertIn("partial output", raw)
+        with mock.patch.object(xs, "run_proc") as launch:
+            with self.assertRaises(xs.TerminationUnconfirmed):
+                xs.invoke_reviewer({"backend": "agy", "binary": "/fake/agy"}, "review", str(self.repo),
+                                   str(self.run_dir), {})
+            launch.assert_not_called()
 
 
 if __name__ == "__main__":

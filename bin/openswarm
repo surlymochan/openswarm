@@ -3513,13 +3513,15 @@ def executor_worktree_root(path):
 def configure_executor_environment(worktree, env=None):
     """Create and locally exclude the executor temp directory, returning its path and environment."""
     root = executor_worktree_root(worktree)
-    tmpdir = os.path.join(root, ".openswarm-tmp")
-    if os.path.lexists(tmpdir) and (os.path.islink(tmpdir) or not os.path.isdir(tmpdir)):
-        if os.path.isdir(tmpdir) and not os.path.islink(tmpdir):
-            shutil.rmtree(tmpdir)
-        else:
-            os.unlink(tmpdir)
-    os.makedirs(tmpdir, exist_ok=True)
+    tmp_root = os.path.join(root, ".openswarm-tmp")
+    if os.path.lexists(tmp_root) and (os.path.islink(tmp_root) or not os.path.isdir(tmp_root)):
+        raise ExecutorStartError("executor temp root is not a directory")
+    os.makedirs(tmp_root, exist_ok=True)
+    with os.scandir(tmp_root) as entries:
+        for entry in entries:
+            if entry.is_dir(follow_symlinks=False) and os.path.exists(os.path.join(entry.path, "quarantine.json")):
+                raise TerminationUnconfirmed(TERMINATION_UNCONFIRMED_ERROR)
+    tmpdir = tempfile.mkdtemp(prefix="invocation-", dir=tmp_root)
 
     try:
         rc, exclude, _ = git(["rev-parse", "--git-path", "info/exclude"], root)
@@ -3545,12 +3547,9 @@ def configure_executor_environment(worktree, env=None):
     return tmpdir, executor_env
 
 
-def cleanup_executor_tmp(worktree):
-    tmpdir = os.path.join(executor_worktree_root(worktree), ".openswarm-tmp")
-    if os.path.islink(tmpdir):
-        os.unlink(tmpdir)
-    else:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+def cleanup_executor_tmp(tmpdir):
+    """Remove only the invocation directory owned by this call."""
+    shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def rm_target_path_class(target, cwd, root):
@@ -3745,33 +3744,44 @@ def read_executor_capture(out_path, structured_output_path=None):
     stdout, stderr = "", ""
     try:
         with open(out_path, encoding="utf-8", errors="replace") as stream:
-            stdout = stream.read()
+            stdout = stream.read(1024 * 1024)
     except OSError:
         pass
     try:
         with open(out_path + ".err", encoding="utf-8", errors="replace") as stream:
-            stderr = stream.read()
+            stderr = stream.read(1024 * 1024)
     except OSError:
         pass
     if structured_output_path and os.path.isfile(structured_output_path):
         try:
             with open(structured_output_path, encoding="utf-8") as stream:
-                stdout = stream.read()
+                stdout = stream.read(1024 * 1024)
         except OSError:
             pass
     return stdout, stderr
 
 
 def run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
-    _tmpdir, env = configure_executor_environment(cwd, env)
+    tmpdir, env = configure_executor_environment(cwd, env)
     try:
         result = _run_proc(cmd, cwd, env, timeout, out_path, abort_re)
     except TerminationUnconfirmed:
+        marker = os.path.join(tmpdir, "quarantine.json")
+        with open(marker, "w", encoding="utf-8") as stream:
+            json.dump({"error_class": "termination_unconfirmed", "output": os.path.abspath(out_path)}, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        for path in (tmpdir, os.path.dirname(tmpdir)):
+            directory = os.open(path, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
         raise
     except BaseException:
-        cleanup_executor_tmp(cwd)
+        cleanup_executor_tmp(tmpdir)
         raise
-    cleanup_executor_tmp(cwd)
+    cleanup_executor_tmp(tmpdir)
     return result
 
 
@@ -3814,11 +3824,14 @@ def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
                 done = p.poll() is not None
                 with open(out_path, errors="replace") as events:
                     events.seek(offset)
-                    pending += events.read()
+                    chunk = events.read(65536)
+                    pending += chunk
                     offset = events.tell()
                 lines = pending.split("\n")
                 pending = lines.pop()
-                if done and pending:
+                if len(pending) > 1024 * 1024 or any(len(line) > 1024 * 1024 for line in lines):
+                    raise RuntimeError("executor event exceeds output limit")
+                if done and not chunk and pending:
                     lines.append(pending)
                     pending = ""
                 for line in lines:
@@ -3842,7 +3855,7 @@ def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
                         if not terminate_executor(p, grace=0.1, observed=observed):
                             raise TerminationUnconfirmed("observed executor termination unconfirmed; workspace quarantined")
                         return 133
-                if done:
+                if done and not chunk:
                     if not terminate_executor(p, grace=0.1, observed=observed):
                         raise TerminationUnconfirmed("observed executor termination unconfirmed; workspace quarantined")
                     return p.returncode
@@ -5196,7 +5209,11 @@ def redact_review_raw(value):
 
 def invoke_reviewer(reviewer, prompt, repo, rdir, policy):
     os.makedirs(rdir, exist_ok=True)
+    if os.path.exists(os.path.join(rdir, "quarantine.json")):
+        raise TerminationUnconfirmed(TERMINATION_UNCONFIRMED_ERROR)
     raw_attempts = []
+    scratch_dir = tempfile.mkdtemp(prefix=".peer-review-", dir=rdir)
+    preserve_scratch = False
 
     def save_raw():
         path = os.path.join(rdir, "review.raw.txt")
@@ -5204,57 +5221,59 @@ def invoke_reviewer(reviewer, prompt, repo, rdir, policy):
             stream.write(redact_review_raw("\n\n".join(raw_attempts)))
 
     try:
-        with tempfile.TemporaryDirectory(prefix=".peer-review-", dir=rdir) as scratch_dir:
-            timeout = review_settings(policy).get("timeout_seconds", 900)
-            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
-                raise ValueError("review.timeout_seconds must be positive")
-            retries = review_settings(policy).get("max_retries", 1)
-            if isinstance(retries, bool) or not isinstance(retries, int) or retries not in (0, 1):
-                raise ValueError("review.max_retries must be 0 or 1")
-            repair_prompt = (prompt + "\n\nYour previous response did not match the required findings schema. "
-                             "Return only JSON, with no prose or markdown, using exactly this shape: "
-                             + json.dumps(REVIEW_FINDINGS_SCHEMA, ensure_ascii=False))
-            prompts = (prompt, repair_prompt)[:retries + 1]
-            for attempt, active_prompt in enumerate(prompts, start=1):
-                output_path = os.path.join(scratch_dir, "review-response.json")
-                try:
-                    os.unlink(output_path)
-                except FileNotFoundError:
-                    pass
-                command = review_command(reviewer, active_prompt, repo, scratch_dir, policy)
-                evp = os.path.join(scratch_dir, f"events-{attempt}")
-                file_output = output_path if reviewer.get("backend") == "codex" else None
-                try:
-                    rc = run_proc(command, repo, os.environ.copy(), timeout, evp)
-                except TerminationUnconfirmed:
-                    stdout, stderr = read_executor_capture(evp, file_output)
-                    raw = stdout or stderr
-                    raw_attempts.append(f"--- attempt {attempt} ---\n{raw}"
-                                        + (f"\n[stderr]\n{stderr}" if stderr else ""))
-                    quarantine_executor_workspace(rdir, context="peer_review")
-                    raise
-                except ExecutorStartError as error:
-                    raise RuntimeError(f"reviewer could not start: {error}") from error
+        timeout = review_settings(policy).get("timeout_seconds", 900)
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+            raise ValueError("review.timeout_seconds must be positive")
+        retries = review_settings(policy).get("max_retries", 1)
+        if isinstance(retries, bool) or not isinstance(retries, int) or retries not in (0, 1):
+            raise ValueError("review.max_retries must be 0 or 1")
+        repair_prompt = (prompt + "\n\nYour previous response did not match the required findings schema. "
+                         "Return only JSON, with no prose or markdown, using exactly this shape: "
+                         + json.dumps(REVIEW_FINDINGS_SCHEMA, ensure_ascii=False))
+        prompts = (prompt, repair_prompt)[:retries + 1]
+        for attempt, active_prompt in enumerate(prompts, start=1):
+            output_path = os.path.join(scratch_dir, "review-response.json")
+            try:
+                os.unlink(output_path)
+            except FileNotFoundError:
+                pass
+            command = review_command(reviewer, active_prompt, repo, scratch_dir, policy)
+            evp = os.path.join(scratch_dir, f"events-{attempt}")
+            file_output = output_path if reviewer.get("backend") == "codex" else None
+            try:
+                rc = run_proc(command, repo, os.environ.copy(), timeout, evp)
+            except TerminationUnconfirmed:
+                preserve_scratch = True
+                quarantine_executor_workspace(rdir, context="peer_review")
                 stdout, stderr = read_executor_capture(evp, file_output)
                 raw = stdout or stderr
                 raw_attempts.append(f"--- attempt {attempt} ---\n{raw}"
                                     + (f"\n[stderr]\n{stderr}" if stderr else ""))
-                if rc == 124:
-                    raise RuntimeError(f"reviewer timed out after {timeout}s")
-                if rc:
-                    detail = bus_redact((stderr or raw).strip())[-500:]
-                    raise RuntimeError(f"reviewer exited with status {rc}"
-                                       + (f": {detail}" if detail else ""))
-                execution_error = review_execution_error(raw, stderr)
-                if execution_error:
-                    raise RuntimeError(execution_error)
-                payload = review_payload_from_text(raw)
-                if payload is not None:
-                    return payload
-                if attempt > retries:
-                    suffix = " after repair retry" if retries else ""
-                    raise RuntimeError(f"reviewer returned no findings JSON{suffix}")
+                raise
+            except ExecutorStartError as error:
+                raise RuntimeError(f"reviewer could not start: {error}") from error
+            stdout, stderr = read_executor_capture(evp, file_output)
+            raw = stdout or stderr
+            raw_attempts.append(f"--- attempt {attempt} ---\n{raw}"
+                                + (f"\n[stderr]\n{stderr}" if stderr else ""))
+            if rc == 124:
+                raise RuntimeError(f"reviewer timed out after {timeout}s")
+            if rc:
+                detail = bus_redact((stderr or raw).strip())[-500:]
+                raise RuntimeError(f"reviewer exited with status {rc}"
+                                   + (f": {detail}" if detail else ""))
+            execution_error = review_execution_error(raw, stderr)
+            if execution_error:
+                raise RuntimeError(execution_error)
+            payload = review_payload_from_text(raw)
+            if payload is not None:
+                return payload
+            if attempt > retries:
+                suffix = " after repair retry" if retries else ""
+                raise RuntimeError(f"reviewer returned no findings JSON{suffix}")
     finally:
+        if not preserve_scratch:
+            shutil.rmtree(scratch_dir, ignore_errors=True)
         save_raw()
 
 
@@ -7376,7 +7395,6 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
                    "lessons_injected": spec.get("lessons_injected", []),
                    "patterns_injected": spec.get("patterns_injected", [])})
     set_status(rdir, state="finished", status=status, finished=NOW(), commit=fin.get("commit"), lane=lane["name"])
-    cleanup_executor_tmp(ws.get("root") or ws["path"])
     return out
 
 
@@ -7641,7 +7659,6 @@ def cmd_lane_serve(lane, policy):
                 shutdown = True
     if child:
         child.close()
-    cleanup_executor_tmp(os.path.join(lane_root(name), "wt"))
     lane_write_state(name, state="idle", child_pid=None, supervisor_pid=None, current_run=None,
                      turn_state=None, concurrency_keys=[], stopped=NOW(), last_error=None)
     server.close()

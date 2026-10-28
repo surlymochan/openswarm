@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import types
 import unittest
@@ -160,6 +161,33 @@ class ConsultTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertLess(elapsed, 3.0)
         self.assertTrue(all(row["valid"] for row in result["answers"]))
+
+    def test_deadline_waits_for_worker_quarantine_before_finalizing(self):
+        started = threading.Event()
+        release = threading.Event()
+        result = []
+        def delayed(core, profile, prompt, run_dir, deadline, policy, reservation):
+            started.set()
+            self.assertTrue(release.wait(5))
+            core.quarantine_executor_workspace(run_dir, context="consult")
+            return {"backend": profile["backend"], "family": profile["family"], "valid": False,
+                    "answer": None, "raw": "", "error": "termination unconfirmed", "quarantined": True}
+        def run():
+            result.append(self.run_consult(["agy", "codex"], deadline=0.001))
+        with mock.patch.object(consult, "_ask_one", side_effect=delayed):
+            thread = threading.Thread(target=run)
+            thread.start()
+            self.assertTrue(started.wait(5))
+            time.sleep(1.2)
+            self.assertTrue(thread.is_alive())
+            release.set()
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        code, output = result[0]
+        self.assertEqual(code, 1)
+        self.assertTrue(all(row["quarantined"] for row in output["answers"]))
+        for index in (1, 2):
+            self.assertTrue(os.path.isfile(os.path.join(xs.RUNS, output["id"], f"answer-{index}", "quarantine.json")))
 
     def test_total_concurrency_cap_serializes_admission(self):
         os.environ["FAKE_CONSULT_SLEEP_SECONDS"] = "0.6"

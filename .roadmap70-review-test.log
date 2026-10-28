@@ -1,0 +1,17 @@
+test_agy_permission_denial_is_reported_without_a_paid_format_retry (test_review.PeerReviewTests.test_agy_permission_denial_is_reported_without_a_paid_format_retry) ... ok
+test_auto_review_concurrency_cap_and_failure_do_not_escape_run_hook (test_review.PeerReviewTests.test_auto_review_concurrency_cap_and_failure_do_not_escape_run_hook) ... ok
+test_auto_review_trigger_respects_default_and_policy_card_types (test_review.PeerReviewTests.test_auto_review_trigger_respects_default_and_policy_card_types) ... ok
+test_cli_json_output_uses_findings_schema (test_review.PeerReviewTests.test_cli_json_output_uses_findings_schema) ... ok
+test_disabled_pi_is_skipped_and_explicit_pi_rejected (test_review.PeerReviewTests.test_disabled_pi_is_skipped_and_explicit_pi_rejected) ... ok
+test_failed_review_still_saves_raw_output (test_review.PeerReviewTests.test_failed_review_still_saves_raw_output) ... ok
+test_family_selection_uses_policy_order_and_opposite_family (test_review.PeerReviewTests.test_family_selection_uses_policy_order_and_opposite_family) ... ok
+test_invalid_review_response_retries_and_saves_redacted_raw_output (test_review.PeerReviewTests.test_invalid_review_response_retries_and_saves_redacted_raw_output) ... ok
+test_perform_review_stores_findings_and_peer_ledger_fields (test_review.PeerReviewTests.test_perform_review_stores_findings_and_peer_ledger_fields) ... ok
+test_review_parser_extracts_first_schema_object_from_common_wrappers (test_review.PeerReviewTests.test_review_parser_extracts_first_schema_object_from_common_wrappers) ... ok
+test_reviewer_commands_are_read_only (test_review.PeerReviewTests.test_reviewer_commands_are_read_only) ... ok
+test_unconfirmed_termination_quarantines_run_dir_and_preserves_raw (test_review.PeerReviewTests.test_unconfirmed_termination_quarantines_run_dir_and_preserves_raw) ... ok
+
+----------------------------------------------------------------------
+Ran 12 tests in 1.428s
+
+OK

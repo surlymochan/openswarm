@@ -1,0 +1,21 @@
+test_agy_permission_denial_is_not_treated_as_a_format_retry (test_consult.ConsultTests.test_agy_permission_denial_is_not_treated_as_a_format_retry) ... ok
+test_cli_dispatch_writes_consult_and_ledger (test_consult.ConsultTests.test_cli_dispatch_writes_consult_and_ledger) ... ok
+test_consult_stops_detached_descendant_via_run_proc (test_consult.ConsultTests.test_consult_stops_detached_descendant_via_run_proc) ... ok
+test_context_file_is_included_in_the_shared_prompt (test_consult.ConsultTests.test_context_file_is_included_in_the_shared_prompt) ... ok
+test_deadline_waits_for_worker_quarantine_before_finalizing (test_consult.ConsultTests.test_deadline_waits_for_worker_quarantine_before_finalizing) ... ok
+test_default_selection_does_not_choose_unverified_pi (test_consult.ConsultTests.test_default_selection_does_not_choose_unverified_pi) ... ok
+test_default_selection_uses_distinct_available_families (test_consult.ConsultTests.test_default_selection_uses_distinct_available_families) ... ok
+test_each_backend_command_enforces_read_only_mode (test_consult.ConsultTests.test_each_backend_command_enforces_read_only_mode) ... ok
+test_executors_run_in_parallel (test_consult.ConsultTests.test_executors_run_in_parallel) ... ok
+test_invalid_agy_answer_retries_and_preserves_both_raw_responses (test_consult.ConsultTests.test_invalid_agy_answer_retries_and_preserves_both_raw_responses) ... ok
+test_malformed_and_timeout_answers_keep_raw_text_and_fail_exec_pass (test_consult.ConsultTests.test_malformed_and_timeout_answers_keep_raw_text_and_fail_exec_pass) ... ok
+test_parser_extracts_envelope_fenced_and_prose_wrapped_answers (test_consult.ConsultTests.test_parser_extracts_envelope_fenced_and_prose_wrapped_answers) ... ok
+test_schema_answers_are_parallel_persisted_and_ledgered (test_consult.ConsultTests.test_schema_answers_are_parallel_persisted_and_ledgered) ... ok
+test_schema_rejects_extra_keys_and_wrong_field_types (test_consult.ConsultTests.test_schema_rejects_extra_keys_and_wrong_field_types) ... ok
+test_total_concurrency_cap_serializes_admission (test_consult.ConsultTests.test_total_concurrency_cap_serializes_admission) ... ok
+test_unconfirmed_executor_termination_quarantines_answer_dir (test_consult.ConsultTests.test_unconfirmed_executor_termination_quarantines_answer_dir) ... ok
+
+----------------------------------------------------------------------
+Ran 16 tests in 13.016s
+
+OK

@@ -159,7 +159,7 @@ def _response_text(backend, stdout, output_path=None):
     if backend == "codex" and output_path:
         try:
             with open(output_path, encoding="utf-8") as stream:
-                return stream.read()
+                return stream.read(1024 * 1024)
         except OSError:
             pass
     if backend == "agy":
@@ -301,6 +301,7 @@ def _ask_one(core, profile, prompt, run_dir, deadline, policy, reservation_id):
             try:
                 rc = core.run_proc(command, profile["cwd"], os.environ.copy(), remaining, evp)
             except core.TerminationUnconfirmed:
+                core.quarantine_executor_workspace(run_dir, context="consult")
                 stdout, stderr = core.read_executor_capture(evp, file_output)
                 stdout, stderr = _decode_output(stdout), _decode_output(stderr)
                 raw = _response_text(profile["backend"], stdout, file_output) or stderr
@@ -309,7 +310,6 @@ def _ask_one(core, profile, prompt, run_dir, deadline, policy, reservation_id):
                 row["raw"] = "\n\n".join(raw_attempts)
                 row["error"] = core.TERMINATION_UNCONFIRMED_ERROR
                 row["quarantined"] = True
-                core.quarantine_executor_workspace(run_dir, context="consult")
                 return row
             except core.ExecutorStartError as error:
                 row["error"] = f"executor could not start: {error}"
@@ -433,19 +433,24 @@ def consult(args, core, policy):
     deadline = core.NOW() + args.deadline_minutes * 60
     answers = [None] * len(profiles)
     threads = []
+    worker_errors = []
 
     def worker(index, profile):
         result_dir = os.path.join(run_dir, f"answer-{index + 1}")
-        answers[index] = _ask_one(core, profile, prompt, result_dir, deadline, policy,
-                                  f"{run_id}-{index + 1}")
+        try:
+            answers[index] = _ask_one(core, profile, prompt, result_dir, deadline, policy,
+                                      f"{run_id}-{index + 1}")
+        except BaseException as error:
+            worker_errors.append(error)
 
     for index, profile in enumerate(profiles):
-        thread = threading.Thread(target=worker, args=(index, profile), daemon=True)
+        thread = threading.Thread(target=worker, args=(index, profile))
         threads.append(thread)
         thread.start()
-    join_deadline = deadline + 1
     for thread in threads:
-        thread.join(max(0, join_deadline - core.NOW()))
+        thread.join()
+    if worker_errors:
+        raise worker_errors[0]
     for index, row in enumerate(answers):
         if row is None:
             profile = profiles[index]

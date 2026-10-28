@@ -1,0 +1,21 @@
+test_budget_reserves_concurrent_admissions_and_releases_finished (test_guardrails.GuardrailsTests.test_budget_reserves_concurrent_admissions_and_releases_finished) ... ok
+test_budget_status_json (test_guardrails.GuardrailsTests.test_budget_status_json) ... ok
+test_budget_uses_policy_day_and_all_attempt_backends (test_guardrails.GuardrailsTests.test_budget_uses_policy_day_and_all_attempt_backends) ... ok
+test_computer_use_is_blocked_in_lane_and_exec_events (test_guardrails.GuardrailsTests.test_computer_use_is_blocked_in_lane_and_exec_events) ... ok
+test_daily_cli_html_and_json_are_offline_and_escape_summaries (test_guardrails.GuardrailsTests.test_daily_cli_html_and_json_are_offline_and_escape_summaries) ... ok
+test_daily_report_counts_backend_lane_usage_and_risks (test_guardrails.GuardrailsTests.test_daily_report_counts_backend_lane_usage_and_risks) ... ok
+test_empty_daily_report_and_corrupt_ledger_line (test_guardrails.GuardrailsTests.test_empty_daily_report_and_corrupt_ledger_line) ... ok
+test_enforced_risks_all_protocols_and_policy_opt_out (test_guardrails.GuardrailsTests.test_enforced_risks_all_protocols_and_policy_opt_out) ... ok
+test_executor_exception_never_starts_fallback (test_guardrails.GuardrailsTests.test_executor_exception_never_starts_fallback) ... ok
+test_executor_tmp_environment_is_local_excluded_and_cleaned (test_guardrails.GuardrailsTests.test_executor_tmp_environment_is_local_excluded_and_cleaned) ... ok
+test_fallback_checks_new_backend_cap_before_executing (test_guardrails.GuardrailsTests.test_fallback_checks_new_backend_cap_before_executing) ... ok
+test_io_lost_counts_only_null_output_with_zero_duration (test_guardrails.GuardrailsTests.test_io_lost_counts_only_null_output_with_zero_duration) ... ok
+test_rm_block_records_only_path_class (test_guardrails.GuardrailsTests.test_rm_block_records_only_path_class) ... ok
+test_rm_guard_accepts_worktree_subdirectories_and_executor_tmp (test_guardrails.GuardrailsTests.test_rm_guard_accepts_worktree_subdirectories_and_executor_tmp) ... ok
+test_rm_guard_allows_single_scratch_files_in_tmp_only (test_guardrails.GuardrailsTests.test_rm_guard_allows_single_scratch_files_in_tmp_only) ... ok
+test_run_and_detach_refuse_before_creating_workspace (test_guardrails.GuardrailsTests.test_run_and_detach_refuse_before_creating_workspace) ... ok
+
+----------------------------------------------------------------------
+Ran 16 tests in 0.610s
+
+OK

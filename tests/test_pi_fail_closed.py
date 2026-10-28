@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -14,6 +15,84 @@ xs = _load.load()
 
 
 class PiFailClosed(unittest.TestCase):
+    def test_concurrent_invocations_keep_each_others_temp_and_quarantine(self):
+        with tempfile.TemporaryDirectory(dir=os.getcwd()) as run, \
+             mock.patch.object(xs, "executor_worktree_root", return_value=run), \
+             mock.patch.object(xs, "git", return_value=(1, "", "")):
+            entered = threading.Barrier(2)
+            finished = threading.Event()
+            paths = {}
+            def fake(cmd, cwd, env, timeout, out_path, abort_re):
+                paths[cmd[0]] = env["TMPDIR"]
+                Path(env["TMPDIR"], "evidence").write_text(cmd[0])
+                entered.wait(timeout=5)
+                if cmd[0] == "quarantine":
+                    self.assertTrue(finished.wait(5))
+                    self.assertTrue(Path(env["TMPDIR"], "evidence").exists())
+                    raise xs.TerminationUnconfirmed("quarantined")
+                return 0
+            errors = []
+            def invoke(name):
+                try:
+                    xs.run_proc([name], run, {}, 1, os.path.join(run, name))
+                except xs.TerminationUnconfirmed:
+                    errors.append(name)
+                finally:
+                    if name == "normal":
+                        finished.set()
+            with mock.patch.object(xs, "_run_proc", side_effect=fake):
+                threads = [threading.Thread(target=invoke, args=(name,)) for name in ("normal", "quarantine")]
+                for thread in threads: thread.start()
+                for thread in threads: thread.join(6)
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertEqual(errors, ["quarantine"])
+            self.assertNotEqual(paths["normal"], paths["quarantine"])
+            self.assertFalse(os.path.exists(paths["normal"]))
+            self.assertTrue(Path(paths["quarantine"], "evidence").exists())
+            self.assertTrue(Path(paths["quarantine"], "quarantine.json").is_file())
+            with mock.patch.object(xs, "_run_proc") as launch:
+                with self.assertRaises(xs.TerminationUnconfirmed):
+                    xs.run_proc(["later"], run, {}, 1, os.path.join(run, "later"))
+                launch.assert_not_called()
+
+    def test_capture_is_bounded(self):
+        with tempfile.TemporaryDirectory(dir=os.getcwd()) as run:
+            output = Path(run, "events")
+            output.write_text("x" * (2 * 1024 * 1024))
+            self.assertEqual(len(xs.read_executor_capture(str(output))[0]), 1024 * 1024)
+
+    def test_slow_discovery_after_deadline_still_terminates_before_return(self):
+        with tempfile.TemporaryDirectory(dir=os.getcwd()) as run:
+            entered, release, terminated = threading.Event(), threading.Event(), threading.Event()
+            proc = mock.Mock(pid=123, returncode=0)
+            proc.poll.return_value = None
+            result = []
+            def discover(pid):
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("discovery test timed out")
+                return [456]
+            def terminate(process, grace=3, observed=None):
+                self.assertIn(456, observed)
+                terminated.set()
+                return True
+            def run_proc():
+                result.append(xs._run_proc(["fake"], run, {}, 0.01, os.path.join(run, "events")))
+            with mock.patch.object(xs.subprocess, "Popen", return_value=proc), \
+                 mock.patch.object(xs, "descendants", side_effect=discover), \
+                 mock.patch.object(xs, "terminate_executor", side_effect=terminate), \
+                 mock.patch.object(xs, "set_status"):
+                thread = threading.Thread(target=run_proc)
+                thread.start()
+                self.assertTrue(entered.wait(5))
+                self.assertFalse(terminated.wait(0.05))
+                self.assertTrue(thread.is_alive())
+                release.set()
+                thread.join(5)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(terminated.is_set())
+            self.assertEqual(result, [124])
+
     def test_kill_tree_stops_process_and_descendant(self):
         code = ("import signal, subprocess, sys, time\n"
                 "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"

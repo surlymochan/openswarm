@@ -217,7 +217,7 @@ class GuardrailsTests(unittest.TestCase):
         self.assertFalse(xs.rm_outside_worktree("cd nested && rm -rf file", str(repo)))
 
         tmpdir, env = xs.configure_executor_environment(str(repo), {"PATH": os.environ.get("PATH", "")})
-        self.assertEqual(tmpdir, str(repo.resolve() / ".openswarm-tmp"))
+        self.assertEqual(Path(tmpdir).parent, repo.resolve() / ".openswarm-tmp")
         self.assertTrue(Path(tmpdir).is_dir())
         self.assertEqual([env[name] for name in ("TMPDIR", "TMP", "TEMP")], [tmpdir] * 3)
         exclude = subprocess.run(["git", "rev-parse", "--git-path", "info/exclude"], cwd=repo,
@@ -237,9 +237,13 @@ class GuardrailsTests(unittest.TestCase):
         self.assertEqual(xs.run_proc([sys.executable, str(script)], str(repo),
                                      {"RESULT_PATH": str(result_path)}, 10, str(events)), 0)
         executor_env = json.loads(result_path.read_text())
-        self.assertEqual([executor_env[name] for name in ("tmpdir", "tmp", "temp")], [tmpdir] * 3)
+        invocation = executor_env["tmpdir"]
+        self.assertNotEqual(invocation, tmpdir)
+        self.assertEqual([executor_env[name] for name in ("tmpdir", "tmp", "temp")], [invocation] * 3)
         self.assertTrue(executor_env["exists"])
-        self.assertFalse(Path(tmpdir).exists())
+        self.assertFalse(Path(invocation).exists())
+        self.assertTrue(Path(tmpdir).exists())
+        xs.cleanup_executor_tmp(tmpdir)
 
     def report_fixture(self):
         self.ledger([
