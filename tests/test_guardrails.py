@@ -138,6 +138,14 @@ class GuardrailsTests(unittest.TestCase):
         self.assertEqual(xs.enforced_risk(cua, {}, str(self.root))["risk"], "computer use")
         self.assertIsNone(xs.enforced_risk(cua, {"risk": {"enforce": ["push"]}}, str(self.root)))
 
+    def test_computer_use_is_blocked_in_lane_and_exec_events(self):
+        lane_event = {"method": "item/started", "params": {"item": {"type": "mcpToolCall", "server": "cua_repl", "tool": "js"}}}
+        exec_event = {"type": "item.started", "item": {"type": "mcpToolCall", "server": "cua_repl", "tool": "js"}}
+        other = {"method": "item/started", "params": {"item": {"type": "mcpToolCall", "server": "openbot", "tool": "x"}}}
+        self.assertEqual(xs.enforced_risk(lane_event, {}, str(self.root))["risk"], "computer use")
+        self.assertEqual(xs.enforced_risk(exec_event, {}, str(self.root))["risk"], "computer use")
+        self.assertIsNone(xs.enforced_risk(other, {}, str(self.root)))
+
     def test_rm_guard_allows_single_scratch_files_in_tmp_only(self):
         for command in ("rm -f /tmp/t-sqlite.ts", "rm /tmp/cjs-test.log", "cd /tmp && rm -f probe.json"):
             self.assertFalse(xs.rm_outside_worktree(command, str(self.root)), command)

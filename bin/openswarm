@@ -3623,10 +3623,13 @@ def computer_use_risk(event):
             title = str(update.get("title") or update.get("name") or "")
             if server == "cua_repl" or "computer_use" in server or "computer use" in title.lower():
                 return {"risk": "computer use", "command": title or server or "cua_repl"}
-    if event.get("type") == "mcpToolCall":
-        server = str(event.get("server") or event.get("mcp_server") or "")
-        if server == "cua_repl" or "computer_use" in server:
-            return {"risk": "computer use", "command": str(event.get("tool") or server)}
+    # Codex app-server lanes wrap tool calls as {"method": "item/started", "params": {"item": {...}}}.
+    items = [event, (event.get("params") or {}).get("item") or {}, event.get("item") or {}]
+    for item in items:
+        if isinstance(item, dict) and item.get("type") == "mcpToolCall":
+            server = str(item.get("server") or item.get("mcp_server") or "")
+            if server == "cua_repl" or "computer_use" in server:
+                return {"risk": "computer use", "command": str(item.get("tool") or server)}
     return None
 
 
