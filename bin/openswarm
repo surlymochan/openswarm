@@ -3337,8 +3337,12 @@ def run_executor_with_rate_limit(backend, decision, state, prompt, wd, rdir, bud
                    deadline=budget_deadline, workspace=wd)
         started = NOW()
         timeout = max(0, budget_deadline - NOW())
-        rc, final, meta, err_text = EXECUTORS[backend](call_decision, state, current_prompt, wd,
-                                                       rdir, timeout, event_file)
+        try:
+            rc, final, meta, err_text = EXECUTORS[backend](call_decision, state, current_prompt, wd,
+                                                           rdir, timeout, event_file)
+        except Exception as error:
+            rc, final, meta, err_text = 1, None, {"usage": {}}, f"executor startup failed: {short(error, 500)}"
+            open(event_file, "a").close()
         seconds = round(NOW() - started, 3)
         error_class = executor_error_class(rc, final, err_text)
         set_status(rdir, state="routing", concurrency_keys=[])
@@ -4119,7 +4123,12 @@ def pi_read_only_tools_or_error(read_only):
     for forbidden in ("bash", "edit", "write"):
         if forbidden in tools.split(","):
             return None, f"pi read-only tool allowlist includes forbidden tool {forbidden}"
-    return tools, None
+    return None, "pi read-only effective capabilities cannot be verified before prompting"
+
+
+def fallback_forbidden_for_read_only(decision):
+    # Other executors do not all enforce the Pi tool restriction.
+    return bool(decision.get("read_only"))
 
 
 def run_detached_child_argv(rid, args, title, budget_min, cwd):
@@ -4731,7 +4740,7 @@ def cmd_run(args, policy):
             result = final
             break
         if final is not None or err_class not in ("rate_limit", "exec_error", "model_unavailable") or not policy["run"]["fallback"] \
-                or args.no_fallback or prof.get("backend") or deadline - NOW() < 120 \
+                or args.no_fallback or fallback_forbidden_for_read_only(decision) or prof.get("backend") or deadline - NOW() < 120 \
                 or (jload(f"{rdir}/status.json", {}) or {}).get("stop_requested"):
             result = final
             break
@@ -6552,6 +6561,8 @@ def lane_refresh_pi_child_for_tools(lane, child, policy, spec, event_file):
     if lane.get("backend") != "pi":
         return child, False
     want = lane_pi_tools_for_spec(spec)
+    if want == PI_READ_ONLY_TOOLS:
+        raise RuntimeError("pi read-only effective capabilities cannot be verified before prompting")
     if child and child.pi_tools == want:
         return child, False
     wt = os.path.join(lane_root(lane["name"]), "wt")
@@ -6560,10 +6571,9 @@ def lane_refresh_pi_child_for_tools(lane, child, policy, spec, event_file):
                                        "previous": getattr(child, "pi_tools", None) if child else None,
                                        "current": want})
     if child:
-        try:
-            child.close()
-        except Exception:
-            pass
+        child.close()
+        if child.alive():
+            raise RuntimeError("previous pi lane process did not terminate")
     try:
         new_child = LaneChild(lane, wt, policy, pi_tools=want)
     except Exception as error:
@@ -7295,6 +7305,8 @@ def lane_do_run(lane, spec, child, server, current):
     ws = None
     turn, pending = {}, []
     try:
+        if spec.get("_startup_error"):
+            raise RuntimeError(spec["_startup_error"])
         ws = lane_prepare_workspace(lane, rid, spec.get("base"))
         if ws.get("workspace_note"):
             set_status(rdir, workspace_note=ws["workspace_note"])
@@ -7516,6 +7528,9 @@ def cmd_lane_serve(lane, policy):
                     active_lane = lanes_by_name([lane["name"]])[0]
                     child, _ = lane_refresh_pi_child_for_tools(active_lane, child, policy, spec, evp)
                 lane_do_run(lanes_by_name([lane["name"]])[0], spec, child, server, current)
+            except Exception as error:
+                # Startup/replacement failures must produce the same visible failed result as turn failures.
+                lane_do_run(lane, dict(spec, _startup_error=short(error, 500)), child, server, current)
             finally:
                 down_after = bool(spec.get("down_requested"))
                 current.clear()

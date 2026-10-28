@@ -245,6 +245,8 @@ A ledger record carries the outcome and what the next run learns from it: `exec_
 | --- | --- | --- |
 | `openswarm consult` | Ask several executors the same question in read-only mode and compare the answers. | `openswarm consult --question "Which parser change is safest?" --ask codex --ask pi --json` |
 | `openswarm review` | Review a finished run's branch with a read-only executor from another model family. | `openswarm review <run-id> --by codex --json` |
+
+Read-only Pi runs currently fail closed: passing a tool list does not prove the running Pi process's effective capabilities. Read-only runs do not fall back to another backend. Pi tool restrictions are not an OS sandbox.
 | `openswarm compare` | Run one card on two executor families and record the best-of-two comparison. | `openswarm compare --task-file /tmp/task.md --title "Parser fix" --a codex --b pi --verify 'pytest -q'` |
 
 ## Learning loop
