@@ -253,10 +253,13 @@ class WorkspaceTest(unittest.TestCase):
         import re
         rx = re.compile(next(r for r, n in xs.DEFAULT_RISKS if n == "possible secret print"), re.I)
         for cmd in ["cat services/api/test/backup-runtime-recovery.test.mjs | head",
-                    "cat > scripts/tools/channel.py <<'PY'", "rg -n 'token' src/session.mjs"]:
+                    "cat > scripts/tools/channel.py <<'PY'", "rg -n 'token' src/session.mjs",
+                    "cat scripts/acp-mcp-shared-token-e2e.ts", "head -40 src/main/secret-redaction.tsx",
+                    "tail docs/password-store.md"]:
             self.assertIsNone(rx.search(cmd), cmd)
         for cmd in ["cat ~/.codex/auth.json", "cat /var/lib/myapp/api.token", "printenv OPENAI_API_KEY",
-                    "echo $GITHUB_TOKEN", "head -c 20 /etc/myapp/secret.env"]:
+                    "echo $GITHUB_TOKEN", "head -c 20 /etc/myapp/secret.env",
+                    "cat ~/.config/github-token.txt", "cat deploy/api-key.json"]:
             self.assertIsNotNone(rx.search(cmd), cmd)
 
     def test_verify_overrides_executor_status(self):

@@ -8632,7 +8632,7 @@ DEFAULT_RISKS = [
     (r"--no-verify|--force\b", "bypass/force flag"),
     # Reading a credential-named file or echoing a credential-named variable; plain `cat` of source/test files and
     # heredoc writes (`cat >`) no longer match.
-    (r"\b(cat|less|more|head|tail|bat)\s+(?![\s>])[^|;&]*[/\s~.](\.?(auth|credentials?|secrets?)(\.json|\.ya?ml|\.env)?|[\w.-]*(token|secret|password|api[_-]?key)[\w.-]*)(\s|$|[|;&])"
+    (r"\b(cat|less|more|head|tail|bat)\s+(?![\s>])[^|;&]*[/\s~.](\.?(auth|credentials?|secrets?)(\.json|\.ya?ml|\.env)?|(?![\w.-]*\.(?:[cm]?[jt]sx?|md|py|go|rs|sh|css|html|swift|kt)(?:\s|$|[|;&]))[\w.-]*(token|secret|password|api[_-]?key)[\w.-]*)(\s|$|[|;&])"
      r"|\b(printenv|echo|printf)\b[^|;&]*\$\{?[A-Z_]*(TOKEN|SECRET|PASSWORD|API_?KEY)[A-Z_]*"
      r"|\bprintenv\b\s*($|[|;&]|[A-Z_]*(TOKEN|SECRET|PASSWORD|API_?KEY))", "possible secret print"),
     (r"\bsudo\b|systemctl\s+(stop|disable|mask)|launchctl\s+(unload|bootout)", "system service / sudo"),
