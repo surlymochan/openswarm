@@ -20,7 +20,7 @@ xs = _load.load()
 
 class GuardrailsTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         for name, value in (("DATA", str(self.root)), ("RUNS", str(self.root / "runs")),
@@ -133,6 +133,18 @@ class GuardrailsTests(unittest.TestCase):
         self.assertTrue(xs.rm_outside_worktree("cd /var/lib && bash -lc 'rm file'", str(self.root)))
         self.assertTrue(xs.enforced_risk({"type": "tool_execution_start", "args": {"command": "bash -lc 'git push origin'"}}, {}, str(self.root)))
         self.assertEqual(xs.enforced_risk({"type": "tool_execution_start", "args": {"command": "cat .env"}}, {}, str(self.root))["risk"], "secret print")
+        cua = {"method": "session/update", "params": {"update": {"sessionUpdate": "tool_call",
+                                                                  "server": "cua_repl", "name": "click"}}}
+        self.assertEqual(xs.enforced_risk(cua, {}, str(self.root))["risk"], "computer use")
+        self.assertIsNone(xs.enforced_risk(cua, {"risk": {"enforce": ["push"]}}, str(self.root)))
+
+    def test_computer_use_is_blocked_in_lane_and_exec_events(self):
+        lane_event = {"method": "item/started", "params": {"item": {"type": "mcpToolCall", "server": "cua_repl", "tool": "js"}}}
+        exec_event = {"type": "item.started", "item": {"type": "mcpToolCall", "server": "cua_repl", "tool": "js"}}
+        other = {"method": "item/started", "params": {"item": {"type": "mcpToolCall", "server": "openbot", "tool": "x"}}}
+        self.assertEqual(xs.enforced_risk(lane_event, {}, str(self.root))["risk"], "computer use")
+        self.assertEqual(xs.enforced_risk(exec_event, {}, str(self.root))["risk"], "computer use")
+        self.assertIsNone(xs.enforced_risk(other, {}, str(self.root)))
 
     def test_rm_guard_allows_single_scratch_files_in_tmp_only(self):
         for command in ("rm -f /tmp/t-sqlite.ts", "rm /tmp/cjs-test.log", "cd /tmp && rm -f probe.json"):

@@ -3,7 +3,7 @@ usage: openswarm lane assign [-h] (--task-file TASK_FILE | --prompt PROMPT)
                              [--verify-baseline]
                              [--budget-minutes BUDGET_MINUTES] [--base BASE]
                              [--card-type CARD_TYPE] [--rework-of REWORK_OF]
-                             [--paths PATHS [PATHS ...]]
+                             [--paths PATHS [PATHS ...]] [--read-only]
                              name
 
 positional arguments:
@@ -24,3 +24,5 @@ options:
                         run id this task is reworking
   --paths PATHS [PATHS ...]
                         path hints for matching applicable lessons
+  --read-only           review task: allow status=done without repo changes or
+                        commits

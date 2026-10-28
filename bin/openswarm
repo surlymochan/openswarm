@@ -1638,6 +1638,40 @@ def find_codex(policy):
     return good[0][2], good[0][1]
 
 
+CODEX_IO_LOST_STREAK = 3
+
+
+def codex_executor_flags():
+    """Disable Computer Use for non-interactive executor runs (shell-only worktrees)."""
+    return ["--disable", "computer_use"]
+
+
+def codex_resolved_binary(policy, lane=None):
+    if lane:
+        binary = envvar("CODEX_APP_SERVER_BIN") or lane.get("binary") or find_codex(policy)[0]
+    else:
+        binary = find_codex(policy)[0]
+    if binary:
+        binary = os.path.realpath(binary)
+    return binary
+
+
+def codex_install_fingerprint(policy, lane=None):
+    binary = codex_resolved_binary(policy, lane)
+    if not binary:
+        return None
+    version = None
+    if os.path.basename(binary) == "codex":
+        rc, out, _ = sh([binary, "--version"], timeout=15)
+        if rc == 0 and out.strip():
+            version = out.strip().split()[-1]
+    try:
+        mtime = os.path.getmtime(binary)
+    except OSError:
+        mtime = None
+    return {"binary": binary, "version": version, "mtime": mtime}
+
+
 def codex_plan(policy):
     """ChatGPT plan behind Codex. Explicit OPENSWARM_CODEX_PLAN / policy codex.plan wins. Decoding the plan claim
     from ~/.codex/auth.json is opt-in (local_sources.codex_auth_plan): only the id_token's
@@ -3245,6 +3279,8 @@ def rate_limit_delay(policy, retry):
 def executor_error_class(rc, final, err_text):
     if rc == 133:
         return "risk_blocked"
+    if rc == 134:
+        return "executor_io_lost"
     if rc == 124:
         return "budget_exceeded"
     if rc != 0 and MODEL_UNAVAILABLE_RE.search(err_text or ""):
@@ -3367,7 +3403,7 @@ def kill_tree(pid, grace=3):
                 return
 
 
-ENFORCED_RISKS = ["push", "publish", "secret print", "rm outside worktree", "sudo"]
+ENFORCED_RISKS = ["push", "publish", "secret print", "rm outside worktree", "sudo", "computer use"]
 
 
 def event_commands(event):
@@ -3577,12 +3613,77 @@ def redact_command(command):
     return " ".join(token if token in safe else "[redacted]" for token in tokens)[:500]
 
 
+def computer_use_risk(event):
+    """Block Codex Computer Use (cua_repl) in executor lanes and one-shot runs."""
+    method = event.get("method") or ""
+    if method == "session/update":
+        update = (event.get("params") or {}).get("update") or {}
+        if update.get("sessionUpdate") in ("tool_call", "tool_call_update"):
+            server = str(update.get("server") or update.get("mcpServer") or "")
+            title = str(update.get("title") or update.get("name") or "")
+            if server == "cua_repl" or "computer_use" in server or "computer use" in title.lower():
+                return {"risk": "computer use", "command": title or server or "cua_repl"}
+    # Codex app-server lanes wrap tool calls as {"method": "item/started", "params": {"item": {...}}}.
+    items = [event, (event.get("params") or {}).get("item") or {}, event.get("item") or {}]
+    for item in items:
+        if isinstance(item, dict) and item.get("type") == "mcpToolCall":
+            server = str(item.get("server") or item.get("mcp_server") or "")
+            if server == "cua_repl" or "computer_use" in server:
+                return {"risk": "computer use", "command": str(item.get("tool") or server)}
+    return None
+
+
+def codex_command_io_empty(item):
+    if not isinstance(item, dict):
+        return False
+    kind = item.get("type") or item.get("itemType")
+    if kind not in ("commandExecution", "command_execution"):
+        return False
+    exit_code = item.get("exitCode", item.get("exit_code"))
+    if exit_code is None:
+        status = item.get("status")
+        if status in ("completed", "complete", "success"):
+            exit_code = 0
+    try:
+        exit_code = int(exit_code) if exit_code is not None else None
+    except (TypeError, ValueError):
+        exit_code = None
+    if exit_code != 0:
+        return False
+    output = item.get("aggregatedOutput") or item.get("output") or item.get("stdout") or ""
+    if isinstance(output, dict):
+        output = output.get("text") or output.get("content") or ""
+    return not str(output or "").strip()
+
+
+def codex_event_command_item(event):
+    if event.get("method") == "item/completed":
+        return (event.get("params") or {}).get("item") or {}
+    if event.get("type") == "item.completed":
+        return event.get("item") or {}
+    return None
+
+
+def codex_track_io_lost(streak, event, limit=CODEX_IO_LOST_STREAK):
+    item = codex_event_command_item(event)
+    if not item or not codex_command_io_empty(item):
+        return 0, None
+    streak += 1
+    if streak >= limit:
+        return streak, "executor_io_lost"
+    return streak, None
+
+
 def enforced_risk(event, policy, worktree):
     enforced = (policy.get("risk") or {}).get("enforce", ENFORCED_RISKS)
     aliases = {"git destructive/push": "push", "publish/release": "publish",
                "possible secret print": "secret print", "rm -r outside worktree": "rm outside worktree",
                "system service / sudo": "sudo"}
     enabled = {aliases.get(name, name).replace("_", " ") for name in enforced}
+    if "computer use" in enabled:
+        block = computer_use_risk(event)
+        if block:
+            return block
     rules = [(r"\bgit\s+(?:(?:-C|-c|--git-dir|--work-tree)\s+\S+\s+|--[\w-]+=\S+\s+|--[\w-]+\s+)*push\b", "push"),
              (r"\b(npm|pnpm|yarn)\b[^;&|\n]*\bpublish\b|\btwine\s+upload\b|\bgh\s+(release|pr\s+merge)\b", "publish"),
              (DEFAULT_RISKS[3][0] + r"|\b(cat|less|more|head|tail|bat)\s+(?:[^|;&]*[/\s])?\.env(?:\.[\w.-]+)?(?:\s|$)", "secret print"),
@@ -3625,6 +3726,7 @@ def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
         end = NOW() + timeout
         policy = load_policy()
         offset, pending = 0, ""
+        io_streak = 0
         while True:
             done = p.poll() is not None
             with open(out_path, errors="replace") as events:
@@ -3642,6 +3744,16 @@ def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
                     block = enforced_risk(event, policy, cwd) if isinstance(event, dict) else None
                 except ValueError:
                     continue
+                if isinstance(event, dict):
+                    io_streak, lost = codex_track_io_lost(io_streak, event)
+                    if lost:
+                        with open(out_path, "a") as ev:
+                            ev.write(json.dumps({"type": "error", "error": lost, "streak": io_streak},
+                                                ensure_ascii=False) + "\n")
+                        set_status(rdir, last_error="codex shell returned exit 0 with empty output repeatedly")
+                        kill_tree(p.pid, grace=0.1)
+                        p.wait()
+                        return 134
                 if block:
                     set_status(rdir, risk_blocks=[block], stop_requested=True)
                     kill_tree(p.pid, grace=0.1)
@@ -3697,12 +3809,13 @@ def exec_codex(d, st, prompt, wd, rdir, timeout, evp):
     last = f"{rdir}/last.json"
     if d.get("_resume_session"):
         sandbox = load_policy()["codex"]["sandbox"]
-        cmd = [st["codex"]["binary"], "exec", "resume", d["_resume_session"], "-m", d["model"],
+        cmd = [st["codex"]["binary"], *codex_executor_flags(), "exec", "resume", d["_resume_session"], "-m", d["model"],
                "-c", f'model_reasoning_effort="{d["effort"]}"', "-c", f'sandbox_mode="{sandbox}"',
                "-c", 'approval_policy="never"', "--json", "--skip-git-repo-check",
                "--output-schema", schema, "-o", last, prompt]
     else:
-        cmd = [st["codex"]["binary"], "exec", "-m", d["model"], "-c", f'model_reasoning_effort="{d["effort"]}"',
+        cmd = [st["codex"]["binary"], *codex_executor_flags(), "exec", "-m", d["model"],
+               "-c", f'model_reasoning_effort="{d["effort"]}"',
                "-s", load_policy()["codex"]["sandbox"], "-C", wd, "--json", "--skip-git-repo-check",
                "--output-schema", schema, "-o", last, prompt]
     rc = run_proc(cmd, wd, os.environ.copy(), timeout, evp)
@@ -4285,6 +4398,20 @@ def adjust_status_for_verify(status, verify):
     return status, None
 
 
+def adjust_status_for_change_evidence(status, verify_note, *, commit, workspace_changed, changed, read_only, verify):
+    """Downgrade a false done when the executor reported success without commits, diffs, or host verify."""
+    if read_only or verify:
+        return status, verify_note
+    if status != "done":
+        return status, verify_note
+    if commit or workspace_changed or changed:
+        return status, verify_note
+    note = "no_change_evidence"
+    if verify_note:
+        note = verify_note + "; " + note
+    return "partial", note
+
+
 JUNK = ["__pycache__/**", "*.pyc", ".DS_Store", "node_modules/**", ".pytest_cache/**", ".venv/**", "*.egg-info/**"]
 NEVER_COMMIT = ["*_????????-????-????-????-????????????.jsonl", ".pi/", ".codex/", ".cursor/", ".agy/",
                 "pi-session*.jsonl", "codex-session*.jsonl", "cursor-session*.jsonl",
@@ -4571,7 +4698,7 @@ def cmd_run(args, policy):
     fin = finalize_workspace(ws, title, decision["backend"], rdir, keep=True)
     changed = changed_paths(ws.get("repo") or ws.get("path"), ws.get("base"), fin.get("commit"),
                             (result or {}).get("files_changed"))
-    read_only = prof.get("type") in READ_ONLY_CARD_TYPES or card_type in READ_ONLY_CARD_TYPES
+    read_only = getattr(args, "read_only", False) or prof.get("type") in READ_ONLY_CARD_TYPES or card_type in READ_ONLY_CARD_TYPES
     read_only_output = read_only and read_only_output_exists(ws.get("path"), (result or {}).get("files_changed"))
     verify = None
     prepare_error = None
@@ -4611,12 +4738,17 @@ def cmd_run(args, policy):
         status, verify_note = "stopped", None
     elif attempts[-1]["error_class"] == "rate_limit":
         status, verify_note = ("partial" if fin.get("commit") or workspace_changed or changed else "failed"), "rate limited"
+    elif attempts[-1]["error_class"] == "executor_io_lost":
+        status, verify_note = "failed", "codex shell returned exit 0 with empty output repeatedly"
     elif prepare_error:
         status, verify_note = "failed", "workspace prepare failed before verify"
     elif verify and verify["rc"] == 0 and result is None and status == "budget_exceeded":
         status, verify_note = "partial", "executor hit the budget without a final report; host verify passed"
     else:
         status, verify_note = adjust_status_for_verify(status, verify)
+    status, verify_note = adjust_status_for_change_evidence(
+        status, verify_note, commit=fin.get("commit"), workspace_changed=workspace_changed, changed=changed,
+        read_only=read_only, verify=verify)
     usage = (attempts[-1].get("meta") or {}).get("usage")
     wall_seconds = round(sum(a["seconds"] for a in attempts), 3)
     out = {
@@ -6119,7 +6251,7 @@ class LaneChild:
             binary = envvar("CODEX_APP_SERVER_BIN") or lane.get("binary") or find_codex(policy)[0]
             if not binary:
                 raise RuntimeError("codex binary not found; set lane binary or install Codex")
-            cmd = [binary, "app-server"]
+            cmd = [binary, *codex_executor_flags(), "app-server"]
         elif backend == "pi":
             binary = envvar("PI_RPC_BIN") or lane.get("binary") or pi_bin()
             if not binary:
@@ -6166,6 +6298,7 @@ class LaneChild:
                 if response.get("error"):
                     raise RuntimeError(f"codex app-server initialize failed: {short(response['error'], 300)}")
                 self.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+                self.codex_fingerprint = codex_install_fingerprint(policy, lane)
             except Exception:
                 self.close()
                 raise
@@ -6347,6 +6480,27 @@ def lane_child(lane, cwd, policy):
     return LaneChild(lane, cwd, policy)
 
 
+def lane_refresh_codex_child_if_stale(lane, child, policy, event_file):
+    if lane.get("backend") != "codex" or not child:
+        return child, False
+    configured = next((row for row in lane_config() if row.get("name") == lane["name"]), lane)
+    current = codex_install_fingerprint(policy, configured)
+    previous = getattr(child, "codex_fingerprint", None)
+    if not current or current == previous:
+        return child, False
+    wt = os.path.join(lane_root(lane["name"]), "wt")
+    if event_file:
+        lane_record_event(event_file, {"type": "codex_app_server_restarted", "reason": "binary_changed",
+                                       "previous": previous, "current": current})
+    try:
+        child.close()
+    except Exception:
+        pass
+    new_child = lane_child(configured, wt, policy)
+    lane_write_state(lane["name"], child_pid=new_child.pid, last_error=None)
+    return new_child, True
+
+
 def lane_record_event(path, event):
     with open(path, "a") as f:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
@@ -6395,7 +6549,7 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                         with open(os.path.join(rdir, "task.md"), "w") as f:
                             f.write(task)
                         spec = {k: req.get(k) for k in ("title", "verify", "verify_baseline", "budget_minutes", "base",
-                                                        "card_type", "rework_of", "paths", "regress_label")}
+                                                        "card_type", "rework_of", "paths", "regress_label", "read_only")}
                         provider = execution_provider(lane["backend"], policy=load_policy(), lane=lane)
                         spec.update({"run_id": rid, "task": task, "started": NOW(), "provider": provider})
                         spec["_event_file"] = os.path.join(rdir, f"events.1.{lane['backend']}.jsonl")
@@ -6704,6 +6858,7 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
     budget_hit = NOW() >= deadline
     risk_policy = load_policy()
     abort_deadline = None
+    codex_io_streak = 0
 
     def agy_resume_steer():
         """Restart the agy turn with the queued steer text; True when a new turn was started."""
@@ -6797,6 +6952,13 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
             method = msg.get("method")
             params = msg.get("params") or {}
             item = params.get("item") or {}
+            codex_io_streak, io_lost = codex_track_io_lost(codex_io_streak, msg)
+            if io_lost:
+                lane_record_event(event_file, {"type": "error", "error": io_lost, "streak": codex_io_streak})
+                lane_abort_child(lane, child, turn)
+                abort_deadline = NOW() + 30
+                return None, usage, "executor_io_lost", 134, event_file, (
+                    "codex shell returned exit 0 with empty output repeatedly")
             if method == "item/completed" and item.get("type") in ("agentMessage", "agent_message"):
                 text = item.get("text") or "".join(x.get("text", "") for x in item.get("content") or [] if isinstance(x, dict))
                 if text:
@@ -6965,6 +7127,8 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
         error_class = "prepare_failed"
     elif error_class == "rate_limit":
         status, verify_note = ("partial" if fin.get("commit") or changed else "failed"), "rate limited"
+    elif error_class == "executor_io_lost":
+        status, verify_note = "failed", "codex shell returned exit 0 with empty output repeatedly"
     elif stopped:
         status, verify_note = "stopped", None
     elif budget_hit and not (verify and verify["rc"] == 0 and final is None):
@@ -6981,6 +7145,10 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
     else:
         status = (final or {}).get("status") or "failed"
         status, verify_note = adjust_status_for_verify(status, verify)
+    read_only = spec.get("read_only") or spec.get("card_type") in READ_ONLY_CARD_TYPES
+    status, verify_note = adjust_status_for_change_evidence(
+        status, verify_note, commit=fin.get("commit"), workspace_changed=changed, changed=changed,
+        read_only=read_only, verify=verify)
     if ws.get("mode") == "worktree":
         detach_at = fin.get("commit") or ws["base"]
         lane_git(["checkout", "--detach", detach_at], ws["root"])
@@ -6995,7 +7163,7 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
     jsave(os.path.join(rdir, "result.json"), out)
     changed = changed_paths(ws.get("repo") or ws.get("root"), ws.get("base"), fin.get("commit"),
                             (final or {}).get("files_changed"))
-    read_only = spec.get("card_type") in READ_ONLY_CARD_TYPES
+    read_only = spec.get("read_only") or spec.get("card_type") in READ_ONLY_CARD_TYPES
     read_only_output = read_only and read_only_output_exists(ws.get("path"), (final or {}).get("files_changed"))
     pass_fields = exec_pass_fields(bool(fin.get("commit") or (changed and not read_only)), read_only_output,
                                    bool(spec.get("verify")), verify)
@@ -7236,7 +7404,12 @@ def cmd_lane_serve(lane, policy):
             down_after = False
             # Run against the existing child. A crash is finalized below, and then restart backoff applies.
             try:
-                lane_do_run(lane, spec, child, server, current)
+                if lane["backend"] == "codex" and child:
+                    evp = spec.get("_event_file") or os.path.join(
+                        RUNS, spec["run_id"], f"events.1.{lane['backend']}.jsonl")
+                    active_lane = lanes_by_name([lane["name"]])[0]
+                    child, _ = lane_refresh_codex_child_if_stale(active_lane, child, policy, evp)
+                lane_do_run(lanes_by_name([lane["name"]])[0], spec, child, server, current)
             finally:
                 down_after = bool(spec.get("down_requested"))
                 current.clear()
@@ -7407,7 +7580,8 @@ def cmd_lane_assign(args):
                                          "budget_minutes": budget, "base": args.base,
                                          "card_type": getattr(args, "card_type", None),
                                          "rework_of": getattr(args, "rework_of", None),
-                                         "paths": getattr(args, "paths", None) or []})
+                                         "paths": getattr(args, "paths", None) or [],
+                                         "read_only": getattr(args, "read_only", False)})
     if response.get("ok"):
         response.update({"lane": lane["name"], "watch": f"openswarm watch {rid}",
                          "result": os.path.join(RUNS, rid, "result.json")})
@@ -10349,6 +10523,9 @@ def main():
                 p.add_argument("--rework-of", help=rework_of_help)
             elif field == "paths":
                 p.add_argument("--paths", nargs="+", default=[], help="path hints for matching applicable lessons")
+            elif field == "read-only":
+                p.add_argument("--read-only", action="store_true",
+                               help="review task: allow status=done without repo changes or commits")
             else:
                 raise ValueError(f"unknown dispatch argument field: {field}")
 
@@ -10377,6 +10554,8 @@ def main():
     sp.add_argument("--run-id", help=argparse.SUPPRESS)
     sp.add_argument("--no-auto-review", action="store_true", help=argparse.SUPPRESS)
     sp.add_argument("--dry-run", action="store_true")
+    sp.add_argument("--read-only", action="store_true",
+                    help="review task: allow status=done without repo changes or commits")
     sp.add_argument("--executor", help="optional GitHub bus executor routing label")
 
     sp = sub.add_parser("compare", help="run one task in parallel on two executor families")
@@ -10536,7 +10715,7 @@ def main():
     add_dispatch_arguments(lp, "task-source", "title", "verify", "verify-baseline", "budget",
                            task_source_required=True)
     lp.add_argument("--base")
-    add_dispatch_arguments(lp, "card-type", "rework-of", "paths",
+    add_dispatch_arguments(lp, "card-type", "rework-of", "paths", "read-only",
                            card_type_help="optional task card type from knowledge/card-types.yaml",
                            rework_of_help="run id this task is reworking")
     lp = lane_sub.add_parser("steer", help="steer the active turn")
