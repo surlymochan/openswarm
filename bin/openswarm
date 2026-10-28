@@ -3650,10 +3650,12 @@ def codex_command_io_empty(item):
         exit_code = None
     if exit_code != 0:
         return False
-    output = item.get("aggregatedOutput") or item.get("output") or item.get("stdout") or ""
-    if isinstance(output, dict):
-        output = output.get("text") or output.get("content") or ""
-    return not str(output or "").strip()
+    # A lost app-server pipe reports aggregatedOutput null with a zero duration. A command that really
+    # printed nothing (mkdir, a clean `git status --short`) reports "" or takes time, so it does not count.
+    if "aggregatedOutput" not in item or item.get("aggregatedOutput") is not None:
+        return False
+    duration = item.get("durationMs", item.get("duration_ms"))
+    return duration in (0, None)
 
 
 def codex_event_command_item(event):

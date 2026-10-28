@@ -138,6 +138,18 @@ class GuardrailsTests(unittest.TestCase):
         self.assertEqual(xs.enforced_risk(cua, {}, str(self.root))["risk"], "computer use")
         self.assertIsNone(xs.enforced_risk(cua, {"risk": {"enforce": ["push"]}}, str(self.root)))
 
+    def test_io_lost_counts_only_null_output_with_zero_duration(self):
+        lost = {"type": "commandExecution", "exitCode": 0, "aggregatedOutput": None, "durationMs": 0}
+        quiet = {"type": "commandExecution", "exitCode": 0, "aggregatedOutput": "", "durationMs": 0}
+        slow = {"type": "commandExecution", "exitCode": 0, "aggregatedOutput": None, "durationMs": 40}
+        self.assertTrue(xs.codex_command_io_empty(lost))
+        self.assertFalse(xs.codex_command_io_empty(quiet))
+        self.assertFalse(xs.codex_command_io_empty(slow))
+        streak = 0
+        for _ in range(5):
+            streak, lost_flag = xs.codex_track_io_lost(streak, {"method": "item/completed", "params": {"item": quiet}})
+            self.assertIsNone(lost_flag)
+
     def test_computer_use_is_blocked_in_lane_and_exec_events(self):
         lane_event = {"method": "item/started", "params": {"item": {"type": "mcpToolCall", "server": "cua_repl", "tool": "js"}}}
         exec_event = {"type": "item.started", "item": {"type": "mcpToolCall", "server": "cua_repl", "tool": "js"}}

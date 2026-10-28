@@ -51,7 +51,7 @@ for line in sys.stdin:
                 send({"jsonrpc": "2.0", "method": "item/completed", "params": {
                     "threadId": thread_id, "turnId": turn_id,
                     "item": {"id": f"empty-cmd-{seq}", "type": "commandExecution",
-                             "exitCode": 0, "aggregatedOutput": ""}}})
+                             "exitCode": 0, "aggregatedOutput": None, "durationMs": 0}}})
             time.sleep(1.0)
             continue
         if overload_model == model and not overload_used:
