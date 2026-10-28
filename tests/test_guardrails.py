@@ -20,7 +20,7 @@ xs = _load.load()
 
 class GuardrailsTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         for name, value in (("DATA", str(self.root)), ("RUNS", str(self.root / "runs")),
@@ -133,6 +133,10 @@ class GuardrailsTests(unittest.TestCase):
         self.assertTrue(xs.rm_outside_worktree("cd /var/lib && bash -lc 'rm file'", str(self.root)))
         self.assertTrue(xs.enforced_risk({"type": "tool_execution_start", "args": {"command": "bash -lc 'git push origin'"}}, {}, str(self.root)))
         self.assertEqual(xs.enforced_risk({"type": "tool_execution_start", "args": {"command": "cat .env"}}, {}, str(self.root))["risk"], "secret print")
+        cua = {"method": "session/update", "params": {"update": {"sessionUpdate": "tool_call",
+                                                                  "server": "cua_repl", "name": "click"}}}
+        self.assertEqual(xs.enforced_risk(cua, {}, str(self.root))["risk"], "computer use")
+        self.assertIsNone(xs.enforced_risk(cua, {"risk": {"enforce": ["push"]}}, str(self.root)))
 
     def test_rm_guard_allows_single_scratch_files_in_tmp_only(self):
         for command in ("rm -f /tmp/t-sqlite.ts", "rm /tmp/cjs-test.log", "cd /tmp && rm -f probe.json"):

@@ -270,6 +270,18 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(xs.adjust_status_for_verify("failed", ok)[0], "failed")
         self.assertEqual(xs.adjust_status_for_verify("done", None), ("done", None))
 
+    def test_change_evidence_downgrades_false_done(self):
+        self.assertEqual(xs.adjust_status_for_change_evidence(
+            "done", None, commit=None, workspace_changed=False, changed=False, read_only=False, verify=None),
+            ("partial", "no_change_evidence"))
+        self.assertEqual(xs.adjust_status_for_change_evidence(
+            "done", None, commit=None, workspace_changed=False, changed=False, read_only=True, verify=None),
+            ("done", None))
+        verify = {"rc": 0, "output": "ok", "failing": []}
+        self.assertEqual(xs.adjust_status_for_change_evidence(
+            "done", None, commit=None, workspace_changed=False, changed=False, read_only=False, verify=verify),
+            ("done", None))
+
 
 class CredentialOptInTest(unittest.TestCase):
     """Reading other tools' auth/account files must be explicit opt-in."""

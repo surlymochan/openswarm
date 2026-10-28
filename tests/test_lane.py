@@ -682,6 +682,51 @@ class LaneTests(unittest.TestCase):
             with self.subTest(pid=pid):
                 self.wait_for(lambda: not process_alive(pid), timeout=5, description=f"pid {pid} to exit")
 
+    def test_codex_false_done_without_changes_is_partial(self):
+        self.start_lane()
+        run_id = self.assign("LANE_TEST_NO_CHANGE report done without edits")
+        state = self.wait_run(run_id)
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual(state["status"], "partial")
+        self.assertEqual(result["status"], "partial")
+        self.assertIn("no_change_evidence", result.get("verify_note") or "")
+        self.assertIsNone(result["commit"])
+
+    def test_codex_read_only_assign_allows_done_without_changes(self):
+        self.start_lane()
+        run_id = self.assign("LANE_TEST_NO_CHANGE read-only review", "--read-only")
+        state = self.wait_run(run_id)
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual(state["status"], "done")
+        self.assertEqual(result["status"], "done")
+        self.assertIsNone(result["commit"])
+
+    def test_codex_io_lost_fails_run(self):
+        self.start_lane()
+        run_id = self.assign("LANE_TEST_IO_LOST stale shell output")
+        state = self.wait_run(run_id)
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(result["error_class"], "executor_io_lost")
+        events = [json.loads(line) for line in (self.data / "runs" / run_id / "events.1.codex.jsonl").read_text().splitlines()]
+        self.assertTrue(any(event.get("error") == "executor_io_lost" for event in events if event.get("type") == "error"))
+
+    def test_codex_lane_restarts_app_server_when_binary_changes(self):
+        self.start_lane()
+        pid_before = self.lane_state()["child_pid"]
+        alt = self.root / "fake_app_server_alt.py"
+        shutil.copy(FIXTURES / "fake_app_server.py", alt)
+        alt.chmod(0o755)
+        config = json.loads((self.data / "lanes.json").read_text())
+        config["lanes"][0]["binary"] = str(alt)
+        (self.data / "lanes.json").write_text(json.dumps(config))
+        run_id = self.assign("add the fixture change")
+        self.wait_run(run_id)
+        events = [json.loads(line) for line in (self.data / "runs" / run_id / "events.1.codex.jsonl").read_text().splitlines()]
+        self.assertTrue(any(event.get("type") == "codex_app_server_restarted" for event in events))
+        pid_after = self.lane_state()["child_pid"]
+        self.assertNotEqual(pid_before, pid_after)
+
 
 def process_alive(pid):
     try:

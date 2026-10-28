@@ -46,6 +46,14 @@ for line in sys.stdin:
             os._exit(17)
         send({"jsonrpc": "2.0", "method": "fixture/unrelated", "params": {"before": method}})
         response(req, {"turn": {"id": turn_id, "status": "inProgress"}})
+        if "LANE_TEST_IO_LOST" in prompt:
+            for seq in range(3):
+                send({"jsonrpc": "2.0", "method": "item/completed", "params": {
+                    "threadId": thread_id, "turnId": turn_id,
+                    "item": {"id": f"empty-cmd-{seq}", "type": "commandExecution",
+                             "exitCode": 0, "aggregatedOutput": ""}}})
+            time.sleep(1.0)
+            continue
         if overload_model == model and not overload_used:
             overload_used = True
             with open(os.path.join(cwd, "lane_partial.txt"), "w") as f:

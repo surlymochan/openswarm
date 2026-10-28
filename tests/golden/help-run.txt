@@ -7,7 +7,8 @@ usage: openswarm run [-h] [--type TYPE] [--difficulty DIFFICULTY]
                      [--cwd CWD] [--base BASE] [--no-worktree]
                      [--verify-baseline] [--verify VERIFY] [--keep-worktree]
                      [--no-fallback] [--budget-minutes BUDGET_MINUTES]
-                     [--detach] [--dry-run] [--executor EXECUTOR]
+                     [--detach] [--dry-run] [--read-only]
+                     [--executor EXECUTOR]
 
 options:
   -h, --help            show this help message and exit
@@ -47,4 +48,6 @@ options:
                         exceeded
   --detach              run in background; monitor with `openswarm watch <id>`
   --dry-run
+  --read-only           review task: allow status=done without repo changes or
+                        commits
   --executor EXECUTOR   optional GitHub bus executor routing label
