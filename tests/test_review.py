@@ -87,7 +87,6 @@ class PeerReviewTests(unittest.TestCase):
         cases = {
             "codex": ("codex", ["--sandbox", "read-only"]),
             "agy": ("agy", ["--mode", "plan", "--json-schema"]),
-            "pi": ("pi", ["--tools", "read,grep,find,ls"]),
             "cursor": ("cursor", ["--mode=ask"]),
         }
         for backend, (binary, required) in cases.items():
@@ -100,10 +99,6 @@ class PeerReviewTests(unittest.TestCase):
                 self.assertIn(token, command)
             if backend == "agy":
                 self.assertEqual(command[command.index("--output-format") + 1], "json")
-            if backend == "pi":
-                self.assertNotIn("bash", command)
-                self.assertNotIn("edit", command)
-                self.assertNotIn("write", command)
 
     def test_auto_review_trigger_respects_default_and_policy_card_types(self):
         with mock.patch.object(xs, "spawn_auto_review", return_value=True) as spawn:

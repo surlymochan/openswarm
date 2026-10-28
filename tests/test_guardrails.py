@@ -112,6 +112,24 @@ class GuardrailsTests(unittest.TestCase):
         executor.assert_called_once()
         next_executor.assert_not_called()
 
+    def test_executor_exception_never_starts_fallback(self):
+        args = argparse.Namespace(run_id=None, prompt="task", task_file=None, title="failure", cwd=str(self.root),
+                                  type="impl", difficulty=3, context_tokens=0, backend=None, model=None, effort=None,
+                                  budget_minutes=5, detach=False, dry_run=False, no_worktree=True, base=None,
+                                  verify=None, no_fallback=False, keep_worktree=False)
+        first = mock.Mock(side_effect=RuntimeError("post-start monitor failure"))
+        fallback = mock.Mock()
+        output = io.StringIO()
+        with mock.patch.object(xs, "get_state", return_value={}), \
+                mock.patch.object(xs, "route", return_value={"ok": True, "backend": "pi", "model": "fake"}), \
+                mock.patch.dict(xs.EXECUTORS, {"pi": first, "codex": fallback}), \
+                contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as exit_code:
+            xs.cmd_run(args, self.policy)
+        self.assertEqual(exit_code.exception.code, 1)
+        self.assertEqual(json.loads(output.getvalue())["error_class"], "executor_exception")
+        first.assert_called_once()
+        fallback.assert_not_called()
+
     def test_enforced_risks_all_protocols_and_policy_opt_out(self):
         events = [
             {"type": "item.started", "item": {"type": "command_execution", "command": "git -C repo push origin"}},

@@ -243,10 +243,10 @@ A ledger record carries the outcome and what the next run learns from it: `exec_
 
 | Command | Purpose | Example |
 | --- | --- | --- |
-| `openswarm consult` | Ask several executors the same question in read-only mode and compare the answers. | `openswarm consult --question "Which parser change is safest?" --ask codex --ask pi --json` |
+| `openswarm consult` | Ask several executors the same question in read-only mode and compare the answers. | `openswarm consult --question "Which parser change is safest?" --ask codex --ask agy --json` |
 | `openswarm review` | Review a finished run's branch with a read-only executor from another model family. | `openswarm review <run-id> --by codex --json` |
 
-Read-only Pi runs currently fail closed: passing a tool list does not prove the running Pi process's effective capabilities. Read-only runs do not fall back to another backend. Pi tool restrictions are not an OS sandbox.
+Read-only Pi runs, consults, and manual or automatic reviews currently fail closed: passing a tool list does not prove the running Pi process's effective capabilities. Read-only runs do not fall back to another backend. Pi tool restrictions are not an OS sandbox.
 
 The installed Pi 0.73.0 documents `--tools read,grep,find,ls`, but its documented RPC `get_state` exposes no active-tool inventory and `get_commands` lists slash commands, not tools. RPC also has a separate `bash` command. Before enabling read-only Pi, a supported version must provide a trustworthy pre-prompt check of effective tools and control channels, extensions must not be able to alter those capabilities, and replacement must confirm the old process tree has stopped. An OS isolation boundary would be needed to protect against tool bugs and other process effects; the current tool list alone does not provide one.
 | `openswarm compare` | Run one card on two executor families and record the best-of-two comparison. | `openswarm compare --task-file /tmp/task.md --title "Parser fix" --a codex --b pi --verify 'pytest -q'` |
@@ -277,7 +277,7 @@ reviewable drafts instead of editing the lesson or pattern catalog.
    ```bash
    openswarm review <run-id> --by codex --json
    openswarm compare --task-file /tmp/task.md --title "Parser fix" --a codex --b pi
-   openswarm consult --question "Is this retry safe?" --ask codex --ask pi
+   openswarm consult --question "Is this retry safe?" --ask codex --ask agy
    ```
 
 4. **Lessons.** Turn review findings into lesson, guard, and pattern drafts:

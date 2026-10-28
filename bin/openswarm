@@ -3341,10 +3341,12 @@ def run_executor_with_rate_limit(backend, decision, state, prompt, wd, rdir, bud
             rc, final, meta, err_text = EXECUTORS[backend](call_decision, state, current_prompt, wd,
                                                            rdir, timeout, event_file)
         except Exception as error:
-            rc, final, meta, err_text = 1, None, {"usage": {}}, f"executor startup failed: {short(error, 500)}"
+            rc, final, meta, err_text = 1, None, {"usage": {}}, f"executor failed: {short(error, 500)}"
             open(event_file, "a").close()
+            error_class = "executor_exception"
+        else:
+            error_class = executor_error_class(rc, final, err_text)
         seconds = round(NOW() - started, 3)
-        error_class = executor_error_class(rc, final, err_text)
         set_status(rdir, state="routing", concurrency_keys=[])
         attempt = {"backend": backend, "model": decision.get("model"), "effort": decision.get("effort"),
                    "rc": rc, "seconds": seconds, "error_class": error_class, "meta": meta,
@@ -3404,7 +3406,8 @@ def kill_tree(pid, grace=3):
             time.sleep(grace)
             procs = [p for p in procs if pid_alive(p)]
             if not procs:
-                return
+                return procs
+    return procs
 
 
 ENFORCED_RISKS = ["push", "publish", "secret print", "rm outside worktree", "sudo", "computer use"]
@@ -3721,6 +3724,16 @@ def run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
         cleanup_executor_tmp(cwd)
 
 
+def terminate_executor(p, grace=3):
+    """Stop the observed tree and refuse retry if any observed process remains."""
+    procs = kill_tree(p.pid, grace=grace)
+    try:
+        p.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        return False
+    return not any(pid_alive(pid) for pid in procs)
+
+
 def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
     """Run an executor. abort_re: pattern that, once seen in stderr, means the executor will only retry
     silently (e.g. opencode on a plan usage limit) — kill it early and return 75 so the caller can fall back."""
@@ -3728,66 +3741,64 @@ def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
     with open(out_path, "w") as out, open(out_path + ".err", "w") as err:
         p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=out, stderr=err, stdin=subprocess.DEVNULL,
                              start_new_session=True)
-        set_status(rdir, executor_pid=p.pid, events=out_path, attempt_started=NOW())
-        end = NOW() + timeout
-        policy = load_policy()
-        offset, pending = 0, ""
-        io_streak = 0
-        while True:
-            done = p.poll() is not None
-            with open(out_path, errors="replace") as events:
-                events.seek(offset)
-                pending += events.read()
-                offset = events.tell()
-            lines = pending.split("\n")
-            pending = lines.pop()
-            if done and pending:
-                lines.append(pending)
-                pending = ""
-            for line in lines:
-                try:
-                    event = json.loads(line)
-                    block = enforced_risk(event, policy, cwd) if isinstance(event, dict) else None
-                except ValueError:
-                    continue
-                if isinstance(event, dict):
-                    io_streak, lost = codex_track_io_lost(io_streak, event)
-                    if lost:
-                        with open(out_path, "a") as ev:
-                            ev.write(json.dumps({"type": "error", "error": lost, "streak": io_streak},
-                                                ensure_ascii=False) + "\n")
-                        set_status(rdir, last_error="codex shell returned exit 0 with empty output repeatedly")
-                        kill_tree(p.pid, grace=0.1)
-                        p.wait()
-                        return 134
-                if block:
-                    set_status(rdir, risk_blocks=[block], stop_requested=True)
-                    kill_tree(p.pid, grace=0.1)
-                    p.wait()
-                    return 133
-            if done:
-                return p.returncode
-            if NOW() >= end:
-                kill_tree(p.pid)
-                try:
-                    p.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
-                return 124
-            if abort_re is not None:
-                try:
-                    with open(out_path + ".err", errors="ignore") as f:
-                        f.seek(max(0, os.path.getsize(out_path + ".err") - 65536))
-                        if abort_re.search(f.read()):
-                            kill_tree(p.pid)
-                            try:
-                                p.wait(timeout=5)
-                            except subprocess.TimeoutExpired:
-                                pass
-                            return 75
-                except OSError:
-                    pass
-            time.sleep(0.05)
+        try:
+            set_status(rdir, executor_pid=p.pid, events=out_path, attempt_started=NOW())
+            end = NOW() + timeout
+            policy = load_policy()
+            offset, pending = 0, ""
+            io_streak = 0
+            while True:
+                done = p.poll() is not None
+                with open(out_path, errors="replace") as events:
+                    events.seek(offset)
+                    pending += events.read()
+                    offset = events.tell()
+                lines = pending.split("\n")
+                pending = lines.pop()
+                if done and pending:
+                    lines.append(pending)
+                    pending = ""
+                for line in lines:
+                    try:
+                        event = json.loads(line)
+                        block = enforced_risk(event, policy, cwd) if isinstance(event, dict) else None
+                    except ValueError:
+                        continue
+                    if isinstance(event, dict):
+                        io_streak, lost = codex_track_io_lost(io_streak, event)
+                        if lost:
+                            with open(out_path, "a") as ev:
+                                ev.write(json.dumps({"type": "error", "error": lost, "streak": io_streak},
+                                                    ensure_ascii=False) + "\n")
+                            set_status(rdir, last_error="codex shell returned exit 0 with empty output repeatedly")
+                            if not terminate_executor(p, grace=0.1):
+                                raise RuntimeError("executor process tree termination unconfirmed")
+                            return 134
+                    if block:
+                        set_status(rdir, risk_blocks=[block], stop_requested=True)
+                        if not terminate_executor(p, grace=0.1):
+                            raise RuntimeError("executor process tree termination unconfirmed")
+                        return 133
+                if done:
+                    return p.returncode
+                if NOW() >= end:
+                    if not terminate_executor(p):
+                        raise RuntimeError("executor process tree termination unconfirmed")
+                    return 124
+                if abort_re is not None:
+                    try:
+                        with open(out_path + ".err", errors="ignore") as f:
+                            f.seek(max(0, os.path.getsize(out_path + ".err") - 65536))
+                            if abort_re.search(f.read()):
+                                if not terminate_executor(p):
+                                    raise RuntimeError("executor process tree termination unconfirmed")
+                                return 75
+                    except OSError:
+                        pass
+                time.sleep(0.05)
+        except BaseException:
+            terminate_executor(p, grace=0.1)
+            raise
 
 
 def extract_json(text):
@@ -4216,7 +4227,8 @@ def exec_pi(d, st, prompt, wd, rdir, timeout, evp):
         cmd += ["--model", d["model"]]
     if d.get("_resume_session"):
         cmd.append("--continue")
-    tools, enforce_err = pi_read_only_tools_or_error(bool(d.get("read_only")))
+    tools, enforce_err = pi_read_only_tools_or_error(run_is_read_only(read_only=d.get("read_only"),
+                                                            card_type=d.get("card_type"), task_type=d.get("type")))
     if enforce_err:
         open(evp, "w").close()
         with open(evp + ".err", "w") as f:
@@ -5018,13 +5030,9 @@ def review_command(reviewer, prompt, repo, scratch_dir, policy):
         if model:
             command += ["--model", model]
     elif backend == "pi":
-        session_dir = os.path.join(scratch_dir, "pi-sessions")
-        command = [binary, "-p", "--mode", "json", "--session-dir", session_dir]
-        if reviewer.get("provider") or cfg.get("provider"):
-            command += ["--provider", reviewer.get("provider") or cfg["provider"]]
-        if model:
-            command += ["--model", model]
-        command += ["--tools", "read,grep,find,ls", prompt]
+        _, error = pi_read_only_tools_or_error(True)
+        if error:
+            raise RuntimeError(error)
     else:
         command = [binary, "-p", "--mode=ask", "--output-format", "text"]
         if model:
@@ -6552,7 +6560,8 @@ class AgyChild:
 
 
 def lane_pi_tools_for_spec(spec):
-    if run_is_read_only(read_only=spec.get("read_only"), card_type=spec.get("card_type")):
+    if run_is_read_only(read_only=spec.get("read_only"), card_type=spec.get("card_type"),
+                        task_type=spec.get("type")):
         return PI_READ_ONLY_TOOLS
     return None
 

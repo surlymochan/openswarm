@@ -94,14 +94,12 @@ def _profile(core, state, policy, backend, requested_model=None, lane=None):
 
 def default_profiles(core, state, policy):
     candidates = []
-    for backend in ("codex", "agy", "pi"):
+    for backend in ("codex", "agy"):
         profile = _profile(core, state, policy, backend)
         if not profile["binary"]:
             continue
         if backend == "agy" and (state.get("agy") or {}).get("login") == "not logged in":
             continue
-        if backend == "pi" and profile["provider"]:
-            profile["family"] = backend_family(backend, profile["model"], profile["provider"])
         if profile["family"] not in {row["family"] for row in candidates}:
             candidates.append(profile)
         if len(candidates) == 2:
@@ -149,15 +147,7 @@ def build_command(profile, prompt, run_dir):
         command += ["--mode", "plan", "--output-format", "json", "--json-schema", schema_path]
         return command
     if backend == "pi":
-        session_dir = os.path.join(run_dir, "pi-session")
-        os.makedirs(session_dir, exist_ok=True)
-        command = [binary, "-p", "--mode", "json", "--session-dir", session_dir]
-        if profile.get("provider"):
-            command += ["--provider", profile["provider"]]
-        if model:
-            command += ["--model", model]
-        command += ["--tools", READ_ONLY_PI_TOOLS, prompt]
-        return command
+        raise RuntimeError("pi read-only effective capabilities cannot be verified before prompting")
     raise ValueError(f"unsupported consult backend: {backend}")
 
 
