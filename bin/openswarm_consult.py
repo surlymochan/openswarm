@@ -580,7 +580,7 @@ def _pi_number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
-def _pi_message(message, role):
+def _pi_message(message, role, provider=None):
     if role == "user":
         _pi_object(message, ("role", "content", "timestamp"))
         if message["role"] != role or not isinstance(message["content"], str) or not _pi_number(message["timestamp"]):
@@ -589,6 +589,7 @@ def _pi_message(message, role):
     _pi_object(message, ("role", "content", "api", "provider", "model", "usage", "stopReason", "timestamp"),
                ("responseModel", "responseId"))
     if (message["role"] != "assistant" or message["stopReason"] != "stop" or
+            (provider is not None and message.get("provider") != provider) or
             not all(isinstance(message[k], str) for k in ("api", "provider", "model")) or
             not all(isinstance(message[k], str) for k in ("responseModel", "responseId") if k in message) or
             not _pi_number(message["timestamp"]) or not isinstance(message["content"], list)):
@@ -615,7 +616,7 @@ def _pi_message(message, role):
             raise ValueError("invalid Pi content")
 
 
-def pi_text_answer(stdout):
+def pi_text_answer(stdout, provider=None):
     """Accept one complete Pi 0.73 text-only prompt turn; reject unknown fields/events."""
     state = "agent_start"
     user = final = None
@@ -644,11 +645,11 @@ def pi_text_answer(stdout):
             state = "assistant_start"
         elif state == "assistant_start" and kind == "message_start":
             _pi_object(event, ("type", "message"))
-            _pi_message(event["message"], "assistant")
+            _pi_message(event["message"], "assistant", provider)
             state = "assistant"
         elif state == "assistant" and kind == "message_update":
             _pi_object(event, ("type", "message", "assistantMessageEvent"))
-            _pi_message(event["message"], "assistant")
+            _pi_message(event["message"], "assistant", provider)
             update = event["assistantMessageEvent"]
             if not isinstance(update, dict) or update.get("type") not in ("text_start", "text_delta", "text_end", "thinking_start", "thinking_delta", "thinking_end"):
                 raise ValueError("unexpected Pi update")
@@ -658,7 +659,7 @@ def pi_text_answer(stdout):
             if (not isinstance(update["contentIndex"], int) or isinstance(update["contentIndex"], bool) or update["contentIndex"] < 0 or
                     any(not isinstance(update[k], str) for k in extra)):
                 raise ValueError("invalid Pi update")
-            _pi_message(update["partial"], "assistant")
+            _pi_message(update["partial"], "assistant", provider)
             index = update["contentIndex"]
             content_type = update["type"].split("_")[0]
             content = update["partial"]["content"]
@@ -679,7 +680,7 @@ def pi_text_answer(stdout):
             final = event["message"]
             if active is not None:
                 raise ValueError("unfinished Pi update")
-            _pi_message(final, "assistant")
+            _pi_message(final, "assistant", provider)
             state = "turn_end"
         elif state == "turn_end" and kind == "turn_end":
             _pi_object(event, ("type", "message", "toolResults"))
@@ -854,6 +855,14 @@ def cmd_pi_text(args, core, policy):
     if args.text[-1] in PI_TEXT_TRIM:
         print("pi-text: trailing whitespace is unsupported by Pi stdin transport", file=sys.stderr)
         return 2
+    cfg = policy.get("pi")
+    provider = cfg.get("provider") if isinstance(cfg, dict) else None
+    model = cfg.get("default_model") if isinstance(cfg, dict) else None
+    # Slash-qualified models can select a different provider in Pi.
+    if not all(isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", value)
+               for value in (provider, model)):
+        print("pi-text: explicit supported pi.provider and pi.default_model are required", file=sys.stderr)
+        return 2
     binary = core.pi_bin()
     if not binary:
         print("pi-text: Pi executable unavailable", file=sys.stderr)
@@ -871,7 +880,7 @@ def cmd_pi_text(args, core, policy):
             signal.signal(signal.SIGTERM, stop_handler)
         core.set_status(slot_dir, id=slot_id, state="queued", runner_pid=os.getpid())
         if not core.reserve_provider_slot(
-                slot_dir, "pi", core.execution_provider("pi", policy=policy), policy,
+                slot_dir, "pi", provider, policy,
                 keep_waiting=lambda: not (core.jload(os.path.join(slot_dir, "status.json"), {}) or {}).get("stop_requested")):
             print("pi-text: stopped while waiting for a concurrency slot", file=sys.stderr)
             return 1
@@ -879,7 +888,7 @@ def cmd_pi_text(args, core, policy):
         help_code, help_output = _pi_run([binary, "--help"], timeout=10, cleanup_state=cleanup_state,
                                          include_stderr=True)
         if help_code or any(not re.search(r"(?<![\w-])" + re.escape(flag) + r"(?![\w-])", help_output)
-                                         for flag in PI_TEXT_FLAGS):
+                                         for flag in (*PI_TEXT_FLAGS, "--provider", "--model")):
             print("pi-text: Pi does not advertise all required restrictions", file=sys.stderr)
             return 1
         version_code, version = _pi_run([binary, "--version"], timeout=10, cleanup_state=cleanup_state,
@@ -887,13 +896,14 @@ def cmd_pi_text(args, core, policy):
         if version_code or version.strip() not in ("0.73.0", "0.73.1"):
             print("pi-text: unsupported Pi version for stdin transport", file=sys.stderr)
             return 1
-        command = [binary, "-p", "--mode", "json", *PI_TEXT_FLAGS, "--system-prompt", PI_TEXT_SYSTEM]
+        command = [binary, "-p", "--mode", "json", "--provider", provider, "--model", model,
+                   *PI_TEXT_FLAGS, "--system-prompt", PI_TEXT_SYSTEM]
         returncode, stdout = _pi_run(command, timeout=120, cleanup_state=cleanup_state,
                                      input_bytes=("Public input:\n" + args.text).encode("utf-8"))
         if returncode:
             print("pi-text: Pi execution failed", file=sys.stderr)
             return 1
-        answer = pi_text_answer(stdout)
+        answer = pi_text_answer(stdout, provider)
         print(json.dumps({"text": answer}, ensure_ascii=False))
         return 0
     except (OSError, subprocess.SubprocessError, UnicodeError, ValueError, _PiCleanupUncertain):

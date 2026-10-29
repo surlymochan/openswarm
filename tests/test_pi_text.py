@@ -77,8 +77,11 @@ class PiTextTests(unittest.TestCase):
         self.core = importlib.util.module_from_spec(spec)
         loader.exec_module(self.core)
         self.core.DATA, self.core.RUNS = self.home, os.path.join(self.home, "runs")
+        os.makedirs(self.home)
+        with open(os.path.join(self.home, "policy.local.json"), "w") as f:
+            json.dump({"pi": {"provider": "anthropic", "default_model": "example"}}, f)
         self.core.pi_bin = lambda: self.binary
-        self.env = {"FAKE_LOG": self.log, "FAKE_HELP": " ".join(consult.PI_TEXT_FLAGS),
+        self.env = {"FAKE_LOG": self.log, "FAKE_HELP": " ".join((*consult.PI_TEXT_FLAGS, "--provider", "--model")),
                     "FAKE_EVENTS": events(), "FAKE_RC": "0", "FAKE_HELP_RC": "0",
                     "FAKE_STDERR": "", "EXAMPLE_SECRET": "do-not-log-this"}
 
@@ -96,11 +99,37 @@ class PiTextTests(unittest.TestCase):
         with open(self.log) as f:
             captured = json.load(f)
         argv = captured["args"]
-        self.assertEqual(argv, ["-p", "--mode", "json", *consult.PI_TEXT_FLAGS,
+        self.assertEqual(argv, ["-p", "--mode", "json", "--provider", "anthropic", "--model", "example", *consult.PI_TEXT_FLAGS,
                                 "--system-prompt", consult.PI_TEXT_SYSTEM])
         self.assertEqual(captured["prompt"], "Public input:\n" + prompt)
         self.assertNotIn(prompt, json.dumps(argv) + output + error)
         self.assertNotIn("do-not-log-this", json.dumps(argv) + output + error)
+
+    def test_invalid_configuration_never_launches_pi(self):
+        for config in ({}, {"provider": "anthropic"}, {"default_model": "example"},
+                       {"provider": "", "default_model": "example"},
+                       {"provider": 1, "default_model": "example"},
+                       {"provider": "anthropic", "default_model": "other/example"},
+                       {"provider": "--other", "default_model": "example"}):
+            with self.subTest(config=config), mock.patch.object(self.core, "load_policy", return_value={"pi": config}), \
+                    mock.patch.object(consult, "_pi_run") as run:
+                self.assertEqual(self.invoke()[0], 2)
+                run.assert_not_called()
+                self.assertFalse(os.path.exists(self.log))
+
+    def test_provider_mismatch_is_rejected(self):
+        self.env["FAKE_EVENTS"] = events().replace('"provider": "anthropic"', '"provider": "other"')
+        code, output, error = self.invoke()
+        self.assertEqual(code, 1)
+        self.assertEqual(output, "")
+        self.assertIn("invalid response", error)
+
+    def test_missing_selection_flags_never_sends_input(self):
+        for flag in ("--provider", "--model"):
+            with self.subTest(flag=flag):
+                self.env["FAKE_HELP"] = " ".join(f for f in (*consult.PI_TEXT_FLAGS, "--provider", "--model") if f != flag)
+                self.assertEqual(self.invoke()[0], 1)
+                self.assertFalse(os.path.exists(self.log))
 
     def test_missing_flags_and_failures_are_closed_and_redacted(self):
         for settings in ({"FAKE_HELP": "--no-tools"}, {"FAKE_HELP_RC": "1"}, {"FAKE_VERSION": "0.74.0"},
@@ -115,7 +144,7 @@ class PiTextTests(unittest.TestCase):
                 self.assertEqual(code, 1)
                 self.assertEqual(output, "")
                 self.assertNotIn("do-not-log-this", error)
-                self.env.update({"FAKE_HELP": " ".join(consult.PI_TEXT_FLAGS), "FAKE_HELP_RC": "0",
+                self.env.update({"FAKE_HELP": " ".join((*consult.PI_TEXT_FLAGS, "--provider", "--model")), "FAKE_HELP_RC": "0",
                                  "FAKE_VERSION": "0.73.1", "FAKE_RC": "0", "FAKE_STDERR": "", "FAKE_EVENTS": events()})
 
     def test_stderr_help_and_supported_versions(self):
@@ -350,6 +379,9 @@ except KeyboardInterrupt: pass
 
     def test_cli_path_uses_fake_pi_and_releases_slot(self):
         home = os.path.join(self.tmp.name, "unused-home")
+        os.makedirs(home)
+        with open(os.path.join(home, "policy.local.json"), "w") as f:
+            json.dump({"pi": {"provider": "anthropic", "default_model": "example"}}, f)
         env = os.environ.copy()
         env.update(self.env, OPENSWARM_PI_BIN=self.binary, OPENSWARM_HOME=home)
         cli = os.path.join(os.path.dirname(os.path.dirname(__file__)), "bin", "openswarm")
@@ -361,12 +393,12 @@ except KeyboardInterrupt: pass
 
     def test_process_leases_cross_backends_failure_stop_and_unknown(self):
         cli = os.path.join(os.path.dirname(os.path.dirname(__file__)), "bin", "openswarm")
-        os.makedirs(self.home)
         env = os.environ.copy()
-        env.update(self.env, OPENSWARM_PI_BIN=self.binary, OPENSWARM_HOME=self.home)
+        env.update(self.env, OPENSWARM_PI_BIN=self.binary, OPENSWARM_HOME=self.home,
+                   FAKE_EVENTS=events().replace('"provider": "anthropic"', '"provider": "synthetic"'))
         def policy(concurrency):
             with open(os.path.join(self.home, "policy.local.json"), "w") as f:
-                json.dump({"concurrency": concurrency, "pi": {"provider": "synthetic"}}, f)
+                json.dump({"concurrency": concurrency, "pi": {"provider": "synthetic", "default_model": "example"}}, f)
         def wait_for(predicate):
             deadline = time.monotonic() + 8
             while time.monotonic() < deadline:
