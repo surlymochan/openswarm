@@ -5,6 +5,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -144,6 +145,31 @@ class PiTextTests(unittest.TestCase):
         for stream in ("stdout", "stderr"):
             with self.subTest(stream=stream), self.assertRaises(ValueError):
                 consult._pi_run([sys.executable, "-c", "import sys; sys." + stream + ".write('x' * 4097)"], 5, limit=4096)
+
+    def test_child_inherits_original_signal_mask(self):
+        original = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
+        try:
+            for operation in (signal.SIG_UNBLOCK, signal.SIG_BLOCK):
+                with self.subTest(operation=operation):
+                    signal.pthread_sigmask(operation, {signal.SIGTERM})
+                    expected = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+                    child = ("import json,signal; print(json.dumps(sorted(int(s) for s in "
+                             "signal.pthread_sigmask(signal.SIG_BLOCK, set()))))")
+                    code, output = consult._pi_run([sys.executable, "-c", child], 5)
+                    self.assertEqual(code, 0)
+                    self.assertEqual(json.loads(output), sorted(int(s) for s in expected))
+                    self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, set()), expected)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, original)
+
+    def test_child_terminates_normally_on_sigterm(self):
+        original = signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+        try:
+            child = "import os,signal; os.kill(os.getpid(), signal.SIGTERM); print('still running')"
+            code, output = consult._pi_run([sys.executable, "-c", child], 5)
+            self.assertEqual((code, output), (-signal.SIGTERM, ""))
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, original)
 
     def test_timeout_and_overflow_kill_child_and_grandchild(self):
         marker = os.path.join(self.tmp.name, "grandchild")

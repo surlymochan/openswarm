@@ -746,7 +746,15 @@ def _pi_run(command, timeout, limit=4 * 1024 * 1024, cleanup_state=None):
         raise _PiCleanupUncertain()
     old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
     try:
-        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        # A fresh interpreter avoids preexec_fn in threaded callers. It keeps the
+        # session leader's PID while restoring the caller's mask before exec.
+        launcher = ("import os,signal,sys; "
+                    "signal.pthread_sigmask(signal.SIG_SETMASK, "
+                    "[int(s) for s in sys.argv[1].split(',') if s]); "
+                    "os.execvp(sys.argv[2], sys.argv[2:])")
+        mask_arg = ",".join(str(int(sig)) for sig in old_mask)
+        process = subprocess.Popen([sys.executable, "-c", launcher, mask_arg, *command],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    start_new_session=True)
     except BaseException:
         signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
