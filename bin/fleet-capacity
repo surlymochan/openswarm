@@ -10,9 +10,9 @@ import sys
 import time
 
 ALLOWED = {'codex', 'pi', 'cursor', 'agy', 'copilot'}
-LIMITS = {'total': 8, 'host:gocc': 2, 'host:gores1': 2,
+LIMITS = {'total': 8, 'host:gocc': 2, 'host:gores1': 2, 'host:local': 2,
           'codex': 1, 'pi': 1, 'cursor': 1, 'agy': 1, 'copilot': 1, 'minimax-cn': 1}
-if len(sys.argv) != 2 or sys.argv[1] not in ('gocc', 'gores1'):
+if len(sys.argv) != 2 or sys.argv[1] not in ('gocc', 'gores1', 'local'):
     sys.exit('invalid authenticated host')
 host = sys.argv[1]
 try:
@@ -78,7 +78,7 @@ try:
         if host != 'gocc' or request.get('confirm') != 'all-executor-processes-stopped':
             raise ValueError('local explicit recovery confirmation required')
         owner, run_id = request.get('host'), request.get('run_id')
-        if owner not in ('gocc', 'gores1') or not isinstance(run_id, str) or not run_id:
+        if owner not in ('gocc', 'gores1', 'local') or not isinstance(run_id, str) or not run_id:
             raise ValueError('invalid reservation owner or run id')
         count = db.execute('DELETE FROM reservations WHERE host=? AND run_id=?', (owner,run_id)).rowcount
         out = {'ok': True, 'recovered': count}

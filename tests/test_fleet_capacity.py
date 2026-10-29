@@ -91,6 +91,26 @@ class FleetCapacityTests(unittest.TestCase):
         self.assertEqual(self.call('gocc', **third)['blocked'], ['host:gocc'])
         self.assertTrue(self.call('gores1', **third)['admitted'])
 
+    def test_local_host_shares_backend_limit_and_cannot_recover(self):
+        local = dict(op='acquire', token='1' * 32, run_id='local-turn', backend='codex', provider=None)
+        remote = dict(op='acquire', token='2' * 32, run_id='remote-run', backend='codex', provider=None)
+        self.assertTrue(self.call('local', **local)['admitted'])
+        self.assertEqual(self.call('gocc', **remote)['blocked'], ['codex'])
+        self.assertFalse(self.call('local', op='recover', host='local', run_id='local-turn',
+                                   confirm='all-executor-processes-stopped')['ok'])
+        self.assertEqual(self.call('gocc', op='recover', host='local', run_id='local-turn',
+                                   confirm='all-executor-processes-stopped')['recovered'], 1)
+        self.assertTrue(self.call('gocc', **remote)['admitted'])
+
+    def test_local_host_limit_applies_across_backends(self):
+        for i, backend in enumerate(('codex', 'agy', 'copilot'), 1):
+            result = self.call('local', op='acquire', token=f'{i:032x}', run_id=f'turn-{i}',
+                               backend=backend, provider=None)
+            if i < 3:
+                self.assertTrue(result['admitted'])
+            else:
+                self.assertEqual(result['blocked'], ['host:local'])
+
     def test_lane_rate_limit_wait_cannot_exceed_task_budget(self):
         spec = {'started': 100.0, 'budget_minutes': 1}
         with mock.patch.object(xs, 'NOW', return_value=160.0), \
