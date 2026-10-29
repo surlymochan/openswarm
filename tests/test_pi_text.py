@@ -88,9 +88,22 @@ class PiTextTests(unittest.TestCase):
     def invoke(self, text="public", approved=True):
         output, error = io.StringIO(), io.StringIO()
         args = types.SimpleNamespace(text=text, public_input_approved=approved)
-        with mock.patch.dict(os.environ, self.env), contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+        # Exercise the existing transport contract separately from the production gate.
+        with mock.patch.object(consult, "_pi_text_selection_proven", return_value=True), \
+                mock.patch.dict(os.environ, self.env), contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
             code = consult.cmd_pi_text(args, self.core, self.core.load_policy())
         return code, output.getvalue(), error.getvalue()
+
+    def test_unproven_selection_fails_before_binary_or_slot(self):
+        args = types.SimpleNamespace(text="public", public_input_approved=True)
+        error = io.StringIO()
+        with mock.patch.object(self.core, "pi_bin") as binary, \
+                mock.patch.object(self.core, "reserve_provider_slot") as slot, \
+                contextlib.redirect_stderr(error):
+            self.assertEqual(consult.cmd_pi_text(args, self.core, {"pi": {"provider": "Anthropic", "default_model": "example"}}), 1)
+        binary.assert_not_called()
+        slot.assert_not_called()
+        self.assertIn("exact Pi registry selection cannot be proven", error.getvalue())
 
     def test_exact_invocation_and_text_response(self):
         prompt = " \n@file --tools bash\n第二行"
@@ -431,10 +444,12 @@ except KeyboardInterrupt: pass
         cli = os.path.join(os.path.dirname(os.path.dirname(__file__)), "bin", "openswarm")
         result = subprocess.run([sys.executable, cli, "pi-text", "--public-input-approved", "--text", "public"],
                                 env=env, capture_output=True, text=True, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout), {"text": "hello"})
-        self.assertEqual(os.listdir(os.path.join(home, "runs")), [])
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("exact Pi registry selection cannot be proven", result.stderr)
+        self.assertFalse(os.path.exists(self.log))
 
+    @unittest.skip("pi-text dispatch is disabled until exact selection can be bound to the dispatched process")
     def test_process_leases_cross_backends_failure_stop_and_unknown(self):
         cli = os.path.join(os.path.dirname(os.path.dirname(__file__)), "bin", "openswarm")
         env = os.environ.copy()

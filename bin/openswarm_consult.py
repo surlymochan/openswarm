@@ -846,6 +846,12 @@ class _PiTextStopped(Exception):
     pass
 
 
+def _pi_text_selection_proven():
+    # Pi's CLI resolves against a freshly loaded registry in the dispatch process.
+    # A separate preflight cannot bind that selection to the subsequent process.
+    return False
+
+
 def cmd_pi_text(args, core, policy):
     try:
         valid_text = bool(args.text.strip(PI_TEXT_TRIM)) and "\x00" not in args.text and len(args.text.encode("utf-8")) <= PI_TEXT_LIMIT
@@ -865,6 +871,9 @@ def cmd_pi_text(args, core, policy):
                for value in (provider, model)):
         print("pi-text: explicit supported pi.provider and pi.default_model are required", file=sys.stderr)
         return 2
+    if not _pi_text_selection_proven():
+        print("pi-text: disabled: exact Pi registry selection cannot be proven before dispatch", file=sys.stderr)
+        return 1
     binary = core.pi_bin()
     if not binary:
         print("pi-text: Pi executable unavailable", file=sys.stderr)
