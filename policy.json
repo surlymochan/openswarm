@@ -241,6 +241,7 @@
     }
   ],
   "concurrency": {
+    "hosts": {"gocc": 2},
     "codex": 4,
     "minimax-cn": 6,
     "agy": 2,

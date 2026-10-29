@@ -3169,10 +3169,13 @@ AUTH_ERROR_RE = re.compile(r"(authentication required|not authenticated|unauthen
 
 
 def set_status(rdir, **kw):
-    s = jload(f"{rdir}/status.json", {}) or {}
-    s.update(kw)
-    s["updated"] = NOW()
-    jsave(f"{rdir}/status.json", s)
+    os.makedirs(rdir, exist_ok=True)
+    with open(f"{rdir}/.status.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        s = jload(f"{rdir}/status.json", {}) or {}
+        s.update(kw)
+        s["updated"] = NOW()
+        jsave(f"{rdir}/status.json", s)
 
 
 def concurrency_keys(backend, provider=None):
@@ -3207,31 +3210,35 @@ def reserve_provider_slot(rdir, backend, provider, policy, lane_name=None, keep_
     """Atomically admit a turn against provider/backend caps stored in policy.concurrency."""
     keys = concurrency_keys(backend, provider)
     limits = provider_concurrency_limits(policy, keys)
+    configured = policy.get("concurrency") or {}
+    hosts = configured.get("hosts") if isinstance(configured, dict) else {}
+    host = socket.gethostname().split(".")[0].lower()
+    value = hosts.get(host) if isinstance(hosts, dict) else None
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        limits["host"] = value
     lock_path = os.path.join(DATA, "provider-concurrency.lock")
     os.makedirs(DATA, exist_ok=True)
     os.makedirs(rdir, exist_ok=True)
     status_path = os.path.join(rdir, "status.json")
     while True:
+        if keep_waiting and not keep_waiting():
+            return False
         with open(lock_path, "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
+            if (jload(status_path, {}) or {}).get("stop_requested"):
+                return False
             active = {}
             for path in glob.glob(os.path.join(RUNS, "*", "status.json")):
                 if os.path.realpath(path) == os.path.realpath(status_path):
                     continue
                 row = jload(path, {}) or {}
-                if row.get("state") != "running":
-                    continue
-                pid = row.get("runner_pid")
-                if pid and not pid_alive(pid):
+                if row.get("state") not in (None, "unknown", "running", "quarantined"):
                     continue
                 active[row.get("id") or os.path.basename(os.path.dirname(path))] = row
             for path in glob.glob(os.path.join(DATA, "lanes", "*", "state.json")):
                 row = jload(path, {}) or {}
                 rid = row.get("current_run")
-                if row.get("turn_state") != "running" or not rid or rid in active:
-                    continue
-                pid = row.get("supervisor_pid")
-                if pid and not pid_alive(pid):
+                if row.get("turn_state") not in (None, "unknown", "running") or not rid or rid in active:
                     continue
                 active[rid] = {"backend": row.get("backend"), "provider": row.get("provider"),
                                "concurrency_keys": row.get("concurrency_keys") or []}
@@ -3239,7 +3246,7 @@ def reserve_provider_slot(rdir, backend, provider, policy, lane_name=None, keep_
             for row in active.values():
                 row_keys = row.get("concurrency_keys") or concurrency_keys(row.get("backend"), row.get("provider"))
                 for key in counts:
-                    if key in row_keys:
+                    if key == "host" or key in row_keys or row.get("state") in (None, "unknown") and not row.get("backend"):
                         counts[key] += 1
             if all(counts[key] < cap for key, cap in limits.items()):
                 set_status(rdir, state="running", backend=backend, provider=provider,
@@ -3252,8 +3259,6 @@ def reserve_provider_slot(rdir, backend, provider, policy, lane_name=None, keep_
                        **({"lane": lane_name} if lane_name else {}))
             if lane_name:
                 lane_write_state(lane_name, turn_state="queued", concurrency_keys=keys)
-        if keep_waiting and not keep_waiting():
-            return False
         time.sleep(max(0.01, poll))
 
 
@@ -3910,6 +3915,10 @@ def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
             while True:
                 observed.update(descendants(p.pid))
                 done = p.poll() is not None
+                if (jload(os.path.join(rdir, "status.json"), {}) or {}).get("stop_requested"):
+                    if not terminate_executor(p, grace=0.1, observed=observed):
+                        raise TerminationUnconfirmed("observed executor termination unconfirmed; workspace quarantined")
+                    return completed(130)
                 if done:
                     for reader in readers:
                         reader.join(timeout=0.1)
@@ -4994,7 +5003,7 @@ def cmd_run(args, policy):
         cleanup_worktree(ws, fin.get("commit"))
         fin["worktree"] = None
     stopped = bool((jload(f"{rdir}/status.json", {}) or {}).get("stop_requested"))
-    status = (result or {}).get("status") or ("stopped" if stopped else
+    status = "stopped" if stopped else (result or {}).get("status") or (
                                               "budget_exceeded" if attempts[-1]["error_class"] == "budget_exceeded" else "failed")
     if budget_denial:
         status, verify_note = "stopped", None
@@ -6903,6 +6912,8 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                 elif op == "abort":
                     if not active:
                         answer = {"ok": False, "error": f"lane {lane['name']} is idle"}
+                    elif req.get("run_id") and req["run_id"] != current.get("run_id"):
+                        answer = {"ok": False, "error": "lane is running a different run"}
                     else:
                         current["stop_requested"] = True
                         current["abort_requested"] = True
@@ -7137,10 +7148,10 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
         open(event_file, "w").close()
     deadline = spec["started"] + max(0, float(spec["budget_minutes"] or 0)) * 60
     provider = execution_provider(lane["backend"], policy=load_policy(), lane=lane)
-    set_status(rdir, state="running", lane=lane["name"], backend=lane["backend"], model=lane["model"],
+    set_status(rdir, state="running", backend=lane["backend"], model=lane["model"],
                effort=lane.get("effort"), provider=provider, concurrency_keys=concurrency_keys(lane["backend"], provider),
                workspace=ws["path"], events=event_file, attempt=attempt, deadline=deadline,
-               executor_pid=child.pid)
+               executor_pid=child.pid, **({"lane": lane["name"]} if server is not None else {}))
     lane_record_event(event_file, {"type": "lane_start", "lane": lane["name"]})
     if continuation:
         lane_continue_turn(lane, child, prompt, event_file, turn)
@@ -7201,6 +7212,9 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
         lane_abort_child(lane, child, turn)
         abort_deadline = NOW() + 30
     while not ended:
+        if server is None and (jload(os.path.join(rdir, "status.json"), {}) or {}).get("stop_requested"):
+            child.close()
+            return None, usage, "stopped", 130, event_file, None
         lane_control_messages(server, lane, spec, child, turn, pending)
         now = NOW()
         if not budget_hit and now >= deadline:
@@ -9769,23 +9783,15 @@ def cmd_stop(args, policy):
                           "note": "the GitHub issue was cancelled; the bus runner will finalize shortly"}))
         return
     if st.get("lane"):
-        response = lane_call(st["lane"], {"op": "abort"})
+        response = lane_call(st["lane"], {"op": "abort", "run_id": args.run_id})
         print(json.dumps({"id": args.run_id, "lane": st["lane"],
                           "signalled": ["abort"] if response.get("ok") else [],
                           "response": response,
                           "note": "lane supervisor remains running; it finalizes the stopped run"}, ensure_ascii=False))
         return
     set_status(rdir, stop_requested=NOW())
-    killed = []
-    # Stop the executor first so the runner can still finalize (commit partial work, write result/ledger).
-    targets = ["executor_pid"] if pid_alive(st.get("executor_pid")) else ["runner_pid"]
-    for k in targets:
-        pid = st.get(k)
-        if pid and pid_alive(pid):
-            kill_tree(pid)
-            killed.append(k)
-    print(json.dumps({"id": args.run_id, "signalled": killed,
-                      "note": "runner finalizes the worktree (commits partial work) when the executor exits"}))
+    print(json.dumps({"id": args.run_id, "signalled": ["stop_requested"],
+                      "note": "runner stops the executor and finalizes the run"}))
 
 
 def append_ledger(entry):

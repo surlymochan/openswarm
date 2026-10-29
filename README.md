@@ -113,6 +113,7 @@ Routing decisions use live quota data, not guesses.
   - `--verify-baseline` ignores failures that already exist on the base commit.
 - **Automatic fallback.** One-shot Pi, Codex and Cursor runs retry visible 429s in the same session; other fallback-eligible rate limits and model-at-capacity errors can move to another backend.
 - **Rate-limit recovery and provider caps.** Resident lanes retry visible provider 429s in the same session using `rate_limit.backoff_seconds` (default `[30, 60, 120, 240]`) and `rate_limit.max_retries` (default `4`). `concurrency` accepts provider/backend caps plus `total`; defaults are `{"codex": 4, "minimax-cn": 6, "total": 10}`. Excess local turns queue across lanes and runs.
+- **Host cap.** `concurrency.hosts` maps lowercase short hostnames to positive limits; the bundled policy sets `{"gocc": 2}`. For example, override it in `policy.local.json` with `{"concurrency":{"hosts":{"gocc":2}}}`. This cap shares the local admission lock across backends and resident lanes using the same `OPENSWARM_HOME`; running or unknown reservations consume capacity even if their runner PID is dead. Resolve stale reservations only after checking that their executors have stopped. Different data directories do not share a gate.
 - **Risk alerts.** `openswarm watch` streams progress and flags dangerous executor commands (push, `rm -rf ..`, secret prints, `sudo`, publish). It also reports stalls and heartbeats.
 - **Planner-friendly.**
   - `SKILL.md` teaches Claude Code the whole loop.

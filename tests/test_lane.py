@@ -16,9 +16,9 @@ FIXTURES = ROOT / "tests" / "fixtures"
 
 class LaneTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="oslane-", dir="/tmp")
+        self.tmp = tempfile.TemporaryDirectory(prefix="t", dir=ROOT)
         self.root = pathlib.Path(self.tmp.name)
-        self.data = self.root / "data"
+        self.data = self.root / "d"
         self.repo = self.root / "repo"
         self.repo.mkdir()
         self.git("init", "-q")
@@ -268,6 +268,31 @@ class LaneTests(unittest.TestCase):
         self.assertEqual(queued["queue_reason"], "provider concurrency limit")
         self.assertEqual(self.wait_run(first)["status"], "done")
         self.assertEqual(self.wait_run(second)["status"], "done")
+
+    def test_stop_queued_lane_does_not_start_turn(self):
+        self.set_config("pi")
+        config_path = self.data / "lanes.json"
+        config = json.loads(config_path.read_text())
+        second_lane = dict(config["lanes"][0], name="L2", backend="codex", model="fake-model", effort="xhigh")
+        second_lane.pop("provider", None)
+        second_lane["binary"] = str(FIXTURES / "fake_app_server.py")
+        config["lanes"].append(second_lane)
+        config_path.write_text(json.dumps(config))
+        (self.data / "policy.local.json").write_text(json.dumps({"concurrency": {"total": 1}}))
+        self.cli("lane", "up", "L1")
+        self.cli("lane", "up", "L2")
+        first = self.assign("LANE_TEST_WAIT hold slot")
+        self.wait_running(first)
+        second = json.loads(self.cli("lane", "assign", "L2", "--prompt", "queued stop").stdout)["id"]
+        self.wait_for(lambda: self.run_state(second).get("queue_reason"), description="queued lane")
+        self.cli("stop", second)
+        self.assertEqual(self.wait_run(second)["status"], "stopped")
+        result = json.loads((self.data / "runs" / second / "result.json").read_text())
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(result["attempts"][0]["seconds"], 0)
+        self.assertEqual(self.run_state(first)["state"], "running")
+        self.cli("stop", first)
+        self.assertEqual(self.wait_run(first)["status"], "stopped")
 
     def test_codex_assign_commits_and_writes_normal_result(self):
         self.start_lane()
