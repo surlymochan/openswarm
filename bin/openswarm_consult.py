@@ -581,7 +581,7 @@ def _pi_number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
-def _pi_message(message, role, provider=None, model=None):
+def _pi_message(message, role, provider=None, model=None, update=False):
     if role == "user":
         _pi_object(message, ("role", "content", "timestamp"))
         content = message["content"]
@@ -614,7 +614,9 @@ def _pi_message(message, role, provider=None, model=None):
         if not isinstance(part, dict):
             raise ValueError("invalid Pi content")
         if part.get("type") == "text":
-            _pi_object(part, ("type", "text"), ("textSignature",))
+            _pi_object(part, ("type", "text"), ("textSignature", "index") if update else ("textSignature",))
+            if "index" in part and (type(part["index"]) is not int or part["index"] < 0):
+                raise ValueError("invalid Pi content index")
             fields = ("text", "textSignature")
         elif part.get("type") == "thinking":
             _pi_object(part, ("type", "thinking"), ("thinkingSignature", "redacted"))
@@ -627,7 +629,7 @@ def _pi_message(message, role, provider=None, model=None):
             raise ValueError("invalid Pi content")
 
 
-def pi_text_answer(stdout, provider, model):
+def pi_text_answer(stdout, provider, model, expected_input):
     """Accept one complete Pi 0.73 text-only prompt turn; reject unknown fields/events."""
     state = "agent_start"
     user = final = None
@@ -662,9 +664,13 @@ def pi_text_answer(stdout, provider, model):
             _pi_object(event, ("type", "message"))
             user = event["message"]
             _pi_message(user, "user")
+            content = user["content"]
+            if (content if isinstance(content, str) else "".join(part["text"] for part in content)) != expected_input:
+                raise ValueError("mismatched Pi input")
             state = "user_end"
         elif state == "user_end" and kind == "message_end":
             _pi_object(event, ("type", "message"))
+            _pi_message(event["message"], "user")
             if event["message"] != user:
                 raise ValueError("mismatched Pi user message")
             state = "assistant_start"
@@ -674,7 +680,7 @@ def pi_text_answer(stdout, provider, model):
             state = "assistant"
         elif state == "assistant" and kind == "message_update":
             _pi_object(event, ("type", "message", "assistantMessageEvent"))
-            _pi_message(event["message"], "assistant", provider, model)
+            _pi_message(event["message"], "assistant", provider, model, update=True)
             update = event["assistantMessageEvent"]
             if not isinstance(update, dict) or update.get("type") not in ("text_start", "text_delta", "text_end", "thinking_start", "thinking_delta", "thinking_end"):
                 raise ValueError("unexpected Pi update")
@@ -684,7 +690,7 @@ def pi_text_answer(stdout, provider, model):
             if (not isinstance(update["contentIndex"], int) or isinstance(update["contentIndex"], bool) or update["contentIndex"] < 0 or
                     any(not isinstance(update[k], str) for k in extra)):
                 raise ValueError("invalid Pi update")
-            _pi_message(update["partial"], "assistant", provider, model)
+            _pi_message(update["partial"], "assistant", provider, model, update=True)
             index = update["contentIndex"]
             content_type = update["type"].split("_")[0]
             content = update["partial"]["content"]
@@ -714,6 +720,8 @@ def pi_text_answer(stdout, provider, model):
             state = "agent_end"
         elif state == "agent_end" and kind == "agent_end":
             _pi_object(event, ("type", "messages"))
+            if isinstance(event["messages"], list) and len(event["messages"]) == 2:
+                _pi_message(event["messages"][0], "user")
             if event["messages"] != [user, final]:
                 raise ValueError("invalid Pi transcript")
             state = "done"
@@ -928,7 +936,7 @@ def cmd_pi_text(args, core, policy):
         if returncode:
             print("pi-text: Pi execution failed", file=sys.stderr)
             return 1
-        answer = pi_text_answer(stdout, provider, model)
+        answer = pi_text_answer(stdout, provider, model, "Public input:\n" + args.text)
         print(json.dumps({"text": answer}, ensure_ascii=False))
         return 0
     except (OSError, subprocess.SubprocessError, UnicodeError, ValueError, _PiCleanupUncertain):

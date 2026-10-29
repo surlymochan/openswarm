@@ -88,7 +88,13 @@ class PiTextTests(unittest.TestCase):
     def invoke(self, text="public", approved=True):
         output, error = io.StringIO(), io.StringIO()
         args = types.SimpleNamespace(text=text, public_input_approved=approved)
-        with mock.patch.dict(os.environ, self.env), contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+        env = dict(self.env)
+        if env["FAKE_EVENTS"] == events():
+            items = json.loads(json.dumps(event_list()))
+            for message in (items[2]["message"], items[3]["message"], items[10]["messages"][0]):
+                message["content"] = "Public input:\n" + text
+            env["FAKE_EVENTS"] = "\n".join(json.dumps(e) for e in items)
+        with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
             code = consult.cmd_pi_text(args, self.core, self.core.load_policy())
         return code, output.getvalue(), error.getvalue()
 
@@ -155,9 +161,54 @@ class PiTextTests(unittest.TestCase):
         code, output, error = self.invoke()
         self.assertEqual((code, json.loads(output), error), (0, {"text": "hello"}, ""))
 
+    def test_update_text_index_is_nonnegative_integer_and_update_only(self):
+        for index in (0, 2):
+            items = json.loads(json.dumps(event_list()))
+            for event in items[5:8]:
+                event["message"]["content"][0]["index"] = index
+                event["assistantMessageEvent"]["partial"]["content"][0]["index"] = index
+            self.env.update(FAKE_VERSION="0.73.0", FAKE_EVENTS="\n".join(json.dumps(e) for e in items))
+            code, output, error = self.invoke()
+            self.assertEqual((code, json.loads(output), error), (0, {"text": "hello"}, ""))
+        for value in (True, False, -1, 1.0, "0", None, [], {}):
+            for location in ("message", "partial", "both"):
+                with self.subTest(value=value, location=location):
+                    items = json.loads(json.dumps(event_list()))
+                    if location in ("message", "both"):
+                        items[5]["message"]["content"][0]["index"] = value
+                    if location in ("partial", "both"):
+                        items[5]["assistantMessageEvent"]["partial"]["content"][0]["index"] = value
+                    with self.assertRaises(ValueError):
+                        consult.pi_text_answer("\n".join(json.dumps(e) for e in items), "anthropic", "example", "Public input:\npublic")
+        for location in (4, 8):
+            items = json.loads(json.dumps(event_list()))
+            items[location]["message"]["content"] = [{"type": "text", "text": "hello", "index": 0}]
+            with self.assertRaises(ValueError):
+                consult.pi_text_answer("\n".join(json.dumps(e) for e in items), "anthropic", "example", "Public input:\npublic")
+
+    def test_user_end_schema_and_submitted_input_are_bound(self):
+        for location in (3, 10):
+            items = json.loads(json.dumps(event_list()))
+            items[2]["message"]["timestamp"] = 1
+            items[3]["message"]["timestamp"] = 1
+            items[10]["messages"][0]["timestamp"] = 1
+            message = items[location]["messages"][0] if location == 10 else items[location]["message"]
+            message["timestamp"] = True
+            with self.assertRaises(ValueError):
+                consult.pi_text_answer("\n".join(json.dumps(e) for e in items), "anthropic", "example", "Public input:\npublic")
+        self.env["FAKE_EVENTS"] = events()
+        # A syntactically valid transcript of another prompt must not be accepted.
+        code, output, error = self.invoke("different")
+        self.assertEqual(code, 0)  # The fake normally echoes the submitted prompt.
+        self.assertEqual(json.loads(output), {"text": "hello"})
+        self.env["FAKE_EVENTS"] = events().replace("public", "other")
+        code, output, error = self.invoke()
+        self.assertEqual((code, output), (1, ""))
+        self.assertIn("invalid response", error)
+
     def test_user_text_blocks_and_strict_schema(self):
         for content in ("Public input:\npublic", [{"type": "text", "text": "Public input:\npublic"}],
-                        [{"type": "text", "text": "one"}, {"type": "text", "text": "two"}]):
+                        [{"type": "text", "text": "Public input:\n"}, {"type": "text", "text": "public"}]):
             with self.subTest(content=content):
                 items = json.loads(json.dumps(event_list()))
                 for message in (items[2]["message"], items[3]["message"], items[10]["messages"][0]):
@@ -175,7 +226,7 @@ class PiTextTests(unittest.TestCase):
                 for message in (items[2]["message"], items[3]["message"], items[10]["messages"][0]):
                     message["content"] = content
                 with self.assertRaises(ValueError):
-                    consult.pi_text_answer("\n".join(json.dumps(e) for e in items), "anthropic", "example")
+                    consult.pi_text_answer("\n".join(json.dumps(e) for e in items), "anthropic", "example", "Public input:\npublic")
 
         for index in (3, 10):
             with self.subTest(mismatch=index):
@@ -183,7 +234,7 @@ class PiTextTests(unittest.TestCase):
                 message = items[index]["messages"][0] if index == 10 else items[index]["message"]
                 message["content"] = [{"type": "text", "text": "Public input:\npublic"}]
                 with self.assertRaises(ValueError):
-                    consult.pi_text_answer("\n".join(json.dumps(e) for e in items), "anthropic", "example")
+                    consult.pi_text_answer("\n".join(json.dumps(e) for e in items), "anthropic", "example", "Public input:\npublic")
 
     def test_consistent_partial_and_final_model_mismatch_is_rejected(self):
         for location in ("partial", "final"):
@@ -196,7 +247,7 @@ class PiTextTests(unittest.TestCase):
                     for message in messages:
                         message[key] = "other"
                     with self.assertRaises(ValueError):
-                        consult.pi_text_answer("\n".join(json.dumps(e) for e in items), "anthropic", "example")
+                        consult.pi_text_answer("\n".join(json.dumps(e) for e in items), "anthropic", "example", "Public input:\npublic")
 
     def test_missing_selection_flags_never_sends_input(self):
         for flag in ("--provider", "--model"):
@@ -282,9 +333,9 @@ class PiTextTests(unittest.TestCase):
         for items in variants:
             with self.subTest(items=items):
                 with self.assertRaises(ValueError):
-                    consult.pi_text_answer("\n".join(json.dumps(e) for e in items), "anthropic", "example")
+                    consult.pi_text_answer("\n".join(json.dumps(e) for e in items), "anthropic", "example", "Public input:\npublic")
         with self.assertRaises(ValueError):
-            consult.pi_text_answer('{"type":"agent_start","type":"agent_start"}', "anthropic", "example")
+            consult.pi_text_answer('{"type":"agent_start","type":"agent_start"}', "anthropic", "example", "Public input:\npublic")
 
     def test_initial_session_header_is_validated_and_not_exposed(self):
         import copy
@@ -322,7 +373,7 @@ class PiTextTests(unittest.TestCase):
     def test_valid_thinking_and_text_events(self):
         content = [{"type": "thinking", "thinking": "reasoning", "thinkingSignature": "sig"},
                    {"type": "text", "text": "hello", "textSignature": "sig"}]
-        self.assertEqual(consult.pi_text_answer(events(content), "anthropic", "example"), "hello")
+        self.assertEqual(consult.pi_text_answer(events(content), "anthropic", "example", "Public input:\npublic"), "hello")
 
     def test_bounded_stdout_and_stderr(self):
         for stream in ("stdout", "stderr"):
