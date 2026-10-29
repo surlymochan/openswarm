@@ -3408,7 +3408,22 @@ ENFORCED_RISKS = ["push", "publish", "secret print", "rm outside worktree", "sud
 
 def event_commands(event):
     """Extract shell inputs, never assistant prose, from all supported event protocols."""
+    # Pi may encode tool arguments as JSON text; normalize them before summarizing.
+    if event.get("type") == "tool_execution_start":
+        args = event.get("args")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except ValueError as exc:
+                raise ValueError("malformed tool arguments") from exc
+        if not isinstance(args, dict):
+            raise ValueError("malformed tool arguments")
+        if "command" in args and not isinstance(args["command"], str):
+            raise ValueError("malformed command")
+        event = {**event, "args": args}
     kind, text = summarize_event(event)
+    if kind == "cmd" and text and not isinstance(text, str):
+        raise ValueError("malformed command")
     commands = [text] if kind == "cmd" and text else []
     method = event.get("method") or ""
     if method == "session/request_permission":
@@ -3419,7 +3434,7 @@ def event_commands(event):
             return commands
     elif method in ("item/commandExecution/requestApproval", "execCommandApproval"):
         payload = event.get("params") or {}
-    elif event.get("type") in ("tool_call", "tool_use"):
+    elif event.get("type") in ("tool_call", "tool_use", "tool_execution_start"):
         payload = event
     elif event.get("type") == "step_update":  # agy stream-json
         payload = event
@@ -3438,8 +3453,10 @@ def event_commands(event):
                 if key in ("command", "cmd"):
                     if isinstance(item, str):
                         commands.append(item)
-                    elif isinstance(item, list):
-                        commands.append(shlex.join(str(x) for x in item))
+                    elif isinstance(item, list) and all(isinstance(x, str) for x in item):
+                        commands.append(shlex.join(item))
+                    else:
+                        raise ValueError("malformed command")
                 elif isinstance(item, (dict, list)):
                     visit(item)
                 elif key in ("arguments", "rawInput", "input", "args") and isinstance(item, str):
@@ -3660,7 +3677,8 @@ def codex_command_io_empty(item):
 
 def codex_event_command_item(event):
     if event.get("method") == "item/completed":
-        return (event.get("params") or {}).get("item") or {}
+        params = event.get("params")
+        return params.get("item") or {} if isinstance(params, dict) else None
     if event.get("type") == "item.completed":
         return event.get("item") or {}
     return None
@@ -3677,6 +3695,14 @@ def codex_track_io_lost(streak, event, limit=CODEX_IO_LOST_STREAK):
 
 
 def enforced_risk(event, policy, worktree):
+    # Malformed tool-event fields are unknown, not evidence that the event is safe.
+    try:
+        return _enforced_risk(event, policy, worktree)
+    except (AttributeError, TypeError, ValueError, RecursionError):
+        return {"risk": "malformed event", "command": "[unparseable event]"}
+
+
+def _enforced_risk(event, policy, worktree):
     enforced = (policy.get("risk") or {}).get("enforce", ENFORCED_RISKS)
     aliases = {"git destructive/push": "push", "publish/release": "publish",
                "possible secret print": "secret print", "rm -r outside worktree": "rm outside worktree",

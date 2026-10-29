@@ -280,3 +280,33 @@ class GuardrailsTests(unittest.TestCase):
         self.assertEqual(report["totals"]["runs"], 0)
         self.assertEqual(report["slowest_runs"], [])
         self.assertIn("No runs", xs.daily_report_html(report))
+
+
+class MalformedRiskEventTests(unittest.TestCase):
+    def test_pi_structured_and_json_string_args(self):
+        for args in ({"command": "git push origin"}, '{"command":"git push origin"}'):
+            with self.subTest(args=args):
+                event = {"type": "tool_execution_start", "toolName": "bash", "args": args}
+                self.assertEqual(xs.enforced_risk(event, {}, os.getcwd())["risk"], "push")
+        event = {"type": "tool_execution_start", "args": {"command": "git status"}}
+        self.assertIsNone(xs.enforced_risk(event, {}, os.getcwd()))
+
+    def test_malformed_fields_are_unknown_and_do_not_crash(self):
+        events = [
+            {"type": "tool_execution_start", "args": '{"command":'},
+            {"type": "tool_execution_start", "args": '"git push"'},
+            {"type": "tool_execution_start", "args": ["git", "push"]},
+            {"type": "tool_execution_start", "args": {"command": {"bad": "value"}}},
+            {"type": "tool_execution_start", "args": {"command": 0}},
+            {"type": "tool_call", "args": {"command": ["git", 1]}},
+            {"method": "session/update", "params": "bad"},
+            {"method": "session/update", "params": {"update": ["bad"]}},
+            {"type": "tool_use", "part": {"tool": "bash", "state": "bad"}},
+            {"type": "item.started", "item": ["bad"]},
+        ]
+        for event in events:
+            with self.subTest(event=event):
+                block = xs.enforced_risk(event, {}, os.getcwd())
+                self.assertEqual(block["risk"], "malformed event")
+                self.assertNotIn("git push", json.dumps(block))
+        self.assertEqual(xs.codex_track_io_lost(3, {"method": "item/completed", "params": "bad"}), (0, None))
