@@ -559,6 +559,8 @@ PI_TEXT_FLAGS = ("--no-tools", "--no-extensions", "--no-skills", "--no-prompt-te
                  "--no-themes", "--no-context-files", "--no-session")
 PI_TEXT_LIMIT = 16000  # UTF-8 bytes
 PI_TEXT_SYSTEM = "Answer the supplied public text. You have no tools."
+# ECMAScript trim characters; Pi 0.73.1 trims piped input before prompting.
+PI_TEXT_TRIM = "\u0009\u000a\u000b\u000c\u000d\u0020\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
 
 
 def add_pi_text_parser(subparsers):
@@ -752,7 +754,7 @@ def _pi_cleanup(process):
         raise _PiCleanupUncertain() from error
 
 
-def _pi_run(command, timeout, limit=4 * 1024 * 1024, cleanup_state=None):
+def _pi_run(command, timeout, limit=4 * 1024 * 1024, cleanup_state=None, input_bytes=None):
     """Capture bounded stdout/stderr concurrently, failing closed on overflow or timeout."""
     if not all(hasattr(os, name) for name in ("waitid", "WNOWAIT")) or not hasattr(signal, "pthread_sigmask"):
         raise _PiCleanupUncertain()
@@ -766,7 +768,8 @@ def _pi_run(command, timeout, limit=4 * 1024 * 1024, cleanup_state=None):
                     "os.execvp(sys.argv[2], sys.argv[2:])")
         mask_arg = ",".join(str(int(sig)) for sig in old_mask)
         process = subprocess.Popen([sys.executable, "-c", launcher, mask_arg, *command],
-                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    start_new_session=True)
     except BaseException:
         signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
@@ -780,11 +783,25 @@ def _pi_run(command, timeout, limit=4 * 1024 * 1024, cleanup_state=None):
         with selectors.DefaultSelector() as selector:
             for stream in output:
                 selector.register(stream, selectors.EVENT_READ)
+            offset = 0
+            if input_bytes is not None:
+                if input_bytes:
+                    os.set_blocking(process.stdin.fileno(), False)
+                    selector.register(process.stdin, selectors.EVENT_WRITE)
+                else:
+                    process.stdin.close()
             while selector.get_map():
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise subprocess.TimeoutExpired(command, timeout)
                 for key, _ in selector.select(remaining):
+                    if key.fileobj is process.stdin:
+                        written = os.write(key.fd, input_bytes[offset:offset + 65536])
+                        offset += written
+                        if offset == len(input_bytes):
+                            selector.unregister(process.stdin)
+                            process.stdin.close()
+                        continue
                     data = os.read(key.fd, 65536)
                     if not data:
                         selector.unregister(key.fileobj)
@@ -814,6 +831,8 @@ def _pi_run(command, timeout, limit=4 * 1024 * 1024, cleanup_state=None):
         finally:
             process.stdout.close()
             process.stderr.close()
+            if process.stdin is not None:
+                process.stdin.close()
             signal.pthread_sigmask(signal.SIG_SETMASK, mask)
 
 
@@ -824,6 +843,9 @@ class _PiTextStopped(Exception):
 def cmd_pi_text(args, core, policy):
     if not args.public_input_approved or not args.text.strip() or "\x00" in args.text or len(args.text.encode("utf-8")) > PI_TEXT_LIMIT:
         print("pi-text: approved, non-empty public text of at most 16000 UTF-8 bytes is required", file=sys.stderr)
+        return 2
+    if args.text[-1] in PI_TEXT_TRIM:
+        print("pi-text: trailing whitespace is unsupported by Pi stdin transport", file=sys.stderr)
         return 2
     binary = core.pi_bin()
     if not binary:
@@ -852,9 +874,13 @@ def cmd_pi_text(args, core, policy):
                                          for flag in PI_TEXT_FLAGS):
             print("pi-text: Pi does not advertise all required restrictions", file=sys.stderr)
             return 1
-        command = [binary, "-p", "--mode", "json", *PI_TEXT_FLAGS, "--system-prompt", PI_TEXT_SYSTEM,
-                   "Public input:\n" + args.text]
-        returncode, stdout = _pi_run(command, timeout=120, cleanup_state=cleanup_state)
+        version_code, version = _pi_run([binary, "--version"], timeout=10, cleanup_state=cleanup_state)
+        if version_code or version.strip() != "0.73.1":
+            print("pi-text: unsupported Pi version for stdin transport", file=sys.stderr)
+            return 1
+        command = [binary, "-p", "--mode", "json", *PI_TEXT_FLAGS, "--system-prompt", PI_TEXT_SYSTEM]
+        returncode, stdout = _pi_run(command, timeout=120, cleanup_state=cleanup_state,
+                                     input_bytes=("Public input:\n" + args.text).encode("utf-8"))
         if returncode:
             print("pi-text: Pi execution failed", file=sys.stderr)
             return 1

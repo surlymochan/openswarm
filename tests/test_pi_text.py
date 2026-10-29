@@ -24,8 +24,12 @@ args = sys.argv[1:]
 if args == ["--help"]:
     print(os.environ.get("FAKE_HELP", ""))
     sys.exit(int(os.environ.get("FAKE_HELP_RC", "0")))
+if args == ["--version"]:
+    print(os.environ.get("FAKE_VERSION", "0.73.1"))
+    sys.exit(0)
+prompt = sys.stdin.buffer.read()
 with open(os.environ["FAKE_LOG"], "w") as f:
-    json.dump(args, f)
+    json.dump({"args": args, "prompt": prompt.decode("utf-8")}, f)
 if os.environ.get("FAKE_SLEEP"):
     time.sleep(float(os.environ["FAKE_SLEEP"]))
 print(os.environ.get("FAKE_EVENTS", ""))
@@ -86,16 +90,20 @@ class PiTextTests(unittest.TestCase):
         return code, output.getvalue(), error.getvalue()
 
     def test_exact_invocation_and_text_response(self):
-        code, output, error = self.invoke("@file --tools bash")
+        prompt = " \n@file --tools bash\n第二行"
+        code, output, error = self.invoke(prompt)
         self.assertEqual((code, json.loads(output), error), (0, {"text": "hello"}, ""))
         with open(self.log) as f:
-            argv = json.load(f)
+            captured = json.load(f)
+        argv = captured["args"]
         self.assertEqual(argv, ["-p", "--mode", "json", *consult.PI_TEXT_FLAGS,
-                                "--system-prompt", consult.PI_TEXT_SYSTEM, "Public input:\n@file --tools bash"])
+                                "--system-prompt", consult.PI_TEXT_SYSTEM])
+        self.assertEqual(captured["prompt"], "Public input:\n" + prompt)
+        self.assertNotIn(prompt, json.dumps(argv) + output + error)
         self.assertNotIn("do-not-log-this", json.dumps(argv) + output + error)
 
     def test_missing_flags_and_failures_are_closed_and_redacted(self):
-        for settings in ({"FAKE_HELP": "--no-tools"}, {"FAKE_HELP_RC": "1"},
+        for settings in ({"FAKE_HELP": "--no-tools"}, {"FAKE_HELP_RC": "1"}, {"FAKE_VERSION": "0.74.0"},
                          {"FAKE_RC": "1", "FAKE_STDERR": "do-not-log-this"},
                          {"FAKE_EVENTS": "not-json"}, {"FAKE_EVENTS": '{"type":"future"}'},
                          {"FAKE_EVENTS": events(reason="error")},
@@ -108,7 +116,7 @@ class PiTextTests(unittest.TestCase):
                 self.assertEqual(output, "")
                 self.assertNotIn("do-not-log-this", error)
                 self.env.update({"FAKE_HELP": " ".join(consult.PI_TEXT_FLAGS), "FAKE_HELP_RC": "0",
-                                 "FAKE_RC": "0", "FAKE_STDERR": "", "FAKE_EVENTS": events()})
+                                 "FAKE_VERSION": "0.73.1", "FAKE_RC": "0", "FAKE_STDERR": "", "FAKE_EVENTS": events()})
 
     def test_rejects_hidden_activity_and_malformed_lifecycle(self):
         import copy
@@ -199,7 +207,7 @@ time.sleep(30)
             killpg.assert_not_called()
         original = consult._pi_run
         def fail_cleanup(command, timeout, **kwargs):
-            if command[-1] != "--help":
+            if command[-1] not in ("--help", "--version"):
                 kwargs["cleanup_state"][0] = False
                 raise consult._PiCleanupUncertain()
             return original(command, timeout, **kwargs)
@@ -403,11 +411,38 @@ core.set_status(path, state="finished")
         self.assertFalse(any(r.get("id", "").startswith("pi-text-slot-") for r in rows()), stop_error)
 
     def test_input_bounds_and_approval_before_launch(self):
-        for text, approved in (("", True), ("x", False), ("é" * 8001, True), ("x\x00", True)):
+        for text, approved in (("", True), ("x", False), ("é" * 8001, True), ("x\x00", True),
+                               ("x\n", True), ("x\ufeff", True)):
             with self.subTest(text=text[:5], approved=approved):
                 self.assertEqual(self.invoke(text, approved)[0], 2)
                 self.assertFalse(os.path.exists(self.log))
         self.assertEqual(self.invoke("é" * 8000)[0], 0)
+        with open(self.log) as f:
+            self.assertEqual(json.load(f)["prompt"], "Public input:\n" + "é" * 8000)
+
+    def test_stdin_timeout_and_failure_do_not_disclose_input(self):
+        secret = "synthetic-public-marker"
+        original = consult._pi_run
+        for settings in ({"FAKE_RC": "1", "FAKE_STDERR": secret}, {"FAKE_SLEEP": "30"}):
+            with self.subTest(settings=settings), mock.patch.object(consult, "_pi_run") as run:
+                self.env.update(settings)
+                def short_timeout(command, timeout, **kwargs):
+                    return original(command, min(timeout, 0.5) if kwargs.get("input_bytes") else timeout, **kwargs)
+                run.side_effect = short_timeout
+                code, output, error = self.invoke(secret)
+                self.assertEqual(code, 1)
+                self.assertNotIn(secret, output + error)
+                with open(self.log) as f:
+                    self.assertNotIn(secret, json.dumps(json.load(f)["args"]))
+                self.env.update({"FAKE_RC": "0", "FAKE_STDERR": "", "FAKE_SLEEP": ""})
+
+    def test_stdin_blocked_reader_and_closed_pipe_fail(self):
+        with self.assertRaises(subprocess.TimeoutExpired):
+            consult._pi_run([sys.executable, "-c", "import time; time.sleep(30)"],
+                            0.5, input_bytes=b"x" * (2 * 1024 * 1024))
+        with self.assertRaises(BrokenPipeError):
+            consult._pi_run([sys.executable, "-c", "import os,time; os.close(0); time.sleep(1)"],
+                            5, input_bytes=b"x" * (2 * 1024 * 1024))
 
 
 if __name__ == "__main__":
