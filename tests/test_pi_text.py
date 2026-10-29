@@ -256,6 +256,39 @@ class PiTextTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             consult.pi_text_answer('{"type":"agent_start","type":"agent_start"}', "anthropic", "example")
 
+    def test_initial_session_header_is_validated_and_not_exposed(self):
+        import copy
+        session = {"type": "session", "version": 3, "id": "private-session-id",
+                   "timestamp": "2026-10-29T04:43:25.123Z", "cwd": "/private/working-directory"}
+        base = event_list()
+        self.env["FAKE_VERSION"] = "0.73.0"
+        self.env["FAKE_EVENTS"] = "\n".join(json.dumps(e) for e in [session, *base])
+        code, output, error = self.invoke()
+        self.assertEqual((code, json.loads(output), error), (0, {"text": "hello"}, ""))
+
+        variants = []
+        for key in session:
+            invalid = copy.deepcopy(session)
+            del invalid[key]
+            variants.append([invalid, *base])
+        for key, value in (("version", True), ("version", 0), ("version", "3"),
+                           ("id", ""), ("id", 1), ("timestamp", "not-a-date"),
+                           ("timestamp", "2026-02-30T04:43:25.123Z"),
+                           ("cwd", "relative"), ("cwd", None), ("extra", "hidden")):
+            invalid = dict(session, **{key: value})
+            variants.append([invalid, *base])
+        variants.extend(([session, session, *base], [base[0], session, *base[1:]],
+                         [*base, session], [{"type": "unexpected"}, *base]))
+        for items in variants:
+            with self.subTest(header=items[0], count=len(items)):
+                self.env["FAKE_EVENTS"] = "\n".join(json.dumps(e) for e in items)
+                code, output, error = self.invoke()
+                self.assertEqual(code, 1)
+                self.assertEqual(output, "")
+                self.assertIn("invalid response", error)
+                self.assertNotIn("private-session-id", error)
+                self.assertNotIn("/private/working-directory", error)
+
     def test_valid_thinking_and_text_events(self):
         content = [{"type": "thinking", "thinking": "reasoning", "thinkingSignature": "sig"},
                    {"type": "text", "text": "hello", "textSignature": "sig"}]

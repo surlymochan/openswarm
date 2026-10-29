@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Read-only, multi-backend consultation for openswarm."""
 import argparse
+import datetime
 import json
 import math
 import os
@@ -623,6 +624,7 @@ def pi_text_answer(stdout, provider, model):
     state = "agent_start"
     user = final = None
     active = None
+    session_seen = False
     for line in stdout.splitlines():
         try:
             event = json.loads(line, object_pairs_hook=_pi_unique_object,
@@ -632,7 +634,20 @@ def pi_text_answer(stdout, provider, model):
         if not isinstance(event, dict):
             raise ValueError("invalid Pi event")
         kind = event.get("type")
-        if state in ("agent_start", "turn_start") and kind == state:
+        if state == "agent_start" and kind == "session" and not session_seen:
+            _pi_object(event, ("type", "version", "id", "timestamp", "cwd"))
+            if (not isinstance(event["version"], int) or isinstance(event["version"], bool) or event["version"] <= 0 or
+                    not isinstance(event["id"], str) or not event["id"].strip() or
+                    not isinstance(event["cwd"], str) or not os.path.isabs(event["cwd"]) or "\x00" in event["cwd"] or
+                    not isinstance(event["timestamp"], str) or
+                    not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", event["timestamp"])):
+                raise ValueError("invalid Pi session")
+            try:
+                datetime.datetime.strptime(event["timestamp"], "%Y-%m-%dT%H:%M:%S.%fZ")
+            except ValueError:
+                raise ValueError("invalid Pi session") from None
+            session_seen = True
+        elif state in ("agent_start", "turn_start") and kind == state:
             _pi_object(event, ("type",))
             state = "turn_start" if state == "agent_start" else "user_start"
         elif state == "user_start" and kind == "message_start":
