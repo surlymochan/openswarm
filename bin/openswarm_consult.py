@@ -615,16 +615,17 @@ def _pi_message(message, role, provider=None, model=None, update=False):
             raise ValueError("invalid Pi content")
         if part.get("type") == "text":
             _pi_object(part, ("type", "text"), ("textSignature", "index") if update else ("textSignature",))
-            if "index" in part and (type(part["index"]) is not int or part["index"] < 0):
-                raise ValueError("invalid Pi content index")
             fields = ("text", "textSignature")
         elif part.get("type") == "thinking":
-            _pi_object(part, ("type", "thinking"), ("thinkingSignature", "redacted"))
+            _pi_object(part, ("type", "thinking"),
+                       ("thinkingSignature", "redacted", "index") if update else ("thinkingSignature", "redacted"))
             fields = ("thinking", "thinkingSignature")
             if "redacted" in part and not isinstance(part["redacted"], bool):
                 raise ValueError("invalid Pi content")
         else:
             raise ValueError("unexpected Pi content")
+        if "index" in part and (type(part["index"]) is not int or part["index"] < 0):
+            raise ValueError("invalid Pi content index")
         if not all(isinstance(part[k], str) for k in fields if k in part):
             raise ValueError("invalid Pi content")
 

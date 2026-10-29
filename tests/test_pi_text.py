@@ -375,6 +375,41 @@ class PiTextTests(unittest.TestCase):
                    {"type": "text", "text": "hello", "textSignature": "sig"}]
         self.assertEqual(consult.pi_text_answer(events(content), "anthropic", "example", "Public input:\npublic"), "hello")
 
+    def test_update_thinking_index_is_nonnegative_integer_and_update_only(self):
+        def transcript(index):
+            items = json.loads(json.dumps(event_list()))
+            thinking = {"type": "thinking", "thinking": "reasoning", "thinkingSignature": "sig", "index": index}
+            partial = dict(items[4]["message"], content=[thinking])
+            updates = [{"type": "message_update", "message": partial, "assistantMessageEvent":
+                        dict(type="thinking_" + suffix, contentIndex=0, partial=partial, **extra)}
+                       for suffix, extra in (("start", {}), ("delta", {"delta": "reasoning"}),
+                                             ("end", {"content": "reasoning"}))]
+            items[5:5] = json.loads(json.dumps(updates))
+            return items
+
+        def parse(items):
+            return consult.pi_text_answer("\n".join(json.dumps(e) for e in items),
+                                          "anthropic", "example", "Public input:\npublic")
+
+        for index in (0, 2):
+            with self.subTest(index=index):
+                self.assertEqual(parse(transcript(index)), "hello")
+        for value in (True, False, -1, 1.0, "0", None, [], {}):
+            for location in ("message", "partial", "both"):
+                with self.subTest(value=value, location=location):
+                    items = transcript(0)
+                    if location in ("message", "both"):
+                        items[5]["message"]["content"][0]["index"] = value
+                    if location in ("partial", "both"):
+                        items[5]["assistantMessageEvent"]["partial"]["content"][0]["index"] = value
+                    with self.assertRaises(ValueError):
+                        parse(items)
+        for location in (4, 11):
+            items = transcript(0)
+            items[location]["message"]["content"] = [{"type": "thinking", "thinking": "reasoning", "index": 0}]
+            with self.subTest(location=location), self.assertRaises(ValueError):
+                parse(items)
+
     def test_bounded_stdout_and_stderr(self):
         for stream in ("stdout", "stderr"):
             with self.subTest(stream=stream), self.assertRaises(ValueError):
