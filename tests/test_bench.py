@@ -54,8 +54,8 @@ class BenchOpenswarm(unittest.TestCase):
             second, _ = harness.route_all(xs, policy, catalogue, scenarios, trace)
             self.assertEqual(first, second)
             fresh = {(r["task_id"], r["backend"], r["model"]) for r in first if r["scenario"] == "fresh"}
-            self.assertIn(("t06", "codex", "gpt-6.1-sol"), fresh)
-            self.assertIn(("t24", "codex", "gpt-6-luna-fast"), fresh)
+            self.assertIn(("t06", "codex", "gpt-6-luna"), fresh)
+            self.assertIn(("t24", "codex", "gpt-6-luna"), fresh)
             self.assertTrue(all(r["failed_attempts"] == 0 for r in first))
         finally:
             os.environ.clear()
