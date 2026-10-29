@@ -1,0 +1,13 @@
+{
+  "id": "copilot",
+  "name": "GitHub Copilot CLI",
+  "role": "opt-in one-shot or resident ACP executor",
+  "invoke": "copilot -p <prompt> --model <model> --output-format json --sandbox --assisted-approval --no-ask-user --disable-builtin-mcps",
+  "binary_resolution": "OPENSWARM_COPILOT_BIN, else copilot on PATH",
+  "model": "--model, else policy copilot.default_model (auto)",
+  "streaming_events": "JSONL assistant.message, session.auto_mode_resolved and session.error",
+  "steerSupport": "resident ACP cancels and continues; one-shot has no live steer",
+  "privacyRisk": "model_provider",
+  "dataBoundary": "worktree and configured Copilot services",
+  "never": ["blanket tool, path, URL or MCP approval"]
+}

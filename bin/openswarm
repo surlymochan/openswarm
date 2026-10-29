@@ -1703,6 +1703,62 @@ def classify_codex(desc, policy):
     return "balanced"
 
 
+def codex_visible_models(binary):
+    """Ask the current account which models it can select; return None on probe failure."""
+    if not binary:
+        return None
+    proc = None
+    try:
+        proc = subprocess.Popen([binary, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True, bufsize=1, start_new_session=True)
+        events = queue.Queue()
+        def read_events():
+            for line in proc.stdout:
+                try:
+                    events.put(json.loads(line))
+                except ValueError:
+                    pass
+            events.put(None)
+        threading.Thread(target=read_events, daemon=True).start()
+        def request(request_id, method, params):
+            proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": request_id,
+                                         "method": method, "params": params}) + "\n")
+            proc.stdin.flush()
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                try:
+                    message = events.get(timeout=max(0.01, deadline - time.monotonic()))
+                except queue.Empty:
+                    return None
+                if message is None:
+                    return None
+                if isinstance(message, dict) and message.get("id") == request_id:
+                    return message.get("result") if not message.get("error") else None
+            return None
+        if request(1, "initialize", {"clientInfo": {"name": "openswarm-probe", "version": "1"}}) is None:
+            return None
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "initialized", "params": {}}) + "\n")
+        proc.stdin.flush()
+        result = request(2, "model/list", {"includeHidden": False, "limit": 100})
+        if not isinstance(result, dict) or not isinstance(result.get("data"), list) or result.get("nextCursor"):
+            return None
+        return {item.get("id") for item in result["data"] if isinstance(item, dict) and isinstance(item.get("id"), str)}
+    except (OSError, ValueError, BrokenPipeError):
+        return None
+    finally:
+        if proc is not None:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            for stream in (proc.stdin, proc.stdout):
+                if stream:
+                    stream.close()
+
+
 def codex_models(binary, policy):
     data = None
     if binary:
@@ -1716,10 +1772,13 @@ def codex_models(binary, policy):
     if not data:
         data = jload(f"{HOME}/.codex/models_cache.json", {}) or {}
         source = "models_cache.json"
+    visible = codex_visible_models(binary)
     models = []
     legacy_kw = policy["codex"]["legacy_keywords"]
     for m in data.get("models", []):
         if m.get("visibility") != "list":
+            continue
+        if visible is not None and m.get("slug") not in visible:
             continue
         desc = m.get("description") or ""
         efforts = [x["effort"] for x in m.get("supported_reasoning_levels", [])
@@ -1733,7 +1792,7 @@ def codex_models(binary, policy):
             "limit_id": policy["codex"]["limit_id_by_model"].get(m["slug"], policy["codex"]["default_limit_id"]),
         })
     models.sort(key=lambda x: x["priority"])
-    return models, source
+    return models, source + (" + account model/list" if visible is not None else " (account availability unverified)")
 
 
 def codex_limits(policy):
@@ -2779,7 +2838,8 @@ def plan_codex(prof, st, policy, forced, notes):
     for t in TIER_FALLBACK[tier]:
         cands = [m for m in cx["models"] if m["tier"] == t and f"codex/{m['id']}" not in br
                  and f"codex/limit/{m['limit_id']}" not in br]
-        cands.sort(key=lambda m: (m["legacy"], m["priority"]))
+        preferred = (policy.get("codex") or {}).get("default_model")
+        cands.sort(key=lambda m: (m["id"] != preferred if preferred else False, m["legacy"], m["priority"]))
         if prof.get("context_tokens") and cands:
             cands = [m for m in cands if (m.get("context_window") or 1e9) > prof["context_tokens"] * 1.15] or []
         if not cands:
@@ -2892,9 +2952,31 @@ def cursor_bin():
     return None
 
 
+def copilot_bin():
+    """Find Copilot CLI without inspecting its credentials."""
+    explicit = envvar("COPILOT_BIN")
+    if explicit:
+        return explicit if os.path.isfile(explicit) and os.access(explicit, os.X_OK) else None
+    binary = shutil.which("copilot")
+    return binary if binary and os.access(binary, os.X_OK) else None
+
+
+def plan_copilot(prof, st, policy, forced, notes):
+    if not copilot_bin():
+        return None, "no working copilot binary"
+    model = prof.get("model") or (policy.get("copilot") or {}).get("default_model")
+    if not model:
+        return None, "copilot requires a verified model selection"
+    if f"copilot/{model}" in breakers() or "copilot/all" in breakers():
+        return None, "copilot breaker open"
+    notes.append("copilot availability and usage depend on the signed-in account")
+    return {"backend": "copilot", "model": model, "effort": None,
+            "tier": policy["difficulty_map"][str(prof["difficulty"])]["tier"]}, None
+
+
 def probe_cursor(policy):
     cfg = policy.get("cursor") or {}
-    return {"binary": cursor_bin(), "default_model": cfg.get("default_model") or "grok-4.7-high", "quota": None}
+    return {"binary": cursor_bin(), "default_model": cfg.get("default_model") or "composer-2.5[fast=false]", "quota": None}
 
 
 def plan_cursor(prof, st, policy, forced, notes):
@@ -2902,7 +2984,7 @@ def plan_cursor(prof, st, policy, forced, notes):
     binary = known.get("binary") if known is not None and "binary" in known else cursor_bin()
     if not binary:
         return None, "no working cursor-agent binary"
-    model = prof.get("model") or (policy.get("cursor") or {}).get("default_model") or "grok-4.7-high"
+    model = prof.get("model") or (policy.get("cursor") or {}).get("default_model") or "composer-2.5[fast=false]"
     if f"cursor/{model}" in breakers() or "cursor/all" in breakers():
         return None, "cursor breaker open"
     notes.append("cursor quota unknown (opt-in backend; not metered by openswarm)")
@@ -2983,6 +3065,9 @@ def pi_bin():
     env_bin = envvar("PI_BIN")
     if env_bin:
         return env_bin if os.access(env_bin, os.X_OK) else None
+    isolated = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pi-isolated")
+    if os.path.isfile(isolated) and os.access(isolated, os.X_OK):
+        return isolated
     found = shutil.which("pi")
     if found and os.access(found, os.X_OK):
         return found
@@ -3000,10 +3085,22 @@ def probe_pi(policy):
 
 def plan_pi(prof, st, policy, forced, notes):
     known = st.get("pi") if isinstance(st.get("pi"), dict) else None
-    binary = known.get("binary") if known is not None and "binary" in known else pi_bin()
+    cfg = policy.get("pi") or {}
+    if cfg.get("require_isolation", True) and prof.get("read_only"):
+        return None, "isolated Pi does not yet support read-only runs"
+    binary = pi_bin() if cfg.get("require_isolation", True) else (
+        known.get("binary") if known is not None and "binary" in known else pi_bin())
     if not binary:
         return None, "no working pi binary"
-    model = prof.get("model") or (policy.get("pi") or {}).get("default_model")
+    if cfg.get("require_isolation", True):
+        expected = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pi-isolated")
+        if os.path.realpath(binary) != os.path.realpath(expected):
+            return None, "pi requires the isolated launcher"
+    model = prof.get("model") or cfg.get("default_model")
+    if cfg.get("require_isolation", True):
+        expected_model = envvar("PI_ISOLATED_MODEL") or "MiniMax-M3.1-Flash"
+        if cfg.get("provider") != "minimax-cn" or model != expected_model:
+            return None, "isolated Pi provider or model does not match the broker"
     if f"pi/{model or 'default'}" in breakers() or "pi/all" in breakers():
         return None, "pi breaker open"
     notes.append("pi quota unknown (opt-in backend; not metered by openswarm)")
@@ -3051,7 +3148,7 @@ def exec_hermes(d, st, prompt, wd, rdir, timeout, evp):
 
 
 PLANNERS = {"codex": plan_codex, "ocgo": plan_ocgo, "deepseek": plan_deepseek, "cursor": plan_cursor,
-            "agy": plan_agy, "pi": plan_pi, "hermes": plan_hermes}
+            "agy": plan_agy, "pi": plan_pi, "hermes": plan_hermes, "copilot": plan_copilot}
 
 
 def canonical_backend(name):
@@ -3352,7 +3449,8 @@ def run_executor_with_rate_limit(backend, decision, state, prompt, wd, rdir, bud
 
         trip_breaker(rate_limit_breaker_key(backend, decision, err_text or "rate limited"), policy,
                      (err_text or "rate limited")[-200:])
-        can_resume = backend in ("pi", "cursor", "agy") or (backend == "codex" and (meta or {}).get("thread_id"))
+        can_resume = (backend in ("pi", "cursor", "agy") or
+                      (backend == "codex" and (meta or {}).get("thread_id"))) and (meta or {}).get("resume_supported") is not False
         can_retry = retries < max_retries and can_resume
         wait_seconds = rate_limit_delay(policy, retries) if can_retry else 0
         lane_record_event(event_file, {"type": "RATELIMIT", "retry": retries + 1 if can_retry else retries,
@@ -3901,13 +3999,14 @@ def exec_cursor(d, st, prompt, wd, rdir, timeout, evp):
     stdin is /dev/null (run_proc) and cwd is the worktree. Quota is unknown; usage comes back on the result event.
     """
     binary = cursor_bin()
-    model = d.get("model") or (load_policy().get("cursor") or {}).get("default_model") or "grok-4.7-high"
+    model = d.get("model") or (load_policy().get("cursor") or {}).get("default_model") or "composer-2.5[fast=false]"
     if not binary:
         open(evp, "w").close()
         with open(evp + ".err", "w") as f:
             f.write("cursor-agent not found\n")
         return 127, None, {"usage": cursor_usage(None)}, "cursor-agent not found"
-    cmd = [binary, "-p", "--trust", "--force", "--model", model, "--output-format", "stream-json"]
+    cmd = [binary, "-p", "--trust", "--force", "--sandbox", "enabled", "--model", model,
+           "--output-format", "stream-json"]
     if d.get("_resume_session"):
         cmd.append("--continue")
     cmd += ["--", prompt]
@@ -4015,7 +4114,7 @@ def agy_step_text(payload):
 def agy_command(binary, model, prompt, effort=None, conversation=None, cfg=None):
     """The agy headless invocation: one prompt per process, events on stdout as NDJSON."""
     cmd = [binary, "-p", prompt, "--model", model, "--output-format", "stream-json",
-           "--dangerously-skip-permissions"]
+           "--sandbox", "--dangerously-skip-permissions"]
     if effort:
         cmd += ["--effort", effort]
     if conversation:
@@ -4127,6 +4226,10 @@ def exec_pi(d, st, prompt, wd, rdir, timeout, evp):
         with open(evp + ".err", "w") as f:
             f.write("pi not found\n")
         return 127, None, {"usage": {k: 0 for k in PI_USAGE_KEYS}}, "pi not found"
+    isolated = os.path.basename(os.path.realpath(binary)) == "pi-isolated"
+    if isolated and d.get("_resume_session"):
+        open(evp, "w").close()
+        return 1, None, {"usage": {}, "resume_supported": False}, "isolated Pi cannot resume a session"
     cfg = load_policy().get("pi") or {}
     sessions = os.path.abspath(os.path.join(rdir, "pi-sessions"))
     os.makedirs(sessions, exist_ok=True)
@@ -4148,11 +4251,54 @@ def exec_pi(d, st, prompt, wd, rdir, timeout, evp):
         err_tail = ""
     if errors and rc == 0:
         rc = 1
-    return rc, final, {"usage": usage}, "\n".join(errors) + err_tail
+    return rc, final, {"usage": usage, **({"resume_supported": False} if isolated else {})}, "\n".join(errors) + err_tail
+
+
+def exec_copilot(d, st, prompt, wd, rdir, timeout, evp):
+    """Run Copilot without blanket tool, path, URL or MCP permissions."""
+    binary = copilot_bin()
+    if not binary or not d.get("model"):
+        open(evp, "w").close()
+        return 127, None, {"usage": {}}, "copilot binary or model unavailable"
+    cmd = [binary, "-p", prompt, "--model", d["model"], "--output-format", "json",
+           "--sandbox", "--assisted-approval", "--no-ask-user", "--disable-builtin-mcps"]
+    rc = run_proc(cmd, wd, os.environ.copy(), timeout, evp)
+    final, errors, session_error, resolved_model = None, [], False, None
+    usage = {k: 0 for k in CURSOR_USAGE_KEYS}
+    with open(evp, errors="ignore") as stream:
+        for line in stream:
+            try:
+                event = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(event, dict):
+                continue
+            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            if event.get("type") == "session.auto_mode_resolved" and isinstance(data.get("chosenModel"), str):
+                resolved_model = data["chosenModel"]
+            if event.get("type") == "result" and event.get("exitCode") not in (None, 0):
+                session_error = True
+            if event.get("type") == "assistant.message" and isinstance(data.get("content"), str):
+                final = extract_json(data["content"]) or final
+            elif event.get("type") == "assistant.usage":
+                counts = cursor_usage(data)
+                for key in usage:
+                    usage[key] += counts[key]
+            elif event.get("type") == "session.error":
+                session_error = True
+                errors.append(short(data.get("message") or data.get("errorType") or "session error", 500))
+    try:
+        with open(evp + ".err", errors="ignore") as stream:
+            errors.append(stream.read()[-3000:])
+    except OSError:
+        pass
+    if rc == 0 and (session_error or final is None):
+        rc = 1
+    return rc, final, {"usage": usage, "resolved_model": resolved_model or d["model"]}, "\n".join(errors)
 
 
 EXECUTORS = {"codex": exec_codex, "ocgo": exec_opencode, "deepseek": exec_opencode, "cursor": exec_cursor,
-             "agy": exec_agy, "pi": exec_pi, "hermes": exec_hermes}
+             "agy": exec_agy, "pi": exec_pi, "hermes": exec_hermes, "copilot": exec_copilot}
 
 
 def git(args, cwd, timeout=60):
@@ -4528,6 +4674,8 @@ def cmd_run(args, policy):
             f.write(task)
     title = args.title or task.strip().splitlines()[0][:72]
     prof = profile_from_args(args)
+    prof["read_only"] = (getattr(args, "read_only", False) or
+                         prof.get("type") in READ_ONLY_CARD_TYPES or card_type in READ_ONLY_CARD_TYPES)
     budget_min = args.budget_minutes if args.budget_minutes is not None else policy["run"]["timeout_seconds"] / 60
     if args.backend == "github-issue":
         try:
@@ -4601,6 +4749,8 @@ def cmd_run(args, policy):
         for flag in ("no_worktree", "keep_worktree", "no_fallback"):
             if getattr(args, flag):
                 child.append(f"--{flag.replace('_', '-')}")
+        if getattr(args, "read_only", False):
+            child.append("--read-only")
         with open(f"{rdir}/run.out", "w") as out:
             p = subprocess.Popen(child, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                  start_new_session=True)
@@ -4817,6 +4967,8 @@ def review_available(policy):
     state = jload(state_path, {}) or {}
     available = {}
     for backend in REVIEW_BACKENDS:
+        if backend == "pi" and (policy.get("pi") or {}).get("require_isolation", True):
+            continue
         known = state.get(backend) if isinstance(state.get(backend), dict) else {}
         override_name = {"agy": "AGY_BIN", "pi": "PI_BIN", "cursor": "CURSOR_BIN"}.get(backend)
         explicit_override = envvar(override_name) if override_name else None
@@ -4946,6 +5098,8 @@ def review_command(reviewer, prompt, repo, scratch_dir, policy):
         if model:
             command += ["--model", model]
     elif backend == "pi":
+        if cfg.get("require_isolation", True):
+            raise ValueError("isolated Pi does not yet support read-only reviews")
         session_dir = os.path.join(scratch_dir, "pi-sessions")
         command = [binary, "-p", "--mode", "json", "--session-dir", session_dir]
         if reviewer.get("provider") or cfg.get("provider"):
@@ -6047,8 +6201,17 @@ def lane_config():
         if name in names:
             raise ValueError(f"invalid lane config {where}: duplicate lane name {name!r}")
         names.add(name)
-        if backend not in ("codex", "cursor", "agy", "pi", "hermes"):
-            raise ValueError(f"invalid lane config {where}: backend must be codex, cursor, agy, pi, or hermes")
+        if backend not in ("codex", "cursor", "agy", "pi", "hermes", "copilot"):
+            raise ValueError(f"invalid lane config {where}: unsupported backend")
+        if backend == "pi" and (load_policy().get("pi") or {}).get("require_isolation", True):
+            expected = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pi-isolated")
+            if lane.get("binary") and os.path.realpath(lane["binary"]) != os.path.realpath(expected):
+                raise ValueError(f"invalid lane config {where}: pi requires the isolated launcher")
+            lane["model"] = lane.get("model") or (load_policy().get("pi") or {}).get("default_model")
+            lane["provider"] = lane.get("provider") or (load_policy().get("pi") or {}).get("provider")
+            expected_model = envvar("PI_ISOLATED_MODEL") or "MiniMax-M3.1-Flash"
+            if lane["provider"] != "minimax-cn" or lane["model"] != expected_model or lane.get("fallback_models"):
+                raise ValueError(f"invalid lane config {where}: Pi provider or model must match the broker")
         repo = lane.get("repo")
         if not isinstance(repo, str) or not os.path.isabs(repo):
             raise ValueError(f"invalid lane config {where}: repo must be an absolute path")
@@ -6056,6 +6219,8 @@ def lane_config():
             raise ValueError(f"invalid lane config {where}: repo directory does not exist: {repo}")
         if backend == "cursor" and lane.get("model") is None:
             lane["model"] = "composer-2.5"
+        if backend == "copilot" and lane.get("model") is None:
+            lane["model"] = (load_policy().get("copilot") or {}).get("default_model") or "auto"
         if backend == "agy" and lane.get("model") is None:
             lane["model"] = AGY_DEFAULT_MODEL
         if backend == "hermes" and lane.get("model") is None:
@@ -6258,6 +6423,10 @@ class LaneChild:
             binary = envvar("PI_RPC_BIN") or lane.get("binary") or pi_bin()
             if not binary:
                 raise RuntimeError("pi binary not found; set lane binary or install Pi")
+            if (policy.get("pi") or {}).get("require_isolation", True):
+                expected = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pi-isolated")
+                if os.path.realpath(binary) != os.path.realpath(expected):
+                    raise RuntimeError("pi RPC requires the isolated launcher")
             sessions = os.path.abspath(os.path.join(lane_root(lane["name"]), "pi-sessions"))
             os.makedirs(sessions, exist_ok=True)
             cmd = [binary, "--mode", "rpc", "--session-dir", sessions]
@@ -6269,11 +6438,16 @@ class LaneChild:
             if not binary:
                 raise RuntimeError("hermes binary not found")
             cmd = [binary, "acp"]
+        elif backend == "copilot":
+            binary = envvar("COPILOT_BIN") or lane.get("binary") or copilot_bin()
+            if not binary:
+                raise RuntimeError("copilot binary not found")
+            cmd = [binary, "--sandbox", "--disable-builtin-mcps", "--acp"]
         else:
             binary = envvar("CURSOR_BIN") or lane.get("binary") or cursor_bin()
             if not binary:
                 raise RuntimeError("cursor-agent binary not found; set lane binary or install cursor-agent")
-            cmd = [binary, "acp"]
+            cmd = [binary, "--sandbox", "enabled", "acp"]
         child_env = dict(self.env) if getattr(self, "env", None) else os.environ.copy()
         self.secret = None
         if backend == "hermes":
@@ -6304,7 +6478,7 @@ class LaneChild:
             except Exception:
                 self.close()
                 raise
-        elif backend in ("cursor", "hermes"):
+        elif backend in ("cursor", "hermes", "copilot"):
             try:
                 self.send({"jsonrpc": "2.0", "id": "init", "method": "initialize",
                            "params": {"protocolVersion": 1, "clientCapabilities": {},
@@ -6361,7 +6535,7 @@ class LaneChild:
                     raise RuntimeError("executor stdout closed before RPC response")
                 if self.lane["backend"] == "codex" and item.get("id") == req_id and ("result" in item or "error" in item):
                     return item.get("result") or item
-                if self.lane["backend"] in ("cursor", "hermes") and item.get("id") == req_id and ("result" in item or "error" in item):
+                if self.lane["backend"] in ("cursor", "hermes", "copilot") and item.get("id") == req_id and ("result" in item or "error" in item):
                     return item
                 if self.lane["backend"] == "pi" and item.get("id") == req_id and item.get("type") == "response":
                     if not item.get("success"):
@@ -6370,7 +6544,7 @@ class LaneChild:
                 if event_file and item.get("method") and "id" in item:
                     if lane_approval_response(self, item, event_file):
                         continue
-                    if self.lane["backend"] in ("cursor", "hermes") and lane_acp_request(self, item, event_file):
+                    if self.lane["backend"] in ("cursor", "hermes", "copilot") and lane_acp_request(self, item, event_file):
                         continue
                 deferred.append(item)
             raise RuntimeError("executor RPC response timed out")
@@ -6532,7 +6706,10 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                 answer["state"] = jload(lane_state_path(lane["name"]), {})
             elif op == "assign":
                 state = jload(lane_state_path(lane["name"]), {}) or {}
-                if state.get("state") != "idle" or current.get("run_id"):
+                if (lane["backend"] == "pi" and (load_policy().get("pi") or {}).get("require_isolation", True)
+                        and (req.get("read_only") or req.get("card_type") in READ_ONLY_CARD_TYPES)):
+                    answer = {"ok": False, "error": "isolated Pi does not yet support read-only runs"}
+                elif state.get("state") != "idle" or current.get("run_id"):
                     answer = {"ok": False, "error": f"lane {lane['name']} is busy ({state.get('state')})"}
                 else:
                     rid = req.get("run_id")
@@ -6572,7 +6749,7 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                         answer = {"ok": False, "error": f"lane {lane['name']} is idle"}
                     else:
                         text = str(req.get("text") or "")
-                        if lane["backend"] in ("cursor", "hermes"):
+                        if lane["backend"] in ("cursor", "hermes", "copilot"):
                             event_file = current.get("_event_file") or os.path.join(
                                 RUNS, current.get("run_id", ""), f"events.1.{lane['backend']}.jsonl")
                             lane_record_event(event_file, {"type": "steer", "mode": "cancel-and-continue", "text": text})
@@ -6639,7 +6816,7 @@ def lane_abort_child(lane, child, turn):
                         "params": {"threadId": turn["thread_id"], "turnId": turn["id"]}})
         elif lane["backend"] == "pi":
             child.send({"id": f"abort-{uuid.uuid4().hex}", "type": "abort"})
-        elif lane["backend"] in ("cursor", "hermes") and turn.get("session_id") and turn.get("cursor_prompt_id"):
+        elif lane["backend"] in ("cursor", "hermes", "copilot") and turn.get("session_id") and turn.get("cursor_prompt_id"):
             child.send({"jsonrpc": "2.0", "method": "session/cancel",
                         "params": {"sessionId": turn["session_id"]}})
             turn["cursor_cancel_sent"] = True
@@ -6731,7 +6908,7 @@ def lane_begin_turn(lane, child, prompt, worktree, event_file, turn):
         if selected.get("error"):
             raise RuntimeError(f"cursor-agent ACP model selection failed: {short(selected['error'], 300)}")
         lane["resolved_model"] = resolved
-        if lane["backend"] == "cursor":
+        if lane["backend"] in ("cursor", "copilot"):
             lane_write_state(lane["name"], model=resolved, resolved_model=resolved)
         set_status(os.path.dirname(event_file), model=resolved, resolved_model=resolved)
         lane_cursor_start_prompt(child, turn, prompt)
@@ -6795,7 +6972,8 @@ def lane_acp_request(child, msg, event_file):
         return False
     params = msg.get("params") or {}
     options = params.get("options") or []
-    selected = next((option for kind in ("allow_always", "allow_once") for option in options
+    kinds = ("allow_once",) if getattr(child, "lane", {}).get("backend") == "copilot" else ("allow_always", "allow_once")
+    selected = next((option for kind in kinds for option in options
                      if isinstance(option, dict) and option.get("kind") == kind), None)
     tool_call = params.get("toolCall") or {}
     title = tool_call.get("title")
@@ -7048,6 +7226,9 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
                     final = extract_json("".join(turn.get("cursor_text") or [])) or final
                     ended = True
         if not child.alive() and not ended:
+            if lane["backend"] == "agy":
+                # Drain buffered events and EOF before deciding whether to resume a steer.
+                continue
             return None, usage, "risk_blocked" if spec.get("risk_blocks") else "exec_error", 1, event_file, "resident executor process exited"
     if spec.get("risk_blocks"):
         return final, usage, "risk_blocked", 133, event_file, None
@@ -7157,7 +7338,7 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
     out = {"id": rid, "status": status, "error_class": error_class, "title": title, "lane": lane["name"],
            "prepare": ws.get("prepare", []), "workspace_note": ws.get("workspace_note"), "verify": verify,
            "verify_note": verify_note, "backend": lane["backend"], "model": model, "effort": lane.get("effort"),
-           **({"resolved_model": model} if lane["backend"] == "cursor" else {}),
+           **({"resolved_model": model} if lane["backend"] in ("cursor", "copilot") else {}),
            "risk_blocks": spec.get("risk_blocks", []),
            "usage": usage, "seconds": round(sum(attempt["seconds"] for attempt in attempts), 3), "result": final, "workspace":
            {k: v for k, v in ws.items() if k in ("mode", "path", "repo", "base", "note", "lane")},
@@ -7191,7 +7372,7 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
 def lane_do_run(lane, spec, child, server, current):
     rid, rdir = spec["run_id"], os.path.join(RUNS, spec["run_id"])
     lane.pop("resolved_model", None)
-    if lane["backend"] == "cursor":
+    if lane["backend"] in ("cursor", "copilot"):
         lane_write_state(lane["name"], model=lane["model"], resolved_model=None)
     ws = None
     turn, pending = {}, []
@@ -9610,7 +9791,7 @@ def cmd_status(policy, refresh):
           f"{' ERROR ' + ds['error'] if ds.get('error') else ''}")
     cu = st.get("cursor") or {}
     print(f"Cursor   opt-in (--backend cursor) bin={cu.get('binary') or '-'} "
-          f"model={cu.get('default_model') or (policy.get('cursor') or {}).get('default_model') or 'grok-4.7-high'} "
+          f"model={cu.get('default_model') or (policy.get('cursor') or {}).get('default_model') or 'composer-2.5[fast=false]'} "
           f"quota=unknown")
     pi = st.get("pi") or {}
     print(f"Pi       opt-in (--backend pi) bin={pi.get('binary') or '-'} "
@@ -10477,7 +10658,7 @@ def main():
         the repeated argument definitions and their help text aligned.
         """
         if profile_backends is None:
-            profile_backends = ["codex", "ocgo", "deepseek", "cursor", "agy", "gemini", "pi", "hermes"]
+            profile_backends = ["codex", "ocgo", "deepseek", "cursor", "agy", "gemini", "pi", "hermes", "copilot"]
         for field in fields:
             if field == "profile":
                 p.add_argument("--type", default="impl",
@@ -10538,7 +10719,7 @@ def main():
 
     sp = sub.add_parser("run")
     add_dispatch_arguments(sp, "profile", "card-type", "rework-of", "paths", "prompt", "task-file", "title",
-                           profile_backends=["codex", "ocgo", "deepseek", "cursor", "agy", "gemini", "pi", "hermes",
+                           profile_backends=["codex", "ocgo", "deepseek", "cursor", "agy", "gemini", "pi", "hermes", "copilot",
                                              "github-issue"],
                            card_type_help="optional task card type from knowledge/card-types.yaml",
                            rework_of_help="run id this task is reworking")

@@ -85,6 +85,8 @@ def _model(core, state, policy, backend, requested=None, lane=None):
 
 
 def _profile(core, state, policy, backend, requested_model=None, lane=None):
+    if backend == "pi" and (policy.get("pi") or {}).get("require_isolation", True):
+        raise ValueError("isolated Pi does not yet support read-only consultations")
     provider = (lane or {}).get("provider") or (policy.get(backend) or {}).get("provider")
     model = _model(core, state, policy, backend, requested_model, lane)
     return {"backend": backend, "model": model, "family": backend_family(backend, model, provider),
@@ -95,6 +97,8 @@ def _profile(core, state, policy, backend, requested_model=None, lane=None):
 def default_profiles(core, state, policy):
     candidates = []
     for backend in ("codex", "agy", "pi"):
+        if backend == "pi" and (policy.get("pi") or {}).get("require_isolation", True):
+            continue
         profile = _profile(core, state, policy, backend)
         if not profile["binary"]:
             continue

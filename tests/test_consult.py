@@ -79,7 +79,8 @@ class ConsultTests(unittest.TestCase):
             "agy": {"binary": self.script, "default_model": "gemini-test"},
             "pi": {"binary": self.script, "default_model": "minimax-test"},
         }
-        self.policy = xs.deep_merge(POLICY, {"concurrency": {"codex": 2, "agy": 2, "pi": 2, "total": 8}})
+        self.policy = xs.deep_merge(POLICY, {"pi": {"require_isolation": False},
+                                             "concurrency": {"codex": 2, "agy": 2, "pi": 2, "total": 8}})
         self.env_keys = ("FAKE_CONSULT_LOG_DIR", "FAKE_CONSULT_BARRIER", "FAKE_CONSULT_TIMEOUT_BACKEND",
                          "FAKE_CONSULT_MALFORMED_BACKEND", "FAKE_CONSULT_REPAIR_BACKEND",
                          "FAKE_CONSULT_SLEEP_SECONDS")
@@ -194,6 +195,9 @@ class ConsultTests(unittest.TestCase):
         env = os.environ.copy()
         env.update({"OPENSWARM_HOME": self.data, "OPENSWARM_STATE_FILE": state_path,
                     "FAKE_CONSULT_LOG_DIR": self.logs})
+        os.makedirs(self.data, exist_ok=True)
+        with open(os.path.join(self.data, "policy.local.json"), "w", encoding="utf-8") as stream:
+            json.dump({"pi": {"require_isolation": False}}, stream)
         command = [sys.executable, os.path.join(os.path.dirname(os.path.dirname(__file__)), "bin", "openswarm"),
                    "consult", "--question", "Should this contract change?", "--ask", "agy", "--ask", "pi", "--json"]
         result = subprocess.run(command, cwd=self.repo, env=env, capture_output=True, text=True, timeout=10)
