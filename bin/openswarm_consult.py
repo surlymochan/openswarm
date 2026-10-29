@@ -6,11 +6,13 @@ import math
 import os
 import re
 import selectors
+import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
+import uuid
 
 
 CONSULT_SCHEMA = {
@@ -741,7 +743,11 @@ def _pi_run(command, timeout, limit=4 * 1024 * 1024):
         process.stderr.close()
 
 
-def cmd_pi_text(args, core):
+class _PiTextStopped(Exception):
+    pass
+
+
+def cmd_pi_text(args, core, policy):
     if not args.public_input_approved or not args.text.strip() or "\x00" in args.text or len(args.text.encode("utf-8")) > PI_TEXT_LIMIT:
         print("pi-text: approved, non-empty public text of at most 16000 UTF-8 bytes is required", file=sys.stderr)
         return 2
@@ -749,12 +755,27 @@ def cmd_pi_text(args, core):
     if not binary:
         print("pi-text: Pi executable unavailable", file=sys.stderr)
         return 1
+    slot_dir = None
+    previous_handler = None
     try:
         # Some Pi versions ignore unknown options. Never fall back to a less restricted invocation.
         help_code, help_output = _pi_run([binary, "--help"], timeout=10)
         if help_code or any(not re.search(r"(?<![\w-])" + re.escape(flag) + r"(?![\w-])", help_output)
                                          for flag in PI_TEXT_FLAGS):
             print("pi-text: Pi does not advertise all required restrictions", file=sys.stderr)
+            return 1
+        slot_id = "pi-text-slot-" + uuid.uuid4().hex
+        slot_dir = os.path.join(core.RUNS, slot_id)
+        if threading.current_thread() is threading.main_thread():
+            previous_handler = signal.getsignal(signal.SIGTERM)
+            def stop_handler(signum, frame):
+                raise _PiTextStopped()
+            signal.signal(signal.SIGTERM, stop_handler)
+        core.set_status(slot_dir, id=slot_id, state="queued", runner_pid=os.getpid())
+        if not core.reserve_provider_slot(
+                slot_dir, "pi", core.execution_provider("pi", policy=policy), policy,
+                keep_waiting=lambda: not (core.jload(os.path.join(slot_dir, "status.json"), {}) or {}).get("stop_requested")):
+            print("pi-text: stopped while waiting for a concurrency slot", file=sys.stderr)
             return 1
         command = [binary, "-p", "--mode", "json", *PI_TEXT_FLAGS, "--system-prompt", PI_TEXT_SYSTEM,
                    "Public input:\n" + args.text]
@@ -769,3 +790,12 @@ def cmd_pi_text(args, core):
         # Do not expose subprocess output, credentials, or environment values in diagnostics.
         print("pi-text: Pi failed or returned an invalid response", file=sys.stderr)
         return 1
+    except _PiTextStopped:
+        print("pi-text: stopped", file=sys.stderr)
+        return 1
+    finally:
+        if slot_dir:
+            core.set_status(slot_dir, state="finished", finished=core.NOW())
+            shutil.rmtree(slot_dir, ignore_errors=True)
+        if previous_handler is not None:
+            signal.signal(signal.SIGTERM, previous_handler)

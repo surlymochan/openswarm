@@ -3215,6 +3215,8 @@ def reserve_provider_slot(rdir, backend, provider, policy, lane_name=None, keep_
     while True:
         with open(lock_path, "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
+            if keep_waiting and not keep_waiting():
+                return False
             active = {}
             for path in glob.glob(os.path.join(RUNS, "*", "status.json")):
                 if os.path.realpath(path) == os.path.realpath(status_path):
@@ -10787,7 +10789,7 @@ def main():
 
     a = ap.parse_args()
     if a.cmd == "pi-text":
-        sys.exit(consult_module().cmd_pi_text(a, sys.modules[__name__]))
+        sys.exit(consult_module().cmd_pi_text(a, sys.modules[__name__], load_policy()))
     policy = load_policy()
     os.makedirs(DATA, exist_ok=True)
     if a.cmd == "probe":
