@@ -708,12 +708,55 @@ def _pi_unique_object(pairs):
     return result
 
 
-def _pi_run(command, timeout, limit=4 * 1024 * 1024):
+class _PiCleanupUncertain(Exception):
+    pass
+
+
+def _pi_cleanup(process):
+    """Signal only while the unreaped session leader still anchors the group ID."""
+    try:
+        exited = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        if exited is None and os.getpgid(process.pid) != process.pid:
+            raise _PiCleanupUncertain()
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            # macOS can report EPERM for a group containing only a zombie leader.
+            if exited is None:
+                raise
+        process.wait(timeout=2)
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                return
+            if time.monotonic() >= deadline:
+                raise _PiCleanupUncertain()
+            time.sleep(0.02)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise _PiCleanupUncertain() from error
+
+
+def _pi_run(command, timeout, limit=4 * 1024 * 1024, cleanup_state=None):
     """Capture bounded stdout/stderr concurrently, failing closed on overflow or timeout."""
-    process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if not all(hasattr(os, name) for name in ("waitid", "WNOWAIT")) or not hasattr(signal, "pthread_sigmask"):
+        raise _PiCleanupUncertain()
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    try:
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   start_new_session=True)
+    except BaseException:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        raise
+    if cleanup_state is not None:
+        cleanup_state[0] = False
     output = {process.stdout: bytearray(), process.stderr: bytearray()}
     deadline = time.monotonic() + timeout
     try:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
         with selectors.DefaultSelector() as selector:
             for stream in output:
                 selector.register(stream, selectors.EVENT_READ)
@@ -733,14 +776,25 @@ def _pi_run(command, timeout, limit=4 * 1024 * 1024):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(command, timeout)
-            returncode = process.wait(timeout=remaining)
+            while True:
+                result = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                if result is not None:
+                    returncode = result.si_status if result.si_code == os.CLD_EXITED else -result.si_status
+                    break
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                time.sleep(min(0.02, max(0, deadline - time.monotonic())))
         return returncode, bytes(output[process.stdout]).decode("utf-8")
     finally:
-        if process.poll() is None:
-            process.kill()
-            process.wait()
-        process.stdout.close()
-        process.stderr.close()
+        mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+        try:
+            _pi_cleanup(process)
+            if cleanup_state is not None:
+                cleanup_state[0] = True
+        finally:
+            process.stdout.close()
+            process.stderr.close()
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
 
 
 class _PiTextStopped(Exception):
@@ -756,14 +810,9 @@ def cmd_pi_text(args, core, policy):
         print("pi-text: Pi executable unavailable", file=sys.stderr)
         return 1
     slot_dir = None
+    cleanup_state = [True]
     previous_handler = None
     try:
-        # Some Pi versions ignore unknown options. Never fall back to a less restricted invocation.
-        help_code, help_output = _pi_run([binary, "--help"], timeout=10)
-        if help_code or any(not re.search(r"(?<![\w-])" + re.escape(flag) + r"(?![\w-])", help_output)
-                                         for flag in PI_TEXT_FLAGS):
-            print("pi-text: Pi does not advertise all required restrictions", file=sys.stderr)
-            return 1
         slot_id = "pi-text-slot-" + uuid.uuid4().hex
         slot_dir = os.path.join(core.RUNS, slot_id)
         if threading.current_thread() is threading.main_thread():
@@ -777,16 +826,22 @@ def cmd_pi_text(args, core, policy):
                 keep_waiting=lambda: not (core.jload(os.path.join(slot_dir, "status.json"), {}) or {}).get("stop_requested")):
             print("pi-text: stopped while waiting for a concurrency slot", file=sys.stderr)
             return 1
+        # Some Pi versions ignore unknown options. Never fall back to a less restricted invocation.
+        help_code, help_output = _pi_run([binary, "--help"], timeout=10, cleanup_state=cleanup_state)
+        if help_code or any(not re.search(r"(?<![\w-])" + re.escape(flag) + r"(?![\w-])", help_output)
+                                         for flag in PI_TEXT_FLAGS):
+            print("pi-text: Pi does not advertise all required restrictions", file=sys.stderr)
+            return 1
         command = [binary, "-p", "--mode", "json", *PI_TEXT_FLAGS, "--system-prompt", PI_TEXT_SYSTEM,
                    "Public input:\n" + args.text]
-        returncode, stdout = _pi_run(command, timeout=120)
+        returncode, stdout = _pi_run(command, timeout=120, cleanup_state=cleanup_state)
         if returncode:
             print("pi-text: Pi execution failed", file=sys.stderr)
             return 1
         answer = pi_text_answer(stdout)
         print(json.dumps({"text": answer}, ensure_ascii=False))
         return 0
-    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
+    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError, _PiCleanupUncertain):
         # Do not expose subprocess output, credentials, or environment values in diagnostics.
         print("pi-text: Pi failed or returned an invalid response", file=sys.stderr)
         return 1
@@ -794,8 +849,10 @@ def cmd_pi_text(args, core, policy):
         print("pi-text: stopped", file=sys.stderr)
         return 1
     finally:
-        if slot_dir:
+        if slot_dir and cleanup_state[0]:
             core.set_status(slot_dir, state="finished", finished=core.NOW())
             shutil.rmtree(slot_dir, ignore_errors=True)
+        elif slot_dir:
+            print("pi-text: cleanup uncertain; concurrency slot retained", file=sys.stderr)
         if previous_handler is not None:
             signal.signal(signal.SIGTERM, previous_handler)

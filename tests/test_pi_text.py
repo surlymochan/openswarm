@@ -145,6 +145,77 @@ class PiTextTests(unittest.TestCase):
             with self.subTest(stream=stream), self.assertRaises(ValueError):
                 consult._pi_run([sys.executable, "-c", "import sys; sys." + stream + ".write('x' * 4097)"], 5, limit=4096)
 
+    def test_timeout_and_overflow_kill_child_and_grandchild(self):
+        marker = os.path.join(self.tmp.name, "grandchild")
+        child = '''import subprocess, sys, time
+p = subprocess.Popen([sys.executable, "-c", "import os,sys,time; open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(30)", sys.argv[1]])
+while not __import__('os').path.exists(sys.argv[1]): time.sleep(0.01)
+if sys.argv[2] == 'overflow': print('x' * 4097, flush=True)
+time.sleep(30)
+'''
+        for mode, error in (("timeout", subprocess.TimeoutExpired), ("overflow", ValueError)):
+            with self.subTest(mode=mode):
+                if os.path.exists(marker):
+                    os.unlink(marker)
+                with self.assertRaises(error):
+                    consult._pi_run([sys.executable, "-c", child, marker, mode], 1, limit=4096)
+                with open(marker) as f:
+                    pid = int(f.read())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+
+    def test_unknown_identity_never_signals_and_retains_slot(self):
+        process = types.SimpleNamespace(pid=12345)
+        with mock.patch.object(consult.os, "waitid", side_effect=ChildProcessError), \
+                mock.patch.object(consult.os, "killpg") as killpg:
+            with self.assertRaises(consult._PiCleanupUncertain):
+                consult._pi_cleanup(process)
+            killpg.assert_not_called()
+        original = consult._pi_run
+        def fail_cleanup(command, timeout, **kwargs):
+            if command[-1] != "--help":
+                kwargs["cleanup_state"][0] = False
+                raise consult._PiCleanupUncertain()
+            return original(command, timeout, **kwargs)
+        with mock.patch.object(consult, "_pi_run", side_effect=fail_cleanup):
+            code, _, error = self.invoke()
+        self.assertEqual(code, 1)
+        self.assertIn("slot retained", error)
+        slots = os.listdir(self.core.RUNS)
+        self.assertEqual(len(slots), 1)
+        self.assertEqual(self.core.jload(os.path.join(self.core.RUNS, slots[0], "status.json"))["state"], "running")
+
+    def test_cancellation_kills_grandchild(self):
+        marker = os.path.join(self.tmp.name, "cancel-grandchild")
+        runner = '''import signal, sys
+sys.path.insert(0, sys.argv[1])
+import openswarm_consult as c
+def stop(*args): raise KeyboardInterrupt()
+signal.signal(signal.SIGTERM, stop)
+child = "import subprocess,sys,time; subprocess.Popen([sys.executable, '-c', \\\"import os,sys,time; open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(30)\\\", sys.argv[1]]); time.sleep(30)"
+try: c._pi_run([sys.executable, '-c', child, sys.argv[2]], 20)
+except KeyboardInterrupt: pass
+'''
+        bin_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "bin")
+        process = subprocess.Popen([sys.executable, "-c", runner, bin_dir, marker],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 5
+            while not os.path.exists(marker) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(os.path.exists(marker))
+            with open(marker) as f:
+                pid = int(f.read())
+            process.terminate()
+            _, stderr = process.communicate(timeout=8)
+            self.assertEqual(process.returncode, 0, stderr)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
     def test_cancelled_waiter_is_not_admitted_when_capacity_is_free(self):
         slot = os.path.join(self.core.RUNS, "cancelled")
         self.core.set_status(slot, state="queued", stop_requested=1)
