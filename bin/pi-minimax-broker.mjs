@@ -21,6 +21,8 @@ const server = createServer((req, res) => {
   const fail = (status, message) => { if (!res.headersSent) res.writeHead(status, {'content-type': 'text/plain'}); res.end(message); };
   if (busy || accepted >= 64) return fail(503, 'broker temporarily unavailable');
   if (req.method !== 'POST' || !['/v1/messages', '/v1/messages?beta=true'].includes(req.url)) return fail(403, 'request refused');
+  const beta = req.headers['anthropic-beta'];
+  if (beta !== undefined && (typeof beta !== 'string' || !/^[a-z0-9, -]{1,512}$/i.test(beta))) return fail(400, 'invalid beta header');
   const length = Number(req.headers['content-length']);
   if (!Number.isSafeInteger(length) || length < 1 || length > maxBytes || req.headers['transfer-encoding']) return fail(400, 'invalid size');
   busy = true;
@@ -54,9 +56,10 @@ const server = createServer((req, res) => {
     // Forward the parsed value, not the original bytes: duplicate JSON keys must not
     // let the upstream select a different model from the one checked above.
     const payload = Buffer.from(JSON.stringify(parsed));
-    const outgoing = https.request({hostname: 'api.minimaxi.com', port: 443, path: '/anthropic/v1/messages',
+    const outgoing = https.request({hostname: 'api.minimaxi.com', port: 443, path: '/anthropic' + req.url,
       method: 'POST', timeout: 180000, headers: {'content-type': 'application/json', 'content-length': payload.length,
-        'anthropic-version': '2023-06-01', 'x-api-key': key, 'authorization': 'Bearer ' + key}}, upstream => {
+        'anthropic-version': '2023-06-01', ...(beta === undefined ? {} : {'anthropic-beta': beta}),
+        'x-api-key': key, 'authorization': 'Bearer ' + key}}, upstream => {
       if (upstream.statusCode < 200 || upstream.statusCode >= 300) {
         upstream.resume(); release(); return fail(upstream.statusCode || 502, 'provider request failed');
       }

@@ -26,6 +26,46 @@ class UnixHTTP(http.client.HTTPConnection):
 
 @unittest.skipUnless(shutil.which('node'), 'requires node')
 class PiBrokerTests(unittest.TestCase):
+    def test_beta_request_preserves_upstream_opt_in(self):
+        with tempfile.TemporaryDirectory() as root:
+            module = pathlib.Path(root, 'auth.mjs')
+            module.write_text('export class AuthStorage { static create() { return { getApiKey: async () => "fake-key" }; } }')
+            capture = pathlib.Path(root, 'request.json')
+            preload = pathlib.Path(root, 'fake.cjs')
+            preload.write_text('''
+const https = require('node:https');
+const fs = require('node:fs');
+const {EventEmitter} = require('node:events');
+const {PassThrough} = require('node:stream');
+https.request = (options, callback) => {
+  fs.writeFileSync(process.env.REQUEST_CAPTURE, JSON.stringify({path: options.path, beta: options.headers['anthropic-beta']}));
+  const req = new EventEmitter(); req.destroy = () => {};
+  req.end = () => { const upstream = new PassThrough(); upstream.statusCode = 200; upstream.headers = {}; upstream.complete = true; callback(upstream); upstream.end('ok'); };
+  return req;
+};
+''')
+            path = os.path.join(root, 'broker.sock')
+            env = dict(os.environ, NODE_OPTIONS='--require=' + str(preload), REQUEST_CAPTURE=str(capture))
+            proc = subprocess.Popen(['node', str(BROKER), path, str(module), 'allowed-model'],
+                                    env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                deadline = time.monotonic() + 5
+                while not os.path.exists(path) and proc.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(os.path.exists(path))
+                client = UnixHTTP(path)
+                client.request('POST', '/v1/messages?beta=true', json.dumps({'model': 'allowed-model', 'messages': []}),
+                               {'anthropic-beta': 'interleaved-thinking-2025-05-14'})
+                response = client.getresponse()
+                self.assertEqual(response.status, 200)
+                response.read()
+                client.close()
+                self.assertEqual(json.loads(capture.read_text()), {'path': '/anthropic/v1/messages?beta=true',
+                    'beta': 'interleaved-thinking-2025-05-14'})
+            finally:
+                proc.terminate()
+                proc.wait(timeout=5)
+
     def test_aborted_upstream_releases_busy_slot(self):
         with tempfile.TemporaryDirectory() as root:
             module = pathlib.Path(root, 'auth.mjs')
