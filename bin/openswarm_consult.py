@@ -716,8 +716,20 @@ def _pi_cleanup(process):
     """Signal only while the unreaped session leader still anchors the group ID."""
     try:
         exited = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
-        if exited is None and os.getpgid(process.pid) != process.pid:
-            raise _PiCleanupUncertain()
+        if exited is None:
+            try:
+                if os.getpgid(process.pid) != process.pid:
+                    raise _PiCleanupUncertain()
+            except ProcessLookupError:
+                # The leader may have exited after waitid but before getpgid.
+                # Only an unreaped, confirmed exit still anchors its group ID.
+                deadline = time.monotonic() + 2
+                while exited is None:
+                    exited = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                    if exited is None:
+                        if time.monotonic() >= deadline:
+                            raise _PiCleanupUncertain()
+                        time.sleep(0.02)
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:

@@ -211,6 +211,47 @@ time.sleep(30)
         self.assertEqual(len(slots), 1)
         self.assertEqual(self.core.jload(os.path.join(self.core.RUNS, slots[0], "status.json"))["state"], "running")
 
+    def test_cleanup_leader_exits_between_waitid_and_getpgid(self):
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                                   start_new_session=True)
+        waitid = os.waitid
+        calls = [0]
+        def delayed_waitid(*args):
+            calls[0] += 1
+            if calls[0] == 2:
+                return None  # Model the transient exit state observed on macOS.
+            return waitid(*args)
+        def exit_before_getpgid(pid):
+            os.kill(pid, signal.SIGKILL)
+            deadline = time.monotonic() + 5
+            while waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+                if time.monotonic() >= deadline:
+                    self.fail("child did not exit")
+                time.sleep(0.01)
+            raise ProcessLookupError()
+        try:
+            with mock.patch.object(consult.os, "waitid", side_effect=delayed_waitid), \
+                    mock.patch.object(consult.os, "getpgid", side_effect=exit_before_getpgid):
+                consult._pi_cleanup(process)
+            self.assertIsNotNone(process.returncode)
+            self.assertGreaterEqual(calls[0], 3)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+    def test_cleanup_missing_group_with_live_or_unknown_child_is_uncertain(self):
+        process = types.SimpleNamespace(pid=12345)
+        for second in (None, ChildProcessError()):
+            with self.subTest(second=second), \
+                    mock.patch.object(consult.os, "waitid", side_effect=[None, second]), \
+                    mock.patch.object(consult.os, "getpgid", side_effect=ProcessLookupError), \
+                    mock.patch.object(consult.time, "monotonic", side_effect=[0, 3]), \
+                    mock.patch.object(consult.os, "killpg") as killpg:
+                with self.assertRaises(consult._PiCleanupUncertain):
+                    consult._pi_cleanup(process)
+                killpg.assert_not_called()
+
     def test_cancellation_kills_grandchild(self):
         marker = os.path.join(self.tmp.name, "cancel-grandchild")
         runner = '''import signal, sys
@@ -357,9 +398,9 @@ core.set_status(path, state="finished")
         wait_for(lambda: os.path.exists(self.log))
         stop = subprocess.run([sys.executable, cli, "stop", running["id"]], env=env, capture_output=True, text=True, timeout=5)
         self.assertEqual(stop.returncode, 0, stop.stderr)
-        text.communicate(timeout=5)
+        _, stop_error = text.communicate(timeout=5)
         self.assertNotEqual(text.returncode, 0)
-        self.assertFalse(any(r.get("id", "").startswith("pi-text-slot-") for r in rows()))
+        self.assertFalse(any(r.get("id", "").startswith("pi-text-slot-") for r in rows()), stop_error)
 
     def test_input_bounds_and_approval_before_launch(self):
         for text, approved in (("", True), ("x", False), ("é" * 8001, True), ("x\x00", True)):
