@@ -28,12 +28,28 @@ sys.exit(int(os.environ.get("FAKE_RC", "0")))
 '''
 
 
+def event_list(content=None, reason="stop"):
+    user = {"role": "user", "content": "Public input:\npublic", "timestamp": 1700000000000}
+    usage = {"input": 12, "output": 3, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 15,
+             "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0}}
+    assistant = {"role": "assistant", "api": "anthropic-messages", "provider": "anthropic",
+                 "model": "example", "usage": usage, "timestamp": 1700000000001,
+                 "stopReason": reason, "content": content if content is not None else [{"type": "text", "text": "hello"}]}
+    partial = dict(assistant, content=[{"type": "text", "text": "hello"}])
+    return [{"type": "agent_start"}, {"type": "turn_start"},
+            {"type": "message_start", "message": user}, {"type": "message_end", "message": user},
+            {"type": "message_start", "message": dict(assistant, content=[])},
+            *[{"type": "message_update", "message": partial, "assistantMessageEvent":
+               dict(type="text_" + suffix, contentIndex=0, partial=partial, **extra)}
+              for suffix, extra in (("start", {}), ("delta", {"delta": "hello"}),
+                                    ("end", {"content": "hello"}))],
+            {"type": "message_end", "message": assistant},
+            {"type": "turn_end", "message": assistant, "toolResults": []},
+            {"type": "agent_end", "messages": [user, assistant]}]
+
+
 def events(content=None, reason="stop"):
-    return "\n".join(json.dumps(x) for x in [
-        {"type": "agent_start"},
-        {"type": "message_end", "message": {"role": "assistant", "stopReason": reason,
-         "content": content if content is not None else [{"type": "text", "text": "hello"}]}},
-        {"type": "agent_end"}])
+    return "\n".join(json.dumps(x) for x in event_list(content, reason))
 
 
 class PiTextTests(unittest.TestCase):
@@ -71,7 +87,7 @@ class PiTextTests(unittest.TestCase):
                          {"FAKE_EVENTS": "not-json"}, {"FAKE_EVENTS": '{"type":"future"}'},
                          {"FAKE_EVENTS": events(reason="error")},
                          {"FAKE_EVENTS": events([{"type": "toolCall", "name": "bash"}])},
-                         {"FAKE_EVENTS": events().replace('{"type": "agent_end"}', '')}):
+                         {"FAKE_EVENTS": "\n".join(events().splitlines()[:-1])}):
             with self.subTest(settings=settings):
                 self.env.update(settings)
                 code, output, error = self.invoke()
@@ -80,6 +96,42 @@ class PiTextTests(unittest.TestCase):
                 self.assertNotIn("do-not-log-this", error)
                 self.env.update({"FAKE_HELP": " ".join(consult.PI_TEXT_FLAGS), "FAKE_HELP_RC": "0",
                                  "FAKE_RC": "0", "FAKE_STDERR": "", "FAKE_EVENTS": events()})
+
+    def test_rejects_hidden_activity_and_malformed_lifecycle(self):
+        import copy
+        base = event_list()
+        variants = []
+        def variant(change):
+            items = copy.deepcopy(base)
+            change(items)
+            variants.append(items)
+        variant(lambda x: x[5]["assistantMessageEvent"].update(type="toolcall_delta"))
+        variant(lambda x: x[5]["assistantMessageEvent"]["partial"]["content"].append(
+            {"type": "toolCall", "id": "1", "name": "bash", "arguments": {}}))
+        variant(lambda x: x[9]["toolResults"].append({"role": "toolResult"}))
+        variant(lambda x: x[10]["messages"].append({"role": "toolResult"}))
+        variant(lambda x: x[8]["message"].pop("stopReason"))
+        variant(lambda x: x.insert(6, x.pop(10)))
+        variant(lambda x: x[8]["message"].update(content="hello"))
+        variant(lambda x: x[8]["message"]["content"][0].update(text={"type": "toolCall"}))
+        variant(lambda x: x[0].update(message={"role": "toolResult"}))
+        variant(lambda x: x.append({"type": "agent_start"}))
+        for items in variants:
+            with self.subTest(items=items):
+                with self.assertRaises(ValueError):
+                    consult.pi_text_answer("\n".join(json.dumps(e) for e in items))
+        with self.assertRaises(ValueError):
+            consult.pi_text_answer('{"type":"agent_start","type":"agent_start"}')
+
+    def test_valid_thinking_and_text_events(self):
+        content = [{"type": "thinking", "thinking": "reasoning", "thinkingSignature": "sig"},
+                   {"type": "text", "text": "hello", "textSignature": "sig"}]
+        self.assertEqual(consult.pi_text_answer(events(content)), "hello")
+
+    def test_bounded_stdout_and_stderr(self):
+        for stream in ("stdout", "stderr"):
+            with self.subTest(stream=stream), self.assertRaises(ValueError):
+                consult._pi_run([sys.executable, "-c", "import sys; sys." + stream + ".write('x' * 4097)"], 5, limit=4096)
 
     def test_cli_path_uses_fake_pi_without_creating_openswarm_home(self):
         home = os.path.join(self.tmp.name, "unused-home")

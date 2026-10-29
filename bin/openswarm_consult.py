@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+import selectors
 import signal
 import subprocess
 import sys
@@ -566,40 +567,178 @@ def add_pi_text_parser(subparsers):
     return parser
 
 
+def _pi_object(value, required, optional=()):
+    if not isinstance(value, dict) or not set(required) <= value.keys() or value.keys() - set(required) - set(optional):
+        raise ValueError("invalid Pi schema")
+
+
+def _pi_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _pi_message(message, role):
+    if role == "user":
+        _pi_object(message, ("role", "content", "timestamp"))
+        if message["role"] != role or not isinstance(message["content"], str) or not _pi_number(message["timestamp"]):
+            raise ValueError("invalid Pi user message")
+        return
+    _pi_object(message, ("role", "content", "api", "provider", "model", "usage", "stopReason", "timestamp"),
+               ("responseModel", "responseId"))
+    if (message["role"] != "assistant" or message["stopReason"] != "stop" or
+            not all(isinstance(message[k], str) for k in ("api", "provider", "model")) or
+            not all(isinstance(message[k], str) for k in ("responseModel", "responseId") if k in message) or
+            not _pi_number(message["timestamp"]) or not isinstance(message["content"], list)):
+        raise ValueError("invalid Pi assistant message")
+    usage = message["usage"]
+    _pi_object(usage, ("input", "output", "cacheRead", "cacheWrite", "totalTokens", "cost"))
+    _pi_object(usage["cost"], ("input", "output", "cacheRead", "cacheWrite", "total"))
+    if not all(_pi_number(usage[k]) for k in ("input", "output", "cacheRead", "cacheWrite", "totalTokens")) or not all(_pi_number(v) for v in usage["cost"].values()):
+        raise ValueError("invalid Pi usage")
+    for part in message["content"]:
+        if not isinstance(part, dict):
+            raise ValueError("invalid Pi content")
+        if part.get("type") == "text":
+            _pi_object(part, ("type", "text"), ("textSignature",))
+            fields = ("text", "textSignature")
+        elif part.get("type") == "thinking":
+            _pi_object(part, ("type", "thinking"), ("thinkingSignature", "redacted"))
+            fields = ("thinking", "thinkingSignature")
+            if "redacted" in part and not isinstance(part["redacted"], bool):
+                raise ValueError("invalid Pi content")
+        else:
+            raise ValueError("unexpected Pi content")
+        if not all(isinstance(part[k], str) for k in fields if k in part):
+            raise ValueError("invalid Pi content")
+
+
 def pi_text_answer(stdout):
-    """Accept only a completed Pi JSON event stream with a text-only assistant response."""
-    answer = None
-    ended = False
-    known = {"agent_start", "agent_end", "turn_start", "turn_end", "message_start",
-             "message_update", "message_end"}
+    """Accept one complete Pi 0.73 text-only prompt turn; reject unknown fields/events."""
+    state = "agent_start"
+    user = final = None
+    active = None
     for line in stdout.splitlines():
         try:
-            event = json.loads(line)
-        except ValueError:
+            event = json.loads(line, object_pairs_hook=_pi_unique_object,
+                               parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+        except (ValueError, RecursionError):
             raise ValueError("invalid Pi event stream") from None
-        if not isinstance(event, dict) or event.get("type") not in known:
-            raise ValueError("unknown Pi event")
-        if event["type"] == "agent_end":
-            ended = True
-        message = event.get("message")
-        if isinstance(message, dict):
-            if message.get("role") == "toolResult":
-                raise ValueError("Pi reported tool activity")
-            content = message.get("content", [])
-            if isinstance(content, list) and any(isinstance(part, dict) and
-                    part.get("type") in ("toolCall", "tool_use") for part in content):
-                raise ValueError("Pi reported tool activity")
-            if event["type"] == "message_end" and message.get("role") == "assistant":
-                if message.get("stopReason") not in (None, "stop") or message.get("errorMessage"):
-                    raise ValueError("Pi reported an unsuccessful response")
-                if not isinstance(content, list) or any(not isinstance(part, dict) or
-                        part.get("type") not in ("text", "thinking") for part in content):
-                    raise ValueError("unknown Pi response content")
-                answer = "".join(part.get("text", "") for part in content if part.get("type") == "text"
-                                 and isinstance(part.get("text"), str))
-    if not ended or not answer or not answer.strip():
+        if not isinstance(event, dict):
+            raise ValueError("invalid Pi event")
+        kind = event.get("type")
+        if state in ("agent_start", "turn_start") and kind == state:
+            _pi_object(event, ("type",))
+            state = "turn_start" if state == "agent_start" else "user_start"
+        elif state == "user_start" and kind == "message_start":
+            _pi_object(event, ("type", "message"))
+            user = event["message"]
+            _pi_message(user, "user")
+            state = "user_end"
+        elif state == "user_end" and kind == "message_end":
+            _pi_object(event, ("type", "message"))
+            if event["message"] != user:
+                raise ValueError("mismatched Pi user message")
+            state = "assistant_start"
+        elif state == "assistant_start" and kind == "message_start":
+            _pi_object(event, ("type", "message"))
+            _pi_message(event["message"], "assistant")
+            state = "assistant"
+        elif state == "assistant" and kind == "message_update":
+            _pi_object(event, ("type", "message", "assistantMessageEvent"))
+            _pi_message(event["message"], "assistant")
+            update = event["assistantMessageEvent"]
+            if not isinstance(update, dict) or update.get("type") not in ("text_start", "text_delta", "text_end", "thinking_start", "thinking_delta", "thinking_end"):
+                raise ValueError("unexpected Pi update")
+            suffix = update["type"].split("_")[1]
+            extra = {"start": (), "delta": ("delta",), "end": ("content",)}[suffix]
+            _pi_object(update, ("type", "contentIndex", "partial", *extra))
+            if (not isinstance(update["contentIndex"], int) or isinstance(update["contentIndex"], bool) or update["contentIndex"] < 0 or
+                    any(not isinstance(update[k], str) for k in extra)):
+                raise ValueError("invalid Pi update")
+            _pi_message(update["partial"], "assistant")
+            index = update["contentIndex"]
+            content_type = update["type"].split("_")[0]
+            content = update["partial"]["content"]
+            if index >= len(content) or content[index]["type"] != content_type:
+                raise ValueError("invalid Pi update index")
+            if suffix == "start":
+                if active is not None:
+                    raise ValueError("overlapping Pi updates")
+                active = (content_type, index)
+            elif active != (content_type, index):
+                raise ValueError("out-of-order Pi update")
+            elif suffix == "end":
+                active = None
+            if update["partial"] != event["message"]:
+                raise ValueError("mismatched Pi update")
+        elif state == "assistant" and kind == "message_end":
+            _pi_object(event, ("type", "message"))
+            final = event["message"]
+            if active is not None:
+                raise ValueError("unfinished Pi update")
+            _pi_message(final, "assistant")
+            state = "turn_end"
+        elif state == "turn_end" and kind == "turn_end":
+            _pi_object(event, ("type", "message", "toolResults"))
+            if event["message"] != final or event["toolResults"] != []:
+                raise ValueError("invalid Pi turn")
+            state = "agent_end"
+        elif state == "agent_end" and kind == "agent_end":
+            _pi_object(event, ("type", "messages"))
+            if event["messages"] != [user, final]:
+                raise ValueError("invalid Pi transcript")
+            state = "done"
+        else:
+            raise ValueError("unexpected Pi event order")
+    if state != "done":
+        raise ValueError("Pi did not complete")
+    answer = "".join(part["text"] for part in final["content"] if part["type"] == "text")
+    if not answer.strip():
         raise ValueError("Pi did not complete a text response")
     return answer
+
+
+def _pi_unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate Pi field")
+        result[key] = value
+    return result
+
+
+def _pi_run(command, timeout, limit=4 * 1024 * 1024):
+    """Capture bounded stdout/stderr concurrently, failing closed on overflow or timeout."""
+    process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    output = {process.stdout: bytearray(), process.stderr: bytearray()}
+    deadline = time.monotonic() + timeout
+    try:
+        with selectors.DefaultSelector() as selector:
+            for stream in output:
+                selector.register(stream, selectors.EVENT_READ)
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                for key, _ in selector.select(remaining):
+                    data = os.read(key.fd, 65536)
+                    if not data:
+                        selector.unregister(key.fileobj)
+                    else:
+                        buffer = output[key.fileobj]
+                        buffer.extend(data)
+                        if len(buffer) > limit:
+                            raise ValueError("Pi output limit exceeded")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            returncode = process.wait(timeout=remaining)
+        return returncode, bytes(output[process.stdout]).decode("utf-8")
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        process.stdout.close()
+        process.stderr.close()
 
 
 def cmd_pi_text(args, core):
@@ -612,20 +751,18 @@ def cmd_pi_text(args, core):
         return 1
     try:
         # Some Pi versions ignore unknown options. Never fall back to a less restricted invocation.
-        help_result = subprocess.run([binary, "--help"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE, timeout=10, text=True)
-        if help_result.returncode or any(not re.search(r"(?<![\w-])" + re.escape(flag) + r"(?![\w-])", help_result.stdout)
+        help_code, help_output = _pi_run([binary, "--help"], timeout=10)
+        if help_code or any(not re.search(r"(?<![\w-])" + re.escape(flag) + r"(?![\w-])", help_output)
                                          for flag in PI_TEXT_FLAGS):
             print("pi-text: Pi does not advertise all required restrictions", file=sys.stderr)
             return 1
         command = [binary, "-p", "--mode", "json", *PI_TEXT_FLAGS, "--system-prompt", PI_TEXT_SYSTEM,
                    "Public input:\n" + args.text]
-        result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, timeout=120, text=True)
-        if result.returncode:
+        returncode, stdout = _pi_run(command, timeout=120)
+        if returncode:
             print("pi-text: Pi execution failed", file=sys.stderr)
             return 1
-        answer = pi_text_answer(result.stdout)
+        answer = pi_text_answer(stdout)
         print(json.dumps({"text": answer}, ensure_ascii=False))
         return 0
     except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
