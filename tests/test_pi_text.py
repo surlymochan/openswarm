@@ -161,6 +161,41 @@ class PiTextTests(unittest.TestCase):
         code, output, error = self.invoke()
         self.assertEqual((code, json.loads(output), error), (0, {"text": "hello"}, ""))
 
+    def test_terminal_assistant_copies_reject_type_confusion(self):
+        for location in (9, 10):
+            for field in ("timestamp", "redacted", "usage"):
+                with self.subTest(location=location, field=field):
+                    items = json.loads(json.dumps(event_list(
+                        content=[{"type": "thinking", "thinking": "", "redacted": True},
+                                 {"type": "text", "text": "hello"}])))
+                    for index in (8, 9, 10):
+                        message = items[index]["messages"][1] if index == 10 else items[index]["message"]
+                        message["timestamp"] = 1
+                        message["usage"]["input"] = 1
+                    message = items[location]["messages"][1] if location == 10 else items[location]["message"]
+                    if field == "timestamp":
+                        message["timestamp"] = True
+                    elif field == "redacted":
+                        message["content"][0]["redacted"] = 1
+                    else:
+                        message["usage"]["input"] = True
+                    with self.assertRaises(ValueError):
+                        consult.pi_text_answer("\n".join(json.dumps(e) for e in items),
+                                               "anthropic", "example", "Public input:\npublic")
+
+    def test_message_comparison_is_structurally_type_sensitive(self):
+        self.assertFalse(consult._pi_equal({"nested": [True]}, {"nested": [1]}))
+        self.assertFalse(consult._pi_equal({"nested": [1]}, {"nested": [1.0]}))
+        self.assertTrue(consult._pi_equal({"a": [1, True], "b": None},
+                                          {"b": None, "a": [1, True]}))
+        for location in (9, 10):
+            items = json.loads(json.dumps(event_list()))
+            message = items[location]["messages"][1] if location == 10 else items[location]["message"]
+            message["usage"]["input"] = 12.0
+            with self.subTest(location=location), self.assertRaises(ValueError):
+                consult.pi_text_answer("\n".join(json.dumps(e) for e in items),
+                                       "anthropic", "example", "Public input:\npublic")
+
     def test_update_text_index_is_nonnegative_integer_and_update_only(self):
         for index in (0, 2):
             items = json.loads(json.dumps(event_list()))

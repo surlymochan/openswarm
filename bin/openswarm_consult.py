@@ -581,6 +581,16 @@ def _pi_number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
+def _pi_equal(left, right):
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(_pi_equal(left[k], right[k]) for k in left)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(_pi_equal(a, b) for a, b in zip(left, right))
+    return left == right
+
+
 def _pi_message(message, role, provider=None, model=None, update=False):
     if role == "user":
         _pi_object(message, ("role", "content", "timestamp"))
@@ -672,7 +682,7 @@ def pi_text_answer(stdout, provider, model, expected_input):
         elif state == "user_end" and kind == "message_end":
             _pi_object(event, ("type", "message"))
             _pi_message(event["message"], "user")
-            if event["message"] != user:
+            if not _pi_equal(event["message"], user):
                 raise ValueError("mismatched Pi user message")
             state = "assistant_start"
         elif state == "assistant_start" and kind == "message_start":
@@ -705,7 +715,7 @@ def pi_text_answer(stdout, provider, model, expected_input):
                 raise ValueError("out-of-order Pi update")
             elif suffix == "end":
                 active = None
-            if update["partial"] != event["message"]:
+            if not _pi_equal(update["partial"], event["message"]):
                 raise ValueError("mismatched Pi update")
         elif state == "assistant" and kind == "message_end":
             _pi_object(event, ("type", "message"))
@@ -716,14 +726,16 @@ def pi_text_answer(stdout, provider, model, expected_input):
             state = "turn_end"
         elif state == "turn_end" and kind == "turn_end":
             _pi_object(event, ("type", "message", "toolResults"))
-            if event["message"] != final or event["toolResults"] != []:
+            _pi_message(event["message"], "assistant", provider, model)
+            if not _pi_equal(event["message"], final) or event["toolResults"] != []:
                 raise ValueError("invalid Pi turn")
             state = "agent_end"
         elif state == "agent_end" and kind == "agent_end":
             _pi_object(event, ("type", "messages"))
             if isinstance(event["messages"], list) and len(event["messages"]) == 2:
                 _pi_message(event["messages"][0], "user")
-            if event["messages"] != [user, final]:
+                _pi_message(event["messages"][1], "assistant", provider, model)
+            if not _pi_equal(event["messages"], [user, final]):
                 raise ValueError("invalid Pi transcript")
             state = "done"
         else:
