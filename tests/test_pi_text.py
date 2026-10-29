@@ -155,6 +155,36 @@ class PiTextTests(unittest.TestCase):
         code, output, error = self.invoke()
         self.assertEqual((code, json.loads(output), error), (0, {"text": "hello"}, ""))
 
+    def test_user_text_blocks_and_strict_schema(self):
+        for content in ("Public input:\npublic", [{"type": "text", "text": "Public input:\npublic"}],
+                        [{"type": "text", "text": "one"}, {"type": "text", "text": "two"}]):
+            with self.subTest(content=content):
+                items = json.loads(json.dumps(event_list()))
+                for message in (items[2]["message"], items[3]["message"], items[10]["messages"][0]):
+                    message["content"] = content
+                self.env.update(FAKE_VERSION="0.73.0", FAKE_EVENTS="\n".join(json.dumps(e) for e in items))
+                code, output, error = self.invoke()
+                self.assertEqual((code, json.loads(output), error), (0, {"text": "hello"}, ""))
+
+        for content in ([], None, {}, ["text"], [{"type": "image", "text": "x"}],
+                        [{"type": "text"}], [{"text": "x"}], [{"type": "text", "text": 1}],
+                        [{"type": "text", "text": "x", "extra": "hidden"}],
+                        [{"type": "text", "text": "x"}, {"type": "image"}]):
+            with self.subTest(content=content):
+                items = json.loads(json.dumps(event_list()))
+                for message in (items[2]["message"], items[3]["message"], items[10]["messages"][0]):
+                    message["content"] = content
+                with self.assertRaises(ValueError):
+                    consult.pi_text_answer("\n".join(json.dumps(e) for e in items), "anthropic", "example")
+
+        for index in (3, 10):
+            with self.subTest(mismatch=index):
+                items = json.loads(json.dumps(event_list()))
+                message = items[index]["messages"][0] if index == 10 else items[index]["message"]
+                message["content"] = [{"type": "text", "text": "Public input:\npublic"}]
+                with self.assertRaises(ValueError):
+                    consult.pi_text_answer("\n".join(json.dumps(e) for e in items), "anthropic", "example")
+
     def test_consistent_partial_and_final_model_mismatch_is_rejected(self):
         for location in ("partial", "final"):
             for key in ("model", "responseModel"):

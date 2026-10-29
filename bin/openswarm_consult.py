@@ -584,7 +584,15 @@ def _pi_number(value):
 def _pi_message(message, role, provider=None, model=None):
     if role == "user":
         _pi_object(message, ("role", "content", "timestamp"))
-        if message["role"] != role or not isinstance(message["content"], str) or not _pi_number(message["timestamp"]):
+        content = message["content"]
+        if message["role"] != role or not _pi_number(message["timestamp"]):
+            raise ValueError("invalid Pi user message")
+        if isinstance(content, list) and content:
+            for part in content:
+                _pi_object(part, ("type", "text"))
+                if part["type"] != "text" or not isinstance(part["text"], str):
+                    raise ValueError("invalid Pi user message")
+        elif not isinstance(content, str):
             raise ValueError("invalid Pi user message")
         return
     _pi_object(message, ("role", "content", "api", "provider", "model", "usage", "stopReason", "timestamp"),
