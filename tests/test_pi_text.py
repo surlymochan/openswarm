@@ -152,6 +152,17 @@ class PiTextTests(unittest.TestCase):
                                                         keep_waiting=lambda: False))
         self.assertEqual(self.core.jload(os.path.join(slot, "status.json"))["state"], "queued")
 
+    def test_dead_runner_reservation_is_not_discarded(self):
+        holder = os.path.join(self.core.RUNS, "dead-runner")
+        waiter = os.path.join(self.core.RUNS, "waiter")
+        self.core.set_status(holder, id="dead-runner", state="running", runner_pid=99999999,
+                             backend="pi", concurrency_keys=["total", "pi"])
+        checks = iter((True, False))
+        self.assertFalse(self.core.reserve_provider_slot(
+            waiter, "pi", None, {"concurrency": {"total": 1}}, keep_waiting=lambda: next(checks)))
+        self.assertEqual(self.core.jload(os.path.join(waiter, "status.json"))["state"], "queued")
+        self.assertEqual(self.core.jload(os.path.join(holder, "status.json"))["state"], "running")
+
     def test_cli_path_uses_fake_pi_and_releases_slot(self):
         home = os.path.join(self.tmp.name, "unused-home")
         env = os.environ.copy()

@@ -3224,18 +3224,15 @@ def reserve_provider_slot(rdir, backend, provider, policy, lane_name=None, keep_
                 row = jload(path, {}) or {}
                 if row.get("state") != "running":
                     continue
-                pid = row.get("runner_pid")
-                if pid and not pid_alive(pid):
-                    continue
+                # Runner death does not prove its executor or descendants stopped.
+                # Retain the reservation until its owner explicitly releases it.
                 active[row.get("id") or os.path.basename(os.path.dirname(path))] = row
             for path in glob.glob(os.path.join(DATA, "lanes", "*", "state.json")):
                 row = jload(path, {}) or {}
                 rid = row.get("current_run")
                 if row.get("turn_state") != "running" or not rid or rid in active:
                     continue
-                pid = row.get("supervisor_pid")
-                if pid and not pid_alive(pid):
-                    continue
+                # A dead supervisor likewise says nothing about its lane child.
                 active[rid] = {"backend": row.get("backend"), "provider": row.get("provider"),
                                "concurrency_keys": row.get("concurrency_keys") or []}
             counts = {key: 0 for key in limits}
