@@ -550,3 +550,85 @@ def main(argv=None, core=None):
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+# This is deliberately separate from consult and all code-capable Pi execution paths.
+PI_TEXT_FLAGS = ("--no-tools", "--no-extensions", "--no-skills", "--no-prompt-templates",
+                 "--no-themes", "--no-context-files", "--no-session")
+PI_TEXT_LIMIT = 16000  # UTF-8 bytes
+PI_TEXT_SYSTEM = "Answer the supplied public text. You have no tools."
+
+
+def add_pi_text_parser(subparsers):
+    parser = subparsers.add_parser("pi-text", help="ask Pi about separately approved public text without tools")
+    parser.add_argument("--public-input-approved", action="store_true", required=True,
+                        help="confirm this specific input is non-sensitive and approved for the provider")
+    parser.add_argument("--text", required=True, help="public input (maximum 16000 UTF-8 bytes)")
+    return parser
+
+
+def pi_text_answer(stdout):
+    """Accept only a completed Pi JSON event stream with a text-only assistant response."""
+    answer = None
+    ended = False
+    known = {"agent_start", "agent_end", "turn_start", "turn_end", "message_start",
+             "message_update", "message_end"}
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            raise ValueError("invalid Pi event stream") from None
+        if not isinstance(event, dict) or event.get("type") not in known:
+            raise ValueError("unknown Pi event")
+        if event["type"] == "agent_end":
+            ended = True
+        message = event.get("message")
+        if isinstance(message, dict):
+            if message.get("role") == "toolResult":
+                raise ValueError("Pi reported tool activity")
+            content = message.get("content", [])
+            if isinstance(content, list) and any(isinstance(part, dict) and
+                    part.get("type") in ("toolCall", "tool_use") for part in content):
+                raise ValueError("Pi reported tool activity")
+            if event["type"] == "message_end" and message.get("role") == "assistant":
+                if message.get("stopReason") not in (None, "stop") or message.get("errorMessage"):
+                    raise ValueError("Pi reported an unsuccessful response")
+                if not isinstance(content, list) or any(not isinstance(part, dict) or
+                        part.get("type") not in ("text", "thinking") for part in content):
+                    raise ValueError("unknown Pi response content")
+                answer = "".join(part.get("text", "") for part in content if part.get("type") == "text"
+                                 and isinstance(part.get("text"), str))
+    if not ended or not answer or not answer.strip():
+        raise ValueError("Pi did not complete a text response")
+    return answer
+
+
+def cmd_pi_text(args, core):
+    if not args.public_input_approved or not args.text.strip() or "\x00" in args.text or len(args.text.encode("utf-8")) > PI_TEXT_LIMIT:
+        print("pi-text: approved, non-empty public text of at most 16000 UTF-8 bytes is required", file=sys.stderr)
+        return 2
+    binary = core.pi_bin()
+    if not binary:
+        print("pi-text: Pi executable unavailable", file=sys.stderr)
+        return 1
+    try:
+        # Some Pi versions ignore unknown options. Never fall back to a less restricted invocation.
+        help_result = subprocess.run([binary, "--help"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, timeout=10, text=True)
+        if help_result.returncode or any(not re.search(r"(?<![\w-])" + re.escape(flag) + r"(?![\w-])", help_result.stdout)
+                                         for flag in PI_TEXT_FLAGS):
+            print("pi-text: Pi does not advertise all required restrictions", file=sys.stderr)
+            return 1
+        command = [binary, "-p", "--mode", "json", *PI_TEXT_FLAGS, "--system-prompt", PI_TEXT_SYSTEM,
+                   "Public input:\n" + args.text]
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, timeout=120, text=True)
+        if result.returncode:
+            print("pi-text: Pi execution failed", file=sys.stderr)
+            return 1
+        answer = pi_text_answer(result.stdout)
+        print(json.dumps({"text": answer}, ensure_ascii=False))
+        return 0
+    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
+        # Do not expose subprocess output, credentials, or environment values in diagnostics.
+        print("pi-text: Pi failed or returned an invalid response", file=sys.stderr)
+        return 1

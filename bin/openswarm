@@ -15,6 +15,7 @@ Subcommands:
   regress          run or compare a regression-card suite
   review           cross-family read-only review of a finished run
   consult          ask multiple executors the same question in read-only mode
+  pi-text          ask Pi about separately approved public text without tools
   lessons          preview, propose, and escalate executor lessons
   patterns         propose reusable patterns and check active patterns for retirement
   lane             manage long-lived Codex app-server / Cursor ACP / Pi RPC executor lanes
@@ -10465,6 +10466,7 @@ def main():
     ap = argparse.ArgumentParser(prog="openswarm", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     consult_module().add_parser(sub)
+    consult_module().add_pi_text_parser(sub)
 
     sp = sub.add_parser("probe")
     sp.add_argument("--quiet", action="store_true")
@@ -10784,6 +10786,8 @@ def main():
     lp.add_argument("--recompute", action="store_true", help="recompute exec_pass for every finished ledger record")
 
     a = ap.parse_args()
+    if a.cmd == "pi-text":
+        sys.exit(consult_module().cmd_pi_text(a, sys.modules[__name__]))
     policy = load_policy()
     os.makedirs(DATA, exist_ok=True)
     if a.cmd == "probe":
