@@ -3,9 +3,12 @@
 The default models are selected for the accounts checked during this recovery. Model
 catalogues and billing can change. Codex probes the signed-in account's model list;
 Codex is configured for `gpt-6-luna` with high effort and fails closed when the
-account does not offer it. Copilot `auto` reports the selected model in one-shot attempt metadata. Cursor's
-one-shot default requests Composer 2.5 standard speed. Cursor ACP currently exposes
-Composer 2.5 fast as its default, so its cost can differ from one-shot runs.
+account does not offer it. The gocc lane uses the newer ChatGPT-bundled CLI.
+Copilot routes difficulty 1–3 to Haiku 5.5 and difficulty 4–5 to Sonnet 5.5,
+both at medium effort; resident lanes GH1 and GH2 select those models explicitly.
+Cursor's K1 lane uses print mode with `composer-2.5[fast=false]`: ACP currently
+resolves the bare Composer 2.5 model to the Fast variant. A print-mode lane starts
+a fresh process per turn and preserves the sandbox and explicit standard model.
 
 Pi uses a Linux bubblewrap launcher and a single-model MiniMax broker. The broker runs
 on the host that already has the Pi credential; the worker never receives that

@@ -188,6 +188,22 @@ class CursorBackend(unittest.TestCase):
             argv = json.load(fh)
         self.assertEqual(argv.count("--continue"), 1)
 
+    def test_headless_lane_keeps_standard_model_and_parses_result(self):
+        lane = {"name": "K1", "backend": "cursor", "mode": "headless",
+                "model": "composer-2.5[fast=false]"}
+        child = xs.CursorHeadlessChild(lane, self.cwd, POLICY)
+        child.start("test")
+        event = child.next_event(10)
+        self.assertEqual(event["status"], "SUCCESS")
+        self.assertEqual(xs.extract_json(event["response"])["status"], "done")
+        child.close()
+        with open(self.log) as stream:
+            argv = json.load(stream)
+        self.assertEqual(argv[argv.index("--model") + 1], "composer-2.5[fast=false]")
+        self.assertIn("--sandbox", argv)
+        with self.assertRaises(RuntimeError):
+            child.start("test", model="composer-2.5[fast=true]")
+
     def test_budget_kills_the_process(self):
         os.environ["FAKE_CURSOR_MODE"] = "sleep"
         rdir = os.path.join(self.tmp, "run")

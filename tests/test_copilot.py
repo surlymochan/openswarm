@@ -56,6 +56,14 @@ class CopilotTests(unittest.TestCase):
             self.assertIsNone(decision)
             self.assertIn("verified model", reason)
 
+    def test_difficulty_selects_requested_model_and_effort(self):
+        with mock.patch.object(xs, "copilot_bin", return_value="/bin/true"):
+            policy = xs.load_policy()
+            routine, _ = xs.plan_copilot({"difficulty": 3}, {}, policy, True, [])
+            complex_task, _ = xs.plan_copilot({"difficulty": 4}, {}, policy, True, [])
+        self.assertEqual((routine["model"], routine["effort"]), ("claude-haiku-5.5", "medium"))
+        self.assertEqual((complex_task["model"], complex_task["effort"]), ("claude-sonnet-5.5", "medium"))
+
 
 if __name__ == "__main__":
     unittest.main()

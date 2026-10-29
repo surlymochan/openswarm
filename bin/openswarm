@@ -2979,13 +2979,14 @@ def copilot_bin():
 def plan_copilot(prof, st, policy, forced, notes):
     if not copilot_bin():
         return None, "no working copilot binary"
-    model = prof.get("model") or (policy.get("copilot") or {}).get("default_model")
+    cfg = policy.get("copilot") or {}
+    model = prof.get("model") or (cfg.get("complex_model") if prof.get("difficulty", 3) >= cfg.get("complex_difficulty", 4) else cfg.get("default_model"))
     if not model:
         return None, "copilot requires a verified model selection"
     if f"copilot/{model}" in breakers() or "copilot/all" in breakers():
         return None, "copilot breaker open"
     notes.append("copilot availability and usage depend on the signed-in account")
-    return {"backend": "copilot", "model": model, "effort": None,
+    return {"backend": "copilot", "model": model, "effort": prof.get("effort") or cfg.get("default_effort", "medium"),
             "tier": policy["difficulty_map"][str(prof["difficulty"])]["tier"]}, None
 
 
@@ -4276,6 +4277,8 @@ def exec_copilot(d, st, prompt, wd, rdir, timeout, evp):
         return 127, None, {"usage": {}}, "copilot binary or model unavailable"
     cmd = [binary, "-p", prompt, "--model", d["model"], "--output-format", "json",
            "--sandbox", "--assisted-approval", "--no-ask-user", "--disable-builtin-mcps"]
+    if d.get("effort"):
+        cmd += ["--reasoning-effort", d["effort"]]
     rc = run_proc(cmd, wd, os.environ.copy(), timeout, evp)
     final, errors, session_error, resolved_model, saw_result = None, [], False, None, False
     usage = {k: 0 for k in CURSOR_USAGE_KEYS}
@@ -6461,6 +6464,8 @@ class LaneChild:
             if not binary:
                 raise RuntimeError("copilot binary not found")
             cmd = [binary, "--sandbox", "--disable-builtin-mcps", "--acp"]
+            if lane.get("effort"):
+                cmd += ["--reasoning-effort", lane["effort"]]
         else:
             binary = envvar("CURSOR_BIN") or lane.get("binary") or cursor_bin()
             if not binary:
@@ -6570,6 +6575,8 @@ class LaneChild:
             self.backlog = deferred + self.backlog
 
     def close(self):
+        if self.proc is None:
+            return
         if self.alive():
             kill_tree(self.proc.pid, grace=1)
         try:
@@ -6654,6 +6661,8 @@ class AgyChild:
         return "".join(self.stderr_lines)
 
     def close(self):
+        if self.proc is None:
+            return
         if self.alive():
             kill_tree(self.proc.pid, grace=1)
         try:
@@ -6667,10 +6676,57 @@ class AgyChild:
                 pass
 
 
+class CursorHeadlessChild(AgyChild):
+    """Use Cursor print mode to preserve an explicit non-fast model selection."""
+    def start(self, prompt, model=None, effort=None, conversation=None):
+        binary = envvar("CURSOR_BIN") or self.lane.get("binary") or cursor_bin()
+        if not binary:
+            raise RuntimeError("cursor-agent binary not found")
+        selected = model or self.lane["model"]
+        if selected != "composer-2.5[fast=false]":
+            raise RuntimeError("Cursor headless lane requires explicit standard Composer 2.5")
+        cmd = [binary, "-p", "--trust", "--force", "--sandbox", "enabled", "--model", selected,
+               "--output-format", "stream-json"]
+        if conversation:
+            cmd.append("--continue")
+        cmd += ["--", prompt]
+        proc = subprocess.Popen(cmd, cwd=self.cwd, env=self.env, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+                                start_new_session=True)
+        events, stderr_lines = queue.Queue(), []
+        self.proc, self.events, self.stderr_lines = proc, events, stderr_lines
+        threading.Thread(target=self._read_stdout, args=(proc, events), daemon=True).start()
+        threading.Thread(target=self._read_stderr, args=(proc, stderr_lines), daemon=True).start()
+        return proc.pid
+
+    def _read_stdout(self, proc, events):
+        try:
+            for line in proc.stdout:
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if event.get("type") == "result":
+                    event["response"] = event.get("result") or ""
+                    event["status"] = "ERROR" if event.get("is_error") else "SUCCESS"
+                    event["conversation_id"] = event.get("session_id")
+                    if event.get("is_error"):
+                        event["error"] = event["response"]
+                events.put(event)
+        finally:
+            events.put(None)
+
+
+def lane_headless(lane):
+    return lane["backend"] == "agy" or (lane["backend"] == "cursor" and lane.get("mode") == "headless")
+
+
 def lane_child(lane, cwd, policy):
     """The resident child of a lane: a long-lived RPC/ACP process, or one agy process per turn."""
     if lane["backend"] == "agy":
         return AgyChild(lane, cwd, policy)
+    if lane_headless(lane):
+        return CursorHeadlessChild(lane, cwd, policy)
     return LaneChild(lane, cwd, policy)
 
 
@@ -6767,13 +6823,13 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                         answer = {"ok": False, "error": f"lane {lane['name']} is idle"}
                     else:
                         text = str(req.get("text") or "")
-                        if lane["backend"] in ("cursor", "hermes", "copilot"):
+                        if lane["backend"] in ("cursor", "hermes", "copilot") and not lane_headless(lane):
                             event_file = current.get("_event_file") or os.path.join(
                                 RUNS, current.get("run_id", ""), f"events.1.{lane['backend']}.jsonl")
                             lane_record_event(event_file, {"type": "steer", "mode": "cancel-and-continue", "text": text})
                             turn.setdefault("steer_queue", []).append(text)
                             lane_cursor_cancel(child, turn)
-                        elif lane["backend"] == "agy":
+                        elif lane_headless(lane):
                             event_file = current.get("_event_file") or os.path.join(
                                 RUNS, current.get("run_id", ""), f"events.1.{lane['backend']}.jsonl")
                             lane_record_event(event_file, {"type": "steer", "mode": "abort-and-resume", "text": text})
@@ -6838,7 +6894,7 @@ def lane_abort_child(lane, child, turn):
             child.send({"jsonrpc": "2.0", "method": "session/cancel",
                         "params": {"sessionId": turn["session_id"]}})
             turn["cursor_cancel_sent"] = True
-        elif lane["backend"] == "agy":
+        elif lane_headless(lane):
             lane_agy_stop(child)
         else:
             turn["abort_pending"] = True
@@ -6882,7 +6938,7 @@ def lane_begin_turn(lane, child, prompt, worktree, event_file, turn):
         pid = "prompt-" + uuid.uuid4().hex
         child.send({"id": pid, "type": "prompt", "message": prompt})
         turn["id"] = pid
-    elif lane["backend"] == "agy":
+    elif lane_headless(lane):
         turn["id"] = "agy-" + uuid.uuid4().hex
         turn["prompt"] = prompt
         child.start(prompt, model=lane["model"], effort=lane.get("effort"))
@@ -6949,7 +7005,7 @@ def lane_continue_turn(lane, child, prompt, event_file, turn):
         req_id = "prompt-" + uuid.uuid4().hex
         child.send({"id": req_id, "type": "prompt", "message": prompt})
         turn["id"] = req_id
-    elif lane["backend"] == "agy":
+    elif lane_headless(lane):
         turn["id"] = "agy-" + uuid.uuid4().hex
         child.start(prompt, model=lane["model"], effort=lane.get("effort"),
                     conversation=turn.get("conversation_id"))
@@ -7045,7 +7101,7 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
                                        "input": [{"type": "text", "text": value}]}})
             elif lane["backend"] == "pi":
                 child.send({"id": f"steer-{uuid.uuid4().hex}", "type": "steer", "message": value})
-            elif lane["backend"] == "agy":
+            elif lane_headless(lane):
                 turn.setdefault("steer_queue", []).append(value)
                 lane_agy_stop(child)
             else:
@@ -7076,7 +7132,7 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
     def lane_failure(detail):
         """Error class of a lane turn that ended without a report (agy reports auth failures on stderr)."""
         text = detail or ""
-        if lane["backend"] == "agy":
+        if lane_headless(lane):
             text = child.stderr_text()[-600:] or text
         if AUTH_ERROR_RE.search(text):
             return "auth", text
@@ -7112,7 +7168,7 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
         msg = child.next_event(0.15)
         if msg is False:
             if not child.alive():
-                if lane["backend"] == "agy":
+                if lane_headless(lane):
                     msg = child.next_event(1.0)  # a finished process may still have events in its pipe
                     if msg is False:
                         if agy_resume_steer():
@@ -7123,7 +7179,7 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
                     return None, usage, "risk_blocked" if spec.get("risk_blocks") else "exec_error", 1, event_file, "resident executor process exited"
             continue
         if msg is None:
-            if lane["backend"] == "agy":
+            if lane_headless(lane):
                 if agy_resume_steer():
                     continue
                 error_class, detail = lane_failure("resident executor stdout closed")
@@ -7190,7 +7246,7 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
                                        if isinstance(b, dict) and b.get("type") == "text")
                         final = extract_json(text) or final
                 ended = True
-        elif lane["backend"] == "agy":
+        elif lane_headless(lane):
             lane_record_event(event_file, msg)
             kind, payload = agy_event(msg)
             if payload.get("conversation_id"):
@@ -7244,7 +7300,7 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
                     final = extract_json("".join(turn.get("cursor_text") or [])) or final
                     ended = True
         if not child.alive() and not ended:
-            if lane["backend"] == "agy":
+            if lane_headless(lane):
                 # Drain buffered events and EOF before deciding whether to resume a steer.
                 continue
             return None, usage, "risk_blocked" if spec.get("risk_blocks") else "exec_error", 1, event_file, "resident executor process exited"
