@@ -45,6 +45,23 @@ class WorkspaceTest(unittest.TestCase):
                                capture_output=True, text=True).stdout.split()
         self.assertEqual(files, ["pkg/b.txt"])
 
+    def test_openbot_prepare_does_not_commit_nested_dependency_symlinks(self):
+        write(os.path.join(self.repo, "apps", "auth-api", "index.js"), "export {}\n")
+        sh("git", "add", "apps/auth-api/index.js", cwd=self.repo)
+        sh("git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "app", cwd=self.repo)
+        os.makedirs(os.path.join(self.repo, "apps", "auth-api", "node_modules"))
+        os.makedirs(os.path.join(self.repo, "node_modules", "@openbot"))
+        os.symlink("../../pkg", os.path.join(self.repo, "node_modules", "@openbot", "core"))
+        wt = os.path.join(self.tmp, "openbot-wt")
+        sh("git", "worktree", "add", "--detach", "-q", wt, "HEAD", cwd=self.repo)
+        script = os.path.join(HERE, "..", "bin", "link-openbot-deps")
+        sh(script, self.repo, cwd=wt)
+        self.assertTrue(os.path.islink(os.path.join(wt, "apps", "auth-api", "node_modules")))
+        write(os.path.join(wt, "real.py"), "value = 1\n")
+        sh("git", "add", "-A", cwd=wt)
+        files = subprocess.check_output(["git", "diff", "--cached", "--name-only"], cwd=wt, text=True).splitlines()
+        self.assertEqual(files, ["real.py"])
+
     def test_executor_directories_and_logs_are_never_committed(self):
         ws = xs.prepare_workspace(self.repo, "artifacts", True)
         excluded = [".pi/session.jsonl", ".codex/session.jsonl", "pkg/.cursor/log.jsonl", "codex-run.log"]
