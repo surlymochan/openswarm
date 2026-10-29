@@ -559,7 +559,7 @@ PI_TEXT_FLAGS = ("--no-tools", "--no-extensions", "--no-skills", "--no-prompt-te
                  "--no-themes", "--no-context-files", "--no-session")
 PI_TEXT_LIMIT = 16000  # UTF-8 bytes
 PI_TEXT_SYSTEM = "Answer the supplied public text. You have no tools."
-# ECMAScript trim characters; Pi 0.73.1 trims piped input before prompting.
+# ECMAScript trim characters; supported Pi versions trim piped input.
 PI_TEXT_TRIM = "\u0009\u000a\u000b\u000c\u000d\u0020\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
 
 
@@ -754,7 +754,7 @@ def _pi_cleanup(process):
         raise _PiCleanupUncertain() from error
 
 
-def _pi_run(command, timeout, limit=4 * 1024 * 1024, cleanup_state=None, input_bytes=None):
+def _pi_run(command, timeout, limit=4 * 1024 * 1024, cleanup_state=None, input_bytes=None, include_stderr=False):
     """Capture bounded stdout/stderr concurrently, failing closed on overflow or timeout."""
     if not all(hasattr(os, name) for name in ("waitid", "WNOWAIT")) or not hasattr(signal, "pthread_sigmask"):
         raise _PiCleanupUncertain()
@@ -821,7 +821,10 @@ def _pi_run(command, timeout, limit=4 * 1024 * 1024, cleanup_state=None, input_b
                 if time.monotonic() >= deadline:
                     raise subprocess.TimeoutExpired(command, timeout)
                 time.sleep(min(0.02, max(0, deadline - time.monotonic())))
-        return returncode, bytes(output[process.stdout]).decode("utf-8")
+        stdout = bytes(output[process.stdout]).decode("utf-8")
+        if include_stderr:
+            stdout += "\n" + bytes(output[process.stderr]).decode("utf-8")
+        return returncode, stdout
     finally:
         mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
         try:
@@ -841,7 +844,11 @@ class _PiTextStopped(Exception):
 
 
 def cmd_pi_text(args, core, policy):
-    if not args.public_input_approved or not args.text.strip() or "\x00" in args.text or len(args.text.encode("utf-8")) > PI_TEXT_LIMIT:
+    try:
+        valid_text = bool(args.text.strip(PI_TEXT_TRIM)) and "\x00" not in args.text and len(args.text.encode("utf-8")) <= PI_TEXT_LIMIT
+    except UnicodeError:
+        valid_text = False
+    if not args.public_input_approved or not valid_text:
         print("pi-text: approved, non-empty public text of at most 16000 UTF-8 bytes is required", file=sys.stderr)
         return 2
     if args.text[-1] in PI_TEXT_TRIM:
@@ -869,13 +876,15 @@ def cmd_pi_text(args, core, policy):
             print("pi-text: stopped while waiting for a concurrency slot", file=sys.stderr)
             return 1
         # Some Pi versions ignore unknown options. Never fall back to a less restricted invocation.
-        help_code, help_output = _pi_run([binary, "--help"], timeout=10, cleanup_state=cleanup_state)
+        help_code, help_output = _pi_run([binary, "--help"], timeout=10, cleanup_state=cleanup_state,
+                                         include_stderr=True)
         if help_code or any(not re.search(r"(?<![\w-])" + re.escape(flag) + r"(?![\w-])", help_output)
                                          for flag in PI_TEXT_FLAGS):
             print("pi-text: Pi does not advertise all required restrictions", file=sys.stderr)
             return 1
-        version_code, version = _pi_run([binary, "--version"], timeout=10, cleanup_state=cleanup_state)
-        if version_code or version.strip() != "0.73.1":
+        version_code, version = _pi_run([binary, "--version"], timeout=10, cleanup_state=cleanup_state,
+                                        include_stderr=True)
+        if version_code or version.strip() not in ("0.73.0", "0.73.1"):
             print("pi-text: unsupported Pi version for stdin transport", file=sys.stderr)
             return 1
         command = [binary, "-p", "--mode", "json", *PI_TEXT_FLAGS, "--system-prompt", PI_TEXT_SYSTEM]

@@ -22,10 +22,10 @@ FAKE = '''#!/usr/bin/env python3
 import json, os, sys, time
 args = sys.argv[1:]
 if args == ["--help"]:
-    print(os.environ.get("FAKE_HELP", ""))
+    print(os.environ.get("FAKE_HELP", ""), file=sys.stderr if os.environ.get("FAKE_HELP_STDERR") else sys.stdout)
     sys.exit(int(os.environ.get("FAKE_HELP_RC", "0")))
 if args == ["--version"]:
-    print(os.environ.get("FAKE_VERSION", "0.73.1"))
+    print(os.environ.get("FAKE_VERSION", "0.73.1"), file=sys.stderr if os.environ.get("FAKE_VERSION_STDERR") else sys.stdout)
     sys.exit(0)
 prompt = sys.stdin.buffer.read()
 with open(os.environ["FAKE_LOG"], "w") as f:
@@ -117,6 +117,45 @@ class PiTextTests(unittest.TestCase):
                 self.assertNotIn("do-not-log-this", error)
                 self.env.update({"FAKE_HELP": " ".join(consult.PI_TEXT_FLAGS), "FAKE_HELP_RC": "0",
                                  "FAKE_VERSION": "0.73.1", "FAKE_RC": "0", "FAKE_STDERR": "", "FAKE_EVENTS": events()})
+
+    def test_stderr_help_and_supported_versions(self):
+        self.env["FAKE_HELP_STDERR"] = "1"
+        self.env["FAKE_VERSION_STDERR"] = "1"
+        for version in ("0.73.0", "0.73.1"):
+            with self.subTest(version=version):
+                self.env["FAKE_VERSION"] = version
+                self.assertEqual(self.invoke()[0], 0)
+        os.unlink(self.log)
+        self.env["FAKE_VERSION"] = "0.73.2"
+        self.assertEqual(self.invoke()[0], 1)
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_exact_ecmascript_trim_and_utf8_transport(self):
+        trim = [*range(0x09, 0x0e), 0x20, 0xa0, 0x1680, *range(0x2000, 0x200b),
+                0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff]
+        self.assertEqual({ord(c) for c in consult.PI_TEXT_TRIM}, set(trim))
+        for char in map(chr, trim):
+            with self.subTest(codepoint=ord(char)):
+                self.assertEqual(self.invoke("x" + char)[0], 2)
+                self.assertFalse(os.path.exists(self.log))
+        for prompt in ("\u0085", "\u200b", "\u0085é\u0085", "\ufeffé"):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(self.invoke(prompt)[0], 0)
+                with open(self.log) as f:
+                    captured = json.load(f)
+                self.assertEqual(captured["prompt"], "Public input:\n" + prompt)
+                self.assertNotIn(prompt, captured["args"])
+                os.unlink(self.log)
+        self.assertEqual(self.invoke("\ud800")[0], 2)
+
+    def test_stdin_failure_never_retries_with_argv(self):
+        self.env["FAKE_RC"] = "1"
+        with mock.patch.object(consult, "_pi_run", wraps=consult._pi_run) as run:
+            self.assertEqual(self.invoke("public-marker")[0], 1)
+        calls = [call for call in run.call_args_list if call.kwargs.get("input_bytes") is not None]
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("public-marker", calls[0].args[0])
+        self.assertEqual(calls[0].kwargs["input_bytes"], b"Public input:\npublic-marker")
 
     def test_rejects_hidden_activity_and_malformed_lifecycle(self):
         import copy
