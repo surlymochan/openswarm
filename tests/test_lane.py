@@ -647,6 +647,20 @@ class LaneTests(unittest.TestCase):
         self.assertEqual(self.wait_run(run_id)["status"], "stopped")
         self.assertTrue(process_alive(supervisor_pid))
 
+    def test_stop_of_old_run_does_not_abort_the_next_run(self):
+        self.start_lane()
+        old = self.assign("first completed task")
+        self.wait_run(old)
+        self.wait_for(lambda: self.lane_state().get("state") == "idle", description="idle lane")
+        current = self.assign("LANE_TEST_WAIT keep this run alive")
+        self.wait_running(current)
+        response = json.loads(self.cli("stop", old).stdout)
+        self.assertEqual(response["signalled"], [])
+        self.assertEqual(response["response"]["error"], "lane is running a different run")
+        self.assertEqual(self.run_state(current)["state"], "running")
+        self.cli("stop", current)
+        self.assertEqual(self.wait_run(current)["status"], "stopped")
+
     def test_budget_interrupt_is_recorded(self):
         self.start_lane()
         run_id = self.assign("LANE_TEST_WAIT exceed the budget", "--budget-minutes", "0.02")

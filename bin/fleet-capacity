@@ -2,6 +2,7 @@
 """Atomic fleet admission. Reservations persist until explicitly released, even after a crash."""
 import json
 import os
+import re
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -17,17 +18,24 @@ host = sys.argv[1]
 try:
     request = json.load(sys.stdin)
     op = request.get('op')
-    if op in ('lanes', 'assign'):
+    if op in ('lanes', 'assign', 'run_info', 'stop'):
         if host != 'gores1':
             raise ValueError('remote dispatcher host required')
         command = [str(Path.home() / '.local/bin/openswarm'), 'lane']
         if op == 'lanes':
             command += ['status']
+        elif op in ('run_info', 'stop'):
+            run_id = request.get('run_id')
+            if not isinstance(run_id, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,99}', run_id):
+                raise ValueError('invalid run id')
+            command = [str(Path.home() / '.local/bin/openswarm')]
+            command += ['fleet', '_run-info', run_id] if op == 'run_info' else ['stop', run_id]
         else:
             lane = request.get('lane')
             prompt = request.get('prompt')
             base = request.get('base')
             verify = request.get('verify')
+            title = request.get('title')
             budget = request.get('budget_minutes')
             if lane not in ('C1', 'A1', 'GH1', 'GH2') or not isinstance(prompt, str) or not 0 < len(prompt) <= 50000:
                 raise ValueError('invalid lane or prompt')
@@ -37,7 +45,11 @@ try:
                 raise ValueError('invalid budget')
             if verify is not None and (not isinstance(verify, str) or len(verify) > 5000):
                 raise ValueError('invalid verify command')
+            if title is not None and (not isinstance(title, str) or len(title) > 160):
+                raise ValueError('invalid title')
             command += ['assign', lane, '--prompt', prompt, '--base', base, '--budget-minutes', str(budget)]
+            if title:
+                command += ['--title', title]
             if verify:
                 command += ['--verify', verify]
         process = subprocess.run(command, capture_output=True, text=True, timeout=30)

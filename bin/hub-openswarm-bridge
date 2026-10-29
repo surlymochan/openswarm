@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""OpenBot dispatch adapter with a durable, fail-closed remote handoff journal."""
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+import uuid
+
+home = Path.home()
+root = Path(__file__).resolve().parent
+native = str(root / 'openswarm-fleet')
+config_path = home / '.claude/openswarm-hub-bridge/config.json'
+store = home / '.claude/openswarm-hub-bridge'
+transport = ['/usr/bin/ssh', '-T', '-F', str(home / '.ssh/openswarm-hub/config'), 'openswarm-gores-hub']
+
+def gateway(payload):
+    proc = subprocess.run(transport, input=json.dumps(payload), text=True, capture_output=True, timeout=100)
+    try: data = json.loads(proc.stdout)
+    except ValueError: raise RuntimeError('fleet gateway response unavailable; handoff requires reconciliation')
+    if proc.returncode or not data.get('ok'): raise RuntimeError('fleet gateway rejected request; handoff requires reconciliation')
+    return data['result']
+
+def db_open():
+    store.mkdir(parents=True, mode=0o700, exist_ok=True)
+    db = sqlite3.connect(str(store / 'dispatch.sqlite'), timeout=10, isolation_level=None)
+    os.chmod(store / 'dispatch.sqlite', 0o600)
+    db.execute('PRAGMA busy_timeout=10000')
+    db.execute('CREATE TABLE IF NOT EXISTS handoffs (request_id TEXT PRIMARY KEY, state TEXT NOT NULL, run_id TEXT, host TEXT, created REAL NOT NULL)')
+    return db
+
+def run_submit(args):
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--detach', action='store_true'); parser.add_argument('--cwd', required=True)
+    parser.add_argument('--task-file', required=True); parser.add_argument('--title', required=True)
+    parser.add_argument('--budget-minutes', type=float, required=True); parser.add_argument('--verify')
+    opts = parser.parse_args(args)
+    if not opts.detach: raise ValueError('Hub automatic dispatch requires detached execution')
+    cfg = json.loads(config_path.read_text())
+    allowed, repo = Path(cfg['workspace']).resolve(), Path(cfg['repo']).resolve()
+    if Path(opts.cwd).resolve() != allowed: raise ValueError('Hub workspace has no approved repository mapping')
+    check = subprocess.run(['git','-C',str(repo),'status','--porcelain'],capture_output=True,text=True,timeout=20)
+    if check.returncode or check.stdout.strip(): raise ValueError('mapped repository is not a clean checkout')
+    base = subprocess.check_output(['git','-C',str(repo),'rev-parse','HEAD'],text=True,timeout=20).strip()
+    card = Path(opts.task_file).read_text(encoding='utf-8')
+    if not card.strip() or len(card)>64000: raise ValueError('invalid task card')
+    # Hub's own workspace is not a repository. Do not silently redirect work
+    # for another project into this explicitly configured OpenBot checkout.
+    if not re.search(r'(?im)^\s*repository\s*:\s*openbot\s*$', card):
+        raise ValueError('task card must declare Repository: openbot')
+    # Explicit metadata is deterministic. An omitted or unrecognised profile
+    # defaults to a normal Codex task instead of guessing from natural language.
+    match = re.search(r'(?im)^\s*(?:executor-type|task-type)\s*:\s*([a-z-]+)\s*$',card)
+    kind = match.group(1).lower() if match else 'impl'
+    valid_types = {'impl','mechanical','format','rename','docs','test','refactor','debug','migration'}
+    if kind not in valid_types: raise ValueError('invalid or read-only task type for Hub coding dispatch')
+    match = re.search(r'(?im)^\s*(?:difficulty|难度)\s*:\s*([1-5])\s*$',card)
+    difficulty = int(match.group(1)) if match else 3
+    if not 0 < opts.budget_minutes <= 40: raise ValueError('budget must be between 0 and 40 minutes')
+    request_id = uuid.uuid4().hex
+    db = db_open(); db.execute('BEGIN IMMEDIATE')
+    if db.execute("SELECT 1 FROM handoffs WHERE state='pending' LIMIT 1").fetchone():
+        db.execute('ROLLBACK'); db.close(); raise RuntimeError('an earlier handoff is unresolved; reconcile before dispatch')
+    db.execute('INSERT INTO handoffs VALUES (?,?,?,?,?)',(request_id,'pending',None,None,time.time()))
+    db.execute('COMMIT'); db.close()
+    # Do not remove a pending intent on timeout or error: a remote task may have
+    # been accepted even when its acknowledgement was lost.
+    try:
+        reply = gateway({'op':'submit','prompt':card,'title':opts.title,'base':base,'type':kind,
+                         'difficulty':difficulty,'budget':opts.budget_minutes,'verify':opts.verify})
+    except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError(f'handoff {request_id} unresolved; inspect the remote run before reconciliation') from error
+    run_id, host = reply.get('id'), reply.get('host')
+    if not isinstance(run_id,str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,99}',run_id) or host not in ('gocc','gores1'):
+        raise RuntimeError('invalid acknowledgement; handoff requires reconciliation')
+    db = db_open(); db.execute('BEGIN IMMEDIATE')
+    db.execute("UPDATE handoffs SET state='accepted',run_id=?,host=? WHERE request_id=?",(run_id,host,request_id))
+    db.execute('COMMIT'); db.close()
+    print(json.dumps({'id':run_id,'state':reply.get('state'),'host':'local','executor_host':host,
+                      'backend':reply.get('backend'),'model':reply.get('model')}))
+
+def mapped(run_id, op):
+    db=db_open(); row=db.execute("SELECT host FROM handoffs WHERE state='accepted' AND run_id=?",(run_id,)).fetchone(); db.close()
+    if not row: return False
+    data=gateway({'op':op,'id':run_id,'host':row[0]})
+    if op == 'info' and isinstance(data.get('result'),dict):
+        # The local Hub host is a logical gateway. Preserve evidence of where
+        # the executor ran in the result rather than claiming it ran locally.
+        res=data['result']; final=res.get('result')
+        if isinstance(final,dict) and isinstance(final.get('summary'),str):
+            final['summary']='Executor host: '+row[0]+'. '+final['summary']
+    print(json.dumps(data,ensure_ascii=False)); return True
+
+def main():
+    args=sys.argv[1:]
+    if args == ['bridge', 'status']:
+        db = db_open()
+        rows = db.execute('SELECT request_id,state,run_id,host,created FROM handoffs ORDER BY created').fetchall()
+        db.close()
+        print(json.dumps({'handoffs':[dict(zip(('request_id','state','run_id','host','created'),row)) for row in rows]}))
+        return
+    if args[:2] == ['bridge', 'clear-unsubmitted']:
+        p = argparse.ArgumentParser()
+        p.add_argument('--request-id', required=True); p.add_argument('--confirm', required=True)
+        a = p.parse_args(args[2:])
+        if a.confirm != 'no-run-started-on-any-host': raise ValueError('explicit no-run confirmation required')
+        db = db_open()
+        changed = db.execute("UPDATE handoffs SET state='cleared' WHERE request_id=? AND state='pending'",(a.request_id,)).rowcount
+        db.close()
+        if changed != 1: raise ValueError('request is not pending')
+        print(json.dumps({'ok':True,'cleared':a.request_id})); return
+    if args[:2] == ['bridge', 'reconcile']:
+        p = argparse.ArgumentParser()
+        p.add_argument('--request-id', required=True); p.add_argument('--host', choices=['gocc','gores1'], required=True)
+        p.add_argument('--run-id', required=True); p.add_argument('--confirm', required=True)
+        a = p.parse_args(args[2:])
+        if a.confirm != 'matching-terminal-run-verified': raise ValueError('explicit terminal run confirmation required')
+        db = db_open()
+        row = db.execute('SELECT state FROM handoffs WHERE request_id=?',(a.request_id,)).fetchone()
+        db.close()
+        if not row or row[0] != 'pending': raise ValueError('request is not pending')
+        info = gateway({'op':'info','id':a.run_id,'host':a.host})
+        if info.get('id') != a.run_id or not isinstance(info.get('result'),dict):
+            raise ValueError('matching run is not terminal')
+        db = db_open()
+        changed = db.execute("UPDATE handoffs SET state='accepted',run_id=?,host=? WHERE request_id=? AND state='pending'",
+                             (a.run_id,a.host,a.request_id)).rowcount
+        db.close()
+        if changed != 1: raise ValueError('request changed during reconciliation')
+        print(json.dumps({'ok':True,'reconciled':a.run_id,'host':a.host})); return
+    if args[:1]==['run'] and '--backend' not in args and '--model' not in args:
+        return run_submit(args[1:])
+    if len(args)==3 and args[:2]==['fleet','_run-info'] and mapped(args[2],'info'): return
+    if len(args)==2 and args[0]=='stop' and mapped(args[1],'stop'): return
+    os.execv(native,[native,*args])
+
+if __name__ == '__main__':
+    try: main()
+    except (ValueError,KeyError,OSError,sqlite3.Error,subprocess.SubprocessError,RuntimeError) as e:
+        print(json.dumps({'ok':False,'error':str(e)[:500]})); sys.exit(1)

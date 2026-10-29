@@ -45,6 +45,7 @@ def main():
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument('--prompt')
     g.add_argument('--task-file')
+    p.add_argument('--title')
     p.add_argument('--verify')
     p.add_argument('--base')
     p.add_argument('--budget-minutes', type=float, default=15)
@@ -68,6 +69,7 @@ def main():
         command = [cli, 'run', '--type', 'review', '--backend', 'pi', '--read-only', '--no-fallback',
                    '--cwd', str(repo), '--base', base, '--prompt', prompt, '--detach',
                    '--budget-minutes', str(args.budget_minutes)]
+        if args.title: command += ['--title', args.title]
         proc = subprocess.run(command, capture_output=True, text=True, timeout=30)
         if proc.returncode:
             raise RuntimeError('isolated read-only review was rejected')
@@ -91,6 +93,7 @@ def main():
         if lane in ('M1','K1'):
             command = [cli,'lane','assign',lane,'--prompt',prompt,'--base',base,
                        '--budget-minutes',str(args.budget_minutes)]
+            if args.title: command += ['--title', args.title]
             if args.verify: command += ['--verify',args.verify]
             proc = subprocess.run(command, capture_output=True, text=True, timeout=30)
             try: response = json.loads(proc.stdout)
@@ -99,7 +102,7 @@ def main():
         else:
             try:
                 response = remote({'op':'assign','lane':lane,'prompt':prompt,'base':base,
-                                   'verify':args.verify,'budget_minutes':args.budget_minutes})
+                                   'title':args.title,'verify':args.verify,'budget_minutes':args.budget_minutes})
             except RuntimeError:
                 continue
         result.update({'id':response['id'], 'state':response['state']})

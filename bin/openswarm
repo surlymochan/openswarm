@@ -6948,6 +6948,8 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                 elif op == "abort":
                     if not active:
                         answer = {"ok": False, "error": f"lane {lane['name']} is idle"}
+                    elif req.get("run_id") and req["run_id"] != current.get("run_id"):
+                        answer = {"ok": False, "error": "lane is running a different run"}
                     else:
                         current["stop_requested"] = True
                         current["abort_requested"] = True
@@ -9813,7 +9815,7 @@ def cmd_stop(args, policy):
                           "note": "the GitHub issue was cancelled; the bus runner will finalize shortly"}))
         return
     if st.get("lane"):
-        response = lane_call(st["lane"], {"op": "abort"})
+        response = lane_call(st["lane"], {"op": "abort", "run_id": args.run_id})
         print(json.dumps({"id": args.run_id, "lane": st["lane"],
                           "signalled": ["abort"] if response.get("ok") else [],
                           "response": response,

@@ -63,7 +63,8 @@ chooses a currently idle lane on gores1 or gocc. Use `--dry-run` to inspect the
 choice. Difficulty 1–3 selects Copilot Haiku when Copilot is chosen; difficulty
 4–5 selects Sonnet. Review and research profiles use isolated, read-only Pi
 one-shot execution. The dispatcher does not replace the legacy `openswarm run`
-default or integrate the OpenBot Hub's own dispatcher.
+default. The OpenBot Hub integration below explicitly routes eligible Hub work
+through this dispatcher.
 
 Both candidate installations use `/etc/openswarm-fleet-capacity.json` regardless
 of `OPENSWARM_HOME`. Admission is recorded in a SQLite coordinator on gocc, with
@@ -90,3 +91,32 @@ The guard covers the candidate's run, lane, review and consult execution paths;
 unmodified old OpenSwarm binaries and separately started tools can bypass it.
 The legacy govpn2 K2 Fast service is disabled; do not re-enable it as part of
 this fleet. These limits are not evidence that unconfigured hosts are controlled.
+
+## OpenBot Hub integration on gocc
+
+The installed Hub uses `bin/hub-openswarm-bridge` as its configured OpenSwarm
+binary. Its automatic path is limited to the configured Hub agent workspace and
+the clean OpenBot checkout in `~/.claude/openswarm-hub-bridge/config.json`. Task
+cards must include `Repository: openbot`; `Executor-Type` and `Difficulty`
+select the automatic routing profile. A different workspace, repository or a
+dirty mapped checkout is rejected. Specify no lane, host, backend or model to
+use automatic routing. Explicit selections use the existing guarded path and
+Hub workspace-only restrictions continue to apply. Hub's own model turn is not
+an OpenSwarm lane and is outside fleet admission.
+
+The bridge sends a constrained request over a dedicated forced-command SSH key
+to `bin/hub-fleet-gateway` on gores1. It persists the physical host and run ID;
+Hub's native dispatch record says `local` because the bridge is local, while
+the completed result summary names the actual executor host. Poll and stop are
+routed to the recorded host. Failed submission acknowledgements leave a pending
+intent and block automatic dispatch, preventing a blind duplicate. Inspect with
+`hub-openswarm-bridge bridge status`. Only after independently matching the
+terminal run to that intent may the local operator use `bridge reconcile`
+with its explicit confirmation; only after independently proving no run began
+on either host may `bridge clear-unsubmitted` be used. See each command's help
+for required arguments. Neither operation is exposed over the restricted key.
+
+The five suspended legacy Instabox hosts preserve processes. They are not part
+of this configured fleet and must not be assumed guarded if resumed; audit and
+onboard each host before starting any executor. Separately launched tools and
+old binaries remain outside the coordinator.
