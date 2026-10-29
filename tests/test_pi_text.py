@@ -124,6 +124,50 @@ class PiTextTests(unittest.TestCase):
         self.assertEqual(output, "")
         self.assertIn("invalid response", error)
 
+    def test_model_mismatch_or_missing_is_rejected_at_each_event(self):
+        for index, field in ((4, "message"), (5, "message"), (5, "partial"),
+                             (6, "message"), (6, "partial"), (7, "message"),
+                             (7, "partial"), (8, "message"), (9, "message"),
+                             (10, "final")):
+            for key, value in (("model", "other"), ("model", None),
+                               ("responseModel", "other"), ("responseModel", None)):
+                with self.subTest(index=index, field=field, key=key, value=value):
+                    items = json.loads(json.dumps(event_list()))
+                    message = (items[index]["assistantMessageEvent"]["partial"] if field == "partial"
+                               else items[index]["messages"][1] if field == "final"
+                               else items[index][field])
+                    if value is None and key == "model":
+                        del message[key]
+                    else:
+                        message[key] = value
+                    self.env["FAKE_EVENTS"] = "\n".join(json.dumps(e) for e in items)
+                    code, output, error = self.invoke()
+                    self.assertEqual(code, 1)
+                    self.assertEqual(output, "")
+                    self.assertIn("invalid response", error)
+
+    def test_valid_pi_0730_response_metadata(self):
+        items = json.loads(json.dumps(event_list()))
+        for index in (8, 9, 10):
+            message = items[index]["messages"][1] if index == 10 else items[index]["message"]
+            message.update(responseModel="example", responseId="response-1")
+        self.env.update(FAKE_VERSION="0.73.0", FAKE_EVENTS="\n".join(json.dumps(e) for e in items))
+        code, output, error = self.invoke()
+        self.assertEqual((code, json.loads(output), error), (0, {"text": "hello"}, ""))
+
+    def test_consistent_partial_and_final_model_mismatch_is_rejected(self):
+        for location in ("partial", "final"):
+            for key in ("model", "responseModel"):
+                with self.subTest(location=location, key=key):
+                    items = json.loads(json.dumps(event_list()))
+                    messages = ([items[6]["message"], items[6]["assistantMessageEvent"]["partial"]]
+                                if location == "partial" else
+                                [items[8]["message"], items[9]["message"], items[10]["messages"][1]])
+                    for message in messages:
+                        message[key] = "other"
+                    with self.assertRaises(ValueError):
+                        consult.pi_text_answer("\n".join(json.dumps(e) for e in items), "anthropic", "example")
+
     def test_missing_selection_flags_never_sends_input(self):
         for flag in ("--provider", "--model"):
             with self.subTest(flag=flag):
@@ -208,14 +252,14 @@ class PiTextTests(unittest.TestCase):
         for items in variants:
             with self.subTest(items=items):
                 with self.assertRaises(ValueError):
-                    consult.pi_text_answer("\n".join(json.dumps(e) for e in items))
+                    consult.pi_text_answer("\n".join(json.dumps(e) for e in items), "anthropic", "example")
         with self.assertRaises(ValueError):
-            consult.pi_text_answer('{"type":"agent_start","type":"agent_start"}')
+            consult.pi_text_answer('{"type":"agent_start","type":"agent_start"}', "anthropic", "example")
 
     def test_valid_thinking_and_text_events(self):
         content = [{"type": "thinking", "thinking": "reasoning", "thinkingSignature": "sig"},
                    {"type": "text", "text": "hello", "textSignature": "sig"}]
-        self.assertEqual(consult.pi_text_answer(events(content)), "hello")
+        self.assertEqual(consult.pi_text_answer(events(content), "anthropic", "example"), "hello")
 
     def test_bounded_stdout_and_stderr(self):
         for stream in ("stdout", "stderr"):

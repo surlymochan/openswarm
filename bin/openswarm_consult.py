@@ -580,7 +580,7 @@ def _pi_number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
-def _pi_message(message, role, provider=None):
+def _pi_message(message, role, provider=None, model=None):
     if role == "user":
         _pi_object(message, ("role", "content", "timestamp"))
         if message["role"] != role or not isinstance(message["content"], str) or not _pi_number(message["timestamp"]):
@@ -589,7 +589,9 @@ def _pi_message(message, role, provider=None):
     _pi_object(message, ("role", "content", "api", "provider", "model", "usage", "stopReason", "timestamp"),
                ("responseModel", "responseId"))
     if (message["role"] != "assistant" or message["stopReason"] != "stop" or
-            (provider is not None and message.get("provider") != provider) or
+            (not provider or message.get("provider") != provider) or
+            (not model or message.get("model") != model or
+             ("responseModel" in message and message["responseModel"] != model)) or
             not all(isinstance(message[k], str) for k in ("api", "provider", "model")) or
             not all(isinstance(message[k], str) for k in ("responseModel", "responseId") if k in message) or
             not _pi_number(message["timestamp"]) or not isinstance(message["content"], list)):
@@ -616,7 +618,7 @@ def _pi_message(message, role, provider=None):
             raise ValueError("invalid Pi content")
 
 
-def pi_text_answer(stdout, provider=None):
+def pi_text_answer(stdout, provider, model):
     """Accept one complete Pi 0.73 text-only prompt turn; reject unknown fields/events."""
     state = "agent_start"
     user = final = None
@@ -645,11 +647,11 @@ def pi_text_answer(stdout, provider=None):
             state = "assistant_start"
         elif state == "assistant_start" and kind == "message_start":
             _pi_object(event, ("type", "message"))
-            _pi_message(event["message"], "assistant", provider)
+            _pi_message(event["message"], "assistant", provider, model)
             state = "assistant"
         elif state == "assistant" and kind == "message_update":
             _pi_object(event, ("type", "message", "assistantMessageEvent"))
-            _pi_message(event["message"], "assistant", provider)
+            _pi_message(event["message"], "assistant", provider, model)
             update = event["assistantMessageEvent"]
             if not isinstance(update, dict) or update.get("type") not in ("text_start", "text_delta", "text_end", "thinking_start", "thinking_delta", "thinking_end"):
                 raise ValueError("unexpected Pi update")
@@ -659,7 +661,7 @@ def pi_text_answer(stdout, provider=None):
             if (not isinstance(update["contentIndex"], int) or isinstance(update["contentIndex"], bool) or update["contentIndex"] < 0 or
                     any(not isinstance(update[k], str) for k in extra)):
                 raise ValueError("invalid Pi update")
-            _pi_message(update["partial"], "assistant", provider)
+            _pi_message(update["partial"], "assistant", provider, model)
             index = update["contentIndex"]
             content_type = update["type"].split("_")[0]
             content = update["partial"]["content"]
@@ -680,7 +682,7 @@ def pi_text_answer(stdout, provider=None):
             final = event["message"]
             if active is not None:
                 raise ValueError("unfinished Pi update")
-            _pi_message(final, "assistant", provider)
+            _pi_message(final, "assistant", provider, model)
             state = "turn_end"
         elif state == "turn_end" and kind == "turn_end":
             _pi_object(event, ("type", "message", "toolResults"))
@@ -903,7 +905,7 @@ def cmd_pi_text(args, core, policy):
         if returncode:
             print("pi-text: Pi execution failed", file=sys.stderr)
             return 1
-        answer = pi_text_answer(stdout, provider)
+        answer = pi_text_answer(stdout, provider, model)
         print(json.dumps({"text": answer}, ensure_ascii=False))
         return 0
     except (OSError, subprocess.SubprocessError, UnicodeError, ValueError, _PiCleanupUncertain):
