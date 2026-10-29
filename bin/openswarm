@@ -3314,6 +3314,54 @@ def provider_concurrency_limits(policy, keys):
     return limits
 
 
+# Tokens stay in this supervisor process. Lost supervisors intentionally leave a
+# persistent reservation for manual, evidence-backed recovery: no unsafe TTL.
+_FLEET_RESERVATIONS = {}
+
+
+def fleet_guard_command():
+    path = envvar("FLEET_GUARD_CONFIG", "/etc/openswarm-fleet-capacity.json")
+    if not os.path.exists(path):
+        marker = os.path.join(SKILL_DIR, ".fleet-guard-required")
+        if os.path.exists(marker) or envvar("FLEET_GUARD_REQUIRED") == "1":
+            raise RuntimeError("fleet capacity configuration is required but missing")
+        return None
+    try:
+        with open(path, encoding="utf-8") as stream:
+            config = json.load(stream)
+        command = config["command"]
+        if not isinstance(command, list) or not command or any(not isinstance(x, str) or not x for x in command):
+            raise ValueError("invalid command")
+        return command
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise RuntimeError(f"fleet capacity configuration invalid: {error}")
+
+
+def fleet_guard_call(command, payload):
+    try:
+        result = subprocess.run(command, input=json.dumps(payload), text=True, capture_output=True, timeout=15)
+        answer = json.loads(result.stdout)
+        if result.returncode != 0 or not answer.get("ok"):
+            raise ValueError(answer.get("error") or "coordinator rejected request")
+        return answer
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(f"fleet capacity coordinator unavailable: {error}")
+
+
+def release_fleet_slot(rdir):
+    item = _FLEET_RESERVATIONS.get(os.path.realpath(rdir))
+    if not item:
+        return True
+    command, payload = item
+    try:
+        fleet_guard_call(command, {"op": "release", "run_id": payload["run_id"], "token": payload["token"]})
+    except RuntimeError as error:
+        set_status(rdir, fleet_reservation_error=str(error))
+        return False
+    _FLEET_RESERVATIONS.pop(os.path.realpath(rdir), None)
+    return True
+
+
 def reserve_provider_slot(rdir, backend, provider, policy, lane_name=None, keep_waiting=None, poll=0.1):
     """Atomically admit a turn against provider/backend caps stored in policy.concurrency."""
     keys = concurrency_keys(backend, provider)
@@ -3322,6 +3370,11 @@ def reserve_provider_slot(rdir, backend, provider, policy, lane_name=None, keep_
     os.makedirs(DATA, exist_ok=True)
     os.makedirs(rdir, exist_ok=True)
     status_path = os.path.join(rdir, "status.json")
+    command = fleet_guard_command()
+    reservation_key = os.path.realpath(rdir)
+    token = uuid.uuid4().hex
+    payload = {"op": "acquire", "token": token, "run_id": os.path.basename(rdir),
+               "backend": backend, "provider": provider}
     while True:
         with open(lock_path, "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -3353,8 +3406,26 @@ def reserve_provider_slot(rdir, backend, provider, policy, lane_name=None, keep_
                     if key in row_keys:
                         counts[key] += 1
             if all(counts[key] < cap for key, cap in limits.items()):
+                admitted = True
+                if command:
+                    try:
+                        admitted = bool(fleet_guard_call(command, payload).get("admitted"))
+                    except RuntimeError as error:
+                        admitted = False
+                        set_status(rdir, fleet_reservation_error=str(error))
+                if admitted and command:
+                    _FLEET_RESERVATIONS[reservation_key] = (command, payload)
+            else:
+                admitted = False
+            if admitted and keep_waiting and not keep_waiting():
+                # The coordinator call may have taken longer than the task's
+                # budget or overlapped cancellation. Do not start an executor.
+                release_fleet_slot(rdir)
+                return False
+            if admitted:
                 set_status(rdir, state="running", backend=backend, provider=provider,
-                           concurrency_keys=keys, **({"lane": lane_name} if lane_name else {}))
+                           concurrency_keys=keys, fleet_reservation_error=None, queue_reason=None,
+                           **({"lane": lane_name} if lane_name else {}))
                 if lane_name:
                     lane_write_state(lane_name, turn_state="running", concurrency_keys=keys)
                 return True
@@ -3365,7 +3436,7 @@ def reserve_provider_slot(rdir, backend, provider, policy, lane_name=None, keep_
                 lane_write_state(lane_name, turn_state="queued", concurrency_keys=keys)
         if keep_waiting and not keep_waiting():
             return False
-        time.sleep(max(0.01, poll))
+        time.sleep(max(1.0 if command else 0.01, poll))
 
 
 def rate_limit_policy(policy):
@@ -3387,13 +3458,19 @@ def rate_limit_delay(policy, retry):
                           delays[min(max(0, retry), len(delays) - 1)] * 1.2)
 
 
-def executor_error_class(rc, final, err_text):
+def agy_upstream_forbidden(backend, text):
+    return backend == "agy" and bool(re.search(r"\b403\b", text or "")) and "html response" in (text or "").lower()
+
+
+def executor_error_class(rc, final, err_text, backend=None):
     if rc == 133:
         return "risk_blocked"
     if rc == 134:
         return "executor_io_lost"
     if rc == 124:
         return "budget_exceeded"
+    if rc != 0 and agy_upstream_forbidden(backend, err_text):
+        return "upstream_forbidden"
     if rc != 0 and MODEL_UNAVAILABLE_RE.search(err_text or ""):
         return "model_unavailable"
     if rc != 0 and AUTH_ERROR_RE.search(err_text or ""):
@@ -3451,7 +3528,11 @@ def run_executor_with_rate_limit(backend, decision, state, prompt, wd, rdir, bud
         rc, final, meta, err_text = EXECUTORS[backend](call_decision, state, current_prompt, wd,
                                                        rdir, timeout, event_file)
         seconds = round(NOW() - started, 3)
-        error_class = executor_error_class(rc, final, err_text)
+        error_class = executor_error_class(rc, final, err_text, backend)
+        if error_class in (None, "rate_limit"):
+            release_fleet_slot(rdir)
+        elif os.path.realpath(rdir) in _FLEET_RESERVATIONS:
+            set_status(rdir, fleet_reservation_error="retained after abnormal executor exit; inspect descendants")
         set_status(rdir, state="routing", concurrency_keys=[])
         attempt = {"backend": backend, "model": decision.get("model"), "effort": decision.get("effort"),
                    "rc": rc, "seconds": seconds, "error_class": error_class, "meta": meta,
@@ -5108,6 +5189,8 @@ def review_command(reviewer, prompt, repo, scratch_dir, policy):
                    "--skip-git-repo-check", "--output-schema", schema, "-o", output]
         if model:
             command += ["--model", model]
+        if cfg.get("default_effort"):
+            command += ["-c", f'model_reasoning_effort="{cfg["default_effort"]}"']
         command.append(prompt)
     elif backend == "agy":
         schema = os.path.join(scratch_dir, "review-schema.json")
@@ -5219,6 +5302,8 @@ def redact_review_raw(value):
 def invoke_reviewer(reviewer, prompt, repo, rdir, policy):
     os.makedirs(rdir, exist_ok=True)
     raw_attempts = []
+    slot_dir = os.path.join(RUNS, "review-slot-" + uuid.uuid4().hex)
+    acquired, safe_release = False, True
 
     def output_text(value):
         if isinstance(value, bytes):
@@ -5238,6 +5323,14 @@ def invoke_reviewer(reviewer, prompt, repo, rdir, policy):
             retries = review_settings(policy).get("max_retries", 1)
             if isinstance(retries, bool) or not isinstance(retries, int) or retries not in (0, 1):
                 raise ValueError("review.max_retries must be 0 or 1")
+            os.makedirs(slot_dir, exist_ok=True)
+            set_status(slot_dir, id=os.path.basename(slot_dir), runner_pid=os.getpid(), state="queued")
+            deadline = NOW() + timeout
+            backend = reviewer["backend"]
+            provider = execution_provider(backend, decision=reviewer, policy=policy)
+            acquired = reserve_provider_slot(slot_dir, backend, provider, policy, keep_waiting=lambda: NOW() < deadline)
+            if not acquired:
+                raise RuntimeError("review timed out waiting for a fleet capacity slot")
             repair_prompt = (prompt + "\n\nYour previous response did not match the required findings schema. "
                              "Return only JSON, with no prose or markdown, using exactly this shape: "
                              + json.dumps(REVIEW_FINDINGS_SCHEMA, ensure_ascii=False))
@@ -5250,8 +5343,10 @@ def invoke_reviewer(reviewer, prompt, repo, rdir, policy):
                     pass
                 command = review_command(reviewer, active_prompt, repo, scratch_dir, policy)
                 try:
+                    safe_release = False
                     completed = subprocess.run(command, cwd=repo, stdin=subprocess.DEVNULL,
                                                capture_output=True, text=True, timeout=timeout, check=False)
+                    safe_release = True
                 except subprocess.TimeoutExpired as error:
                     raw = (open(output_path, encoding="utf-8").read() if os.path.isfile(output_path)
                            else output_text(error.stdout))
@@ -5279,6 +5374,11 @@ def invoke_reviewer(reviewer, prompt, repo, rdir, policy):
                     raise RuntimeError(f"reviewer returned no findings JSON{suffix}")
     finally:
         save_raw()
+        if acquired and safe_release and release_fleet_slot(slot_dir):
+            set_status(slot_dir, state="finished", finished=NOW())
+            shutil.rmtree(slot_dir, ignore_errors=True)
+        elif not acquired:
+            shutil.rmtree(slot_dir, ignore_errors=True)
 
 
 def update_peer_review_ledger(run_id, peer_review):
@@ -7312,7 +7412,9 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
         return final, usage, "budget_exceeded", 124, event_file, None
     if errors:
         text = " ".join(errors)
-        if AUTH_ERROR_RE.search(text):
+        if agy_upstream_forbidden(lane["backend"], text):
+            error_class = "upstream_forbidden"
+        elif AUTH_ERROR_RE.search(text):
             error_class = "auth"
         elif RATE_LIMIT_RE.search(text):
             error_class = "rate_limit"
@@ -7327,13 +7429,14 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
 
 
 def lane_wait_rate_limit(seconds, lane, spec, child, server, turn, pending):
-    deadline = NOW() + seconds
+    budget_deadline = spec["started"] + max(0, float(spec.get("budget_minutes") or 0)) * 60
+    deadline = min(NOW() + seconds, budget_deadline)
     while NOW() < deadline:
         lane_control_messages(server, lane, spec, child, turn, pending)
         if spec.get("abort_requested") or spec.get("down_requested") or not child.alive():
             return False
         time.sleep(min(0.1, max(0, deadline - NOW())))
-    return True
+    return NOW() < budget_deadline
 
 
 def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file, attempts=None):
@@ -7522,6 +7625,10 @@ def lane_do_run(lane, spec, child, server, current):
                 final, usage, error_class, rc, evp, error_tail = lane_run_turn(
                     attempt_lane, child, spec, retry_prompt, ws, rdir, server, turn, pending,
                     attempt=attempt_number, continuation=continuation)
+                if error_class in (None, "rate_limit"):
+                    release_fleet_slot(rdir)
+                elif os.path.realpath(rdir) in _FLEET_RESERVATIONS:
+                    set_status(rdir, fleet_reservation_error="retained after abnormal executor exit; inspect descendants")
                 attempts.append({"backend": attempt_lane["backend"], "model": model,
                                  "effort": attempt_lane.get("effort"), "rc": rc,
                                  "seconds": round(NOW() - started, 3), "error_class": error_class,

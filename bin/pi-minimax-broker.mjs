@@ -19,8 +19,8 @@ const maxBytes = 8 * 1024 * 1024;
 let busy = false, accepted = 0;
 const server = createServer((req, res) => {
   const fail = (status, message) => { if (!res.headersSent) res.writeHead(status, {'content-type': 'text/plain'}); res.end(message); };
-  if (req.method !== 'POST' || req.url !== '/v1/messages' || busy || accepted >= 64)
-    return fail(busy || accepted >= 64 ? 429 : 403, 'request refused');
+  if (busy || accepted >= 64) return fail(503, 'broker temporarily unavailable');
+  if (req.method !== 'POST' || req.url !== '/v1/messages') return fail(403, 'request refused');
   const length = Number(req.headers['content-length']);
   if (!Number.isSafeInteger(length) || length < 1 || length > maxBytes || req.headers['transfer-encoding']) return fail(400, 'invalid size');
   busy = true;
@@ -38,10 +38,19 @@ const server = createServer((req, res) => {
       release(); return fail(403, 'model or request refused');
     }
     accepted += 1;
-    if (accepted >= 64) res.once('finish', () => server.close(() => {
-      try { unlinkSync(socket); } catch {}
-      process.exit(0);
-    }));
+    if (accepted >= 64) {
+      // A disconnected client may never emit finish. Stop on either terminal
+      // event so the supervised broker cannot remain permanently at its cap.
+      let stopping = false;
+      const stopAtLimit = () => {
+        if (stopping) return;
+        stopping = true;
+        server.close(() => { try { unlinkSync(socket); } catch {} process.exit(0); });
+        server.closeAllConnections?.();
+      };
+      res.once('finish', stopAtLimit);
+      res.once('close', stopAtLimit);
+    }
     // Forward the parsed value, not the original bytes: duplicate JSON keys must not
     // let the upstream select a different model from the one checked above.
     const payload = Buffer.from(JSON.stringify(parsed));
@@ -55,6 +64,7 @@ const server = createServer((req, res) => {
                                          'cache-control': 'no-store'});
       upstream.on('error', () => { release(); res.destroy(); });
       upstream.on('end', release);
+      upstream.on('close', () => { release(); if (!upstream.complete) res.destroy(); });
       upstream.pipe(res);
     });
     outgoing.on('timeout', () => outgoing.destroy());

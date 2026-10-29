@@ -55,3 +55,38 @@ Copilot on macOS uses the system keychain in the graphical login session. The
 process group when the caller disconnects. The Copilot sandbox restricts shell
 commands; built-in file edits use the CLI's best-effort policy rather than an OS
 sandbox.
+
+## Fleet dispatch and admission
+
+On gores1, `openswarm auto --type impl --difficulty 3 --prompt '...' --verify '...'`
+chooses a currently idle lane on gores1 or gocc. Use `--dry-run` to inspect the
+choice. Difficulty 1–3 selects Copilot Haiku when Copilot is chosen; difficulty
+4–5 selects Sonnet. Review and research profiles use isolated, read-only Pi
+one-shot execution. The dispatcher does not replace the legacy `openswarm run`
+default or integrate the OpenBot Hub's own dispatcher.
+
+Both candidate installations use `/etc/openswarm-fleet-capacity.json` regardless
+of `OPENSWARM_HOME`. Admission is recorded in a SQLite coordinator on gocc, with
+host limits of two per host and a fleet total of eight. The provider/backend caps
+are enforced as well. gores1 connects with a separate forced-command SSH key;
+the worker cannot obtain a shell through that key. A missing or unreachable
+coordinator rejects new executor admissions. A crash or uncertain response can
+leave a persistent reservation; abnormal executor exits retain their reservation
+for inspection. Reservations are never released just because a timer expired.
+
+Inspect reservations on gocc with:
+
+```sh
+printf '{"op":"status"}' | ~/tools/openswarm-executor-candidate/bin/fleet-capacity gocc
+```
+
+For an orphan, first independently verify that the named run and every executor
+child and descendant are stopped on its host. Only then may a local gocc
+operator submit `{"op":"recover","host":"gores1","run_id":"...",`
+`"confirm":"all-executor-processes-stopped"}` to the same command. This
+manual recovery is not available over the worker's restricted key.
+
+The guard covers the candidate's run, lane, review and consult execution paths;
+unmodified old OpenSwarm binaries and separately started tools can bypass it.
+The legacy govpn2 K2 Fast service is disabled; do not re-enable it as part of
+this fleet. These limits are not evidence that unconfigured hosts are controlled.
