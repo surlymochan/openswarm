@@ -57,7 +57,7 @@ https.request = (_options, callback) => {
                     time.sleep(0.02)
                 self.assertTrue(os.path.exists(path))
                 client = UnixHTTP(path)
-                client.request('POST', '/v1/messages', json.dumps({'model': 'allowed-model', 'messages': []}))
+                client.request('POST', '/v1/messages?beta=true', json.dumps({'model': 'allowed-model', 'messages': []}))
                 response = client.getresponse()
                 busy_client = UnixHTTP(path)
                 busy_client.request('POST', '/other', '{}')
@@ -90,6 +90,8 @@ https.request = (_options, callback) => {
                     time.sleep(0.02)
                 self.assertTrue(os.path.exists(path), 'broker did not start')
                 for url, body in [('/other', {'model': 'allowed-model', 'messages': []}),
+                                  ('/v1/messages?beta=false', {'model': 'allowed-model', 'messages': []}),
+                                  ('/v1/messages?beta=true', {'model': 'wrong-model', 'messages': []}),
                                   ('/v1/messages', {'model': 'wrong-model', 'messages': []})]:
                     client = UnixHTTP(path)
                     client.request('POST', url, json.dumps(body), {'content-type': 'application/json'})

@@ -20,7 +20,7 @@ let busy = false, accepted = 0;
 const server = createServer((req, res) => {
   const fail = (status, message) => { if (!res.headersSent) res.writeHead(status, {'content-type': 'text/plain'}); res.end(message); };
   if (busy || accepted >= 64) return fail(503, 'broker temporarily unavailable');
-  if (req.method !== 'POST' || req.url !== '/v1/messages') return fail(403, 'request refused');
+  if (req.method !== 'POST' || !['/v1/messages', '/v1/messages?beta=true'].includes(req.url)) return fail(403, 'request refused');
   const length = Number(req.headers['content-length']);
   if (!Number.isSafeInteger(length) || length < 1 || length > maxBytes || req.headers['transfer-encoding']) return fail(400, 'invalid size');
   busy = true;
