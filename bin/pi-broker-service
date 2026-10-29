@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""Run the host-side broker with a private, restart-safe Unix socket."""
+import os
+import pathlib
+import socket
+import stat
+import sys
+
+root = pathlib.Path.home() / 'Library' / 'Caches' / 'openswarm-pi-broker'
+root.mkdir(mode=0o700, parents=True, exist_ok=True)
+info = root.lstat()
+if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+    sys.exit('invalid broker directory')
+root.chmod(0o700)
+path = root / 'broker.sock'
+if path.exists() or path.is_symlink():
+    info = path.lstat()
+    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+        sys.exit('invalid broker socket')
+    probe = socket.socket(socket.AF_UNIX)
+    try:
+        probe.settimeout(1)
+        probe.connect(str(path))
+    except ConnectionRefusedError:
+        path.unlink()
+    else:
+        sys.exit('broker already running')
+    finally:
+        probe.close()
+home = pathlib.Path.home()
+node = home / '.local/node-v24.14.1/bin/node'
+auth = home / '.local/node-v24.14.1/lib/node_modules/@mariozechner/pi-coding-agent/dist/core/auth-storage.js'
+broker = pathlib.Path(__file__).resolve().with_name('pi-minimax-broker.mjs')
+os.execv(str(node), [str(node), str(broker), str(path), str(auth), 'MiniMax-M3.1-Flash'])

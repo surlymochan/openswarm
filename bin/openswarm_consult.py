@@ -85,20 +85,22 @@ def _model(core, state, policy, backend, requested=None, lane=None):
 
 
 def _profile(core, state, policy, backend, requested_model=None, lane=None):
-    if backend == "pi" and (policy.get("pi") or {}).get("require_isolation", True):
-        raise ValueError("isolated Pi does not yet support read-only consultations")
     provider = (lane or {}).get("provider") or (policy.get(backend) or {}).get("provider")
     model = _model(core, state, policy, backend, requested_model, lane)
+    binary = _binary(core, state, backend, lane)
+    if backend == "pi" and (policy.get("pi") or {}).get("require_isolation", True):
+        binary = core.pi_bin()
+        expected = os.path.join(os.path.dirname(os.path.realpath(core.__file__)), "pi-isolated")
+        if not binary or os.path.realpath(binary) != os.path.realpath(expected):
+            raise ValueError("read-only Pi consultation requires the isolated launcher")
     return {"backend": backend, "model": model, "family": backend_family(backend, model, provider),
-            "provider": provider, "binary": _binary(core, state, backend, lane),
+            "provider": provider, "binary": binary,
             "lane": (lane or {}).get("name"), "cwd": (lane or {}).get("repo") or os.getcwd()}
 
 
 def default_profiles(core, state, policy):
     candidates = []
     for backend in ("codex", "agy", "pi"):
-        if backend == "pi" and (policy.get("pi") or {}).get("require_isolation", True):
-            continue
         profile = _profile(core, state, policy, backend)
         if not profile["binary"]:
             continue

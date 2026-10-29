@@ -38,6 +38,10 @@ const server = createServer((req, res) => {
       release(); return fail(403, 'model or request refused');
     }
     accepted += 1;
+    if (accepted >= 64) res.once('finish', () => server.close(() => {
+      try { unlinkSync(socket); } catch {}
+      process.exit(0);
+    }));
     // Forward the parsed value, not the original bytes: duplicate JSON keys must not
     // let the upstream select a different model from the one checked above.
     const payload = Buffer.from(JSON.stringify(parsed));

@@ -2,7 +2,8 @@
 
 The default models are selected for the accounts checked during this recovery. Model
 catalogues and billing can change. Codex probes the signed-in account's model list;
-Copilot `auto` reports the selected model in one-shot attempt metadata. Cursor's
+Codex is configured for `gpt-6-luna` with high effort and fails closed when the
+account does not offer it. Copilot `auto` reports the selected model in one-shot attempt metadata. Cursor's
 one-shot default requests Composer 2.5 standard speed. Cursor ACP currently exposes
 Composer 2.5 fast as its default, so its cost can differ from one-shot runs.
 
@@ -12,10 +13,21 @@ credential. The worker needs bubblewrap, socat, and a Pi 0.73-compatible install
 The launcher disables extension, skill and context discovery, starts with an empty
 environment, and lets the sandbox reach only the broker socket. The broker accepts
 only the configured model and the MiniMax messages endpoint.
-Each broker process accepts at most 64 inference requests; restart the bridge when
-that limit is reached.
+Each broker process accepts at most 64 inference requests and exits so its login
+agent can restart it.
 
-From a machine with the existing SSH identities, start the bounded bridge:
+The persistent deployment uses a restricted SSH key through the existing relay,
+the `app.openswarm.pi-broker` macOS login agent, and the
+`openswarm-pi-proxy.service` Linux service. The worker socket is
+`/run/openswarm-pi/broker.sock`; the Pi lane service sets
+`OPENSWARM_PI_BROKER_SOCKET` explicitly so startup does not race socket creation.
+The macOS broker starts when the graphical user session is available. The worker
+service reconnects through SSH for each request. The key on the relay permits only
+the designated forwarding destination, and the key on the broker host forces the
+broker stdio command.
+
+As a temporary alternative, from a machine with the existing SSH identities, start
+the bounded bridge:
 
 ```sh
 bin/pi-fleet-bridge --broker-host gocc --worker gores1 --minutes 120
@@ -28,14 +40,15 @@ separate OpenSwarm state directory, preserving the existing fleet configuration.
 alive for the run. Interrupting it or reaching its time limit closes its SSH sessions
 and removes its private sockets. It is a transport process, not an executor.
 
-Pi read-only review and consult are deliberately rejected until their own sandbox
-contract is verified. One-shot isolated Pi cannot resume a rate-limited session;
+Pi read-only review and consult use read-only workspace mounts and the read-only
+tool set. Read-only assignments to a resident writable Pi lane are rejected.
+One-shot isolated Pi cannot resume a rate-limited session;
 resident RPC Pi keeps its session inside the sandbox. A missing bridge, unsupported
 host, unapproved model or unisolated binary fails closed. Do not turn off
 `pi.require_isolation` on a host containing credentials or other valuable data.
 
-Copilot on macOS uses the normal GitHub device login. If the system keychain is
-unavailable, its CLI may store the credential in plaintext under `COPILOT_HOME`;
-restrict the directory and files to the owning account and treat that location as a
-credential store. The Copilot sandbox restricts shell commands; built-in file edits
-use the CLI's best-effort policy rather than an OS sandbox.
+Copilot on macOS uses the system keychain in the graphical login session. The
+`copilot-gui-run` bridge starts one-shot jobs in that session and terminates their
+process group when the caller disconnects. The Copilot sandbox restricts shell
+commands; built-in file edits use the CLI's best-effort policy rather than an OS
+sandbox.

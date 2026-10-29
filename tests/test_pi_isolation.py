@@ -46,6 +46,11 @@ class PiIsolationTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(result.stdout),
                                  {'environment': False, 'host_file': False, 'network': False, 'writable': True})
+                command[command.index('read,bash,edit,write,grep,find,ls')] = 'read,grep,find,ls'
+                result = subprocess.run(command, cwd=work, env=env, capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout),
+                                 {'environment': False, 'host_file': False, 'network': False, 'writable': False})
                 command[command.index('MiniMax-M3.1-Flash')] = 'wrong-model'
                 result = subprocess.run(command, cwd=work, env=env, capture_output=True, text=True, timeout=15)
                 self.assertNotEqual(result.returncode, 0)

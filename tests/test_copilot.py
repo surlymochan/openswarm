@@ -33,6 +33,7 @@ class CopilotTests(unittest.TestCase):
                               "print(json.dumps({'type':'assistant.message','data':{'content':"
                               "json.dumps({'status':'done','summary':'ok','files_changed':[],"
                               "'tests':'none','followups':[]})}}))\n"
+                              "print(json.dumps({'type':'result','exitCode':0}))\n"
                               "if os.environ.get('FAKE_SESSION_ERROR'):"
                               " print(json.dumps({'type':'session.error','data':{'message':'failure'}}))\n")
             binary.chmod(0o755)

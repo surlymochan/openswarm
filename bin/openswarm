@@ -2834,10 +2834,21 @@ def plan_codex(prof, st, policy, forced, notes):
         return None, "no working codex binary"
     want = policy["difficulty_map"][str(prof["difficulty"])]
     tier, effort = want["tier"], want["effort"]
+    config = policy.get("codex") or {}
+    required_model = config.get("default_model") if config.get("require_default_model") and not prof.get("model") else None
+    if required_model:
+        if "account availability unverified" in (cx.get("models_source") or ""):
+            return None, "Codex account model availability could not be verified"
+        selected = next((m for m in cx["models"] if m.get("id") == required_model), None)
+        if not selected:
+            return None, f"configured Codex model {required_model} is unavailable for this account"
+        tier = selected["tier"]
     br = breakers()
     for t in TIER_FALLBACK[tier]:
         cands = [m for m in cx["models"] if m["tier"] == t and f"codex/{m['id']}" not in br
                  and f"codex/limit/{m['limit_id']}" not in br]
+        if required_model:
+            cands = [m for m in cands if m["id"] == required_model]
         preferred = (policy.get("codex") or {}).get("default_model")
         cands.sort(key=lambda m: (m["id"] != preferred if preferred else False, m["legacy"], m["priority"]))
         if prof.get("context_tokens") and cands:
@@ -2870,6 +2881,10 @@ def plan_codex(prof, st, policy, forced, notes):
             notes.append("codex quota unknown (no recent rollout); using defaults")
         if t != tier:
             notes.append(f"codex tier {tier} unavailable, using {t}")
+        if required_model and config.get("default_effort"):
+            effort = config["default_effort"]
+            if effort not in m["efforts"]:
+                return None, f"configured Codex effort {effort} is unavailable for {required_model}"
         return {"backend": "codex", "model": m["id"], "effort": clamp_effort(effort, m["efforts"], policy),
                 "tier": t, "limit_id": m["limit_id"]}, None
     return None, "codex unavailable (limits/breakers)"
@@ -3086,8 +3101,6 @@ def probe_pi(policy):
 def plan_pi(prof, st, policy, forced, notes):
     known = st.get("pi") if isinstance(st.get("pi"), dict) else None
     cfg = policy.get("pi") or {}
-    if cfg.get("require_isolation", True) and prof.get("read_only"):
-        return None, "isolated Pi does not yet support read-only runs"
     binary = pi_bin() if cfg.get("require_isolation", True) else (
         known.get("binary") if known is not None and "binary" in known else pi_bin())
     if not binary:
@@ -4240,7 +4253,8 @@ def exec_pi(d, st, prompt, wd, rdir, timeout, evp):
         cmd += ["--model", d["model"]]
     if d.get("_resume_session"):
         cmd.append("--continue")
-    cmd += ["--tools", PI_TOOLS, prompt]
+    read_only = (d.get("profile") or {}).get("read_only") is True
+    cmd += ["--tools", "read,grep,find,ls" if isolated and read_only else PI_TOOLS, prompt]
     rc = run_proc(cmd, wd, os.environ.copy(), timeout, evp)
     usage, text, errors = pi_usage(evp)
     final = extract_json(text) if isinstance(text, str) else None
@@ -4263,7 +4277,7 @@ def exec_copilot(d, st, prompt, wd, rdir, timeout, evp):
     cmd = [binary, "-p", prompt, "--model", d["model"], "--output-format", "json",
            "--sandbox", "--assisted-approval", "--no-ask-user", "--disable-builtin-mcps"]
     rc = run_proc(cmd, wd, os.environ.copy(), timeout, evp)
-    final, errors, session_error, resolved_model = None, [], False, None
+    final, errors, session_error, resolved_model, saw_result = None, [], False, None, False
     usage = {k: 0 for k in CURSOR_USAGE_KEYS}
     with open(evp, errors="ignore") as stream:
         for line in stream:
@@ -4276,8 +4290,10 @@ def exec_copilot(d, st, prompt, wd, rdir, timeout, evp):
             data = event.get("data") if isinstance(event.get("data"), dict) else {}
             if event.get("type") == "session.auto_mode_resolved" and isinstance(data.get("chosenModel"), str):
                 resolved_model = data["chosenModel"]
-            if event.get("type") == "result" and event.get("exitCode") not in (None, 0):
-                session_error = True
+            if event.get("type") == "result":
+                saw_result = True
+                if event.get("exitCode") != 0:
+                    session_error = True
             if event.get("type") == "assistant.message" and isinstance(data.get("content"), str):
                 final = extract_json(data["content"]) or final
             elif event.get("type") == "assistant.usage":
@@ -4292,7 +4308,7 @@ def exec_copilot(d, st, prompt, wd, rdir, timeout, evp):
             errors.append(stream.read()[-3000:])
     except OSError:
         pass
-    if rc == 0 and (session_error or final is None):
+    if rc == 0 and (session_error or final is None or not saw_result):
         rc = 1
     return rc, final, {"usage": usage, "resolved_model": resolved_model or d["model"]}, "\n".join(errors)
 
@@ -4967,13 +4983,13 @@ def review_available(policy):
     state = jload(state_path, {}) or {}
     available = {}
     for backend in REVIEW_BACKENDS:
-        if backend == "pi" and (policy.get("pi") or {}).get("require_isolation", True):
-            continue
         known = state.get(backend) if isinstance(state.get(backend), dict) else {}
         override_name = {"agy": "AGY_BIN", "pi": "PI_BIN", "cursor": "CURSOR_BIN"}.get(backend)
         explicit_override = envvar(override_name) if override_name else None
         binary = None
-        if explicit_override:
+        if backend == "pi" and (policy.get("pi") or {}).get("require_isolation", True):
+            binary = pi_bin()
+        elif explicit_override:
             binary = {"agy": agy_bin, "pi": pi_bin, "cursor": cursor_bin}[backend]()
         elif known.get("binary") and os.access(known["binary"], os.X_OK):
             binary = known["binary"]
@@ -5099,7 +5115,9 @@ def review_command(reviewer, prompt, repo, scratch_dir, policy):
             command += ["--model", model]
     elif backend == "pi":
         if cfg.get("require_isolation", True):
-            raise ValueError("isolated Pi does not yet support read-only reviews")
+            expected = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pi-isolated")
+            if os.path.realpath(binary) != os.path.realpath(expected):
+                raise ValueError("read-only Pi review requires the isolated launcher")
         session_dir = os.path.join(scratch_dir, "pi-sessions")
         command = [binary, "-p", "--mode", "json", "--session-dir", session_dir]
         if reviewer.get("provider") or cfg.get("provider"):

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """One-shot Pi wrapper: Linux namespaces, no host credentials and one broker socket."""
 import argparse
+import glob
 import json
 import os
 import pathlib
@@ -23,7 +24,8 @@ model = os.environ.get('OPENSWARM_PI_ISOLATED_MODEL', 'MiniMax-M3.1-Flash')
 runtime = os.path.realpath(os.environ.get('OPENSWARM_PI_RUNTIME', ''))
 broker = os.path.realpath(os.environ.get('OPENSWARM_PI_BROKER_SOCKET', ''))
 worktree = os.path.realpath(os.getcwd())
-if args.provider != 'minimax-cn' or args.model != model or args.tools != 'read,bash,edit,write,grep,find,ls':
+read_only = args.tools == 'read,grep,find,ls'
+if args.provider != 'minimax-cn' or args.model != model or args.tools not in ('read,bash,edit,write,grep,find,ls', 'read,grep,find,ls'):
     sys.exit('isolated Pi rejected provider, model or tool configuration')
 if (args.mode == 'json' and (not args.p or args.prompt is None)) or (args.mode == 'rpc' and (args.p or args.prompt is not None)):
     sys.exit('isolated Pi rejected mode or prompt configuration')
@@ -60,8 +62,25 @@ fi
            '--ro-bind', '/usr', '/usr', '--symlink', 'usr/bin', '/bin', '--symlink', 'usr/lib', '/lib',
            '--symlink', 'usr/lib64', '/lib64', '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
            '--tmpfs', '/home', '--dir', '/run', '--ro-bind', runtime, '/runtime',
-           '--ro-bind', config_dir, '/config', '--ro-bind', broker, '/run/broker.sock',
-           '--bind', worktree, worktree, '--chdir', worktree, '--clearenv', '--setenv', 'HOME', '/home/pi',
-           '--setenv', 'PATH', '/usr/bin:/bin', '--setenv', 'PI_CODING_AGENT_DIR', '/tmp/agent',
-           '/usr/bin/sh', '-c', script, 'pi-isolated', args.mode, model, args.tools, args.prompt or '']
+           '--ro-bind', config_dir, '/config', '--ro-bind', broker, '/run/broker.sock']
+    deps_root = os.environ.get('OPENSWARM_PI_DEPS_ROOT')
+    if deps_root:
+        deps_root = os.path.realpath(deps_root)
+        candidates = [os.path.join(deps_root, 'node_modules')]
+        for section in ('apps', 'packages', 'remote'):
+            candidates.extend(glob.glob(os.path.join(deps_root, section, '*', 'node_modules')))
+        for path in candidates:
+            if os.path.isdir(path):
+                if os.path.commonpath([deps_root, os.path.realpath(path)]) != deps_root:
+                    sys.exit('isolated Pi dependency path leaves the configured project')
+                cmd += ['--ro-bind', path, path]
+    bun = os.environ.get('OPENSWARM_PI_BUN_RUNTIME')
+    path = '/usr/bin:/bin'
+    if bun and os.path.isfile(os.path.join(bun, 'node_modules/.bin/bun')):
+        cmd += ['--ro-bind', os.path.realpath(bun), '/bun']
+        path = '/bun/node_modules/.bin:' + path
+    cmd += ['--ro-bind' if read_only else '--bind', worktree, worktree, '--chdir', worktree,
+            '--clearenv', '--setenv', 'HOME', '/home/pi', '--setenv', 'PATH', path,
+            '--setenv', 'PI_CODING_AGENT_DIR', '/tmp/agent',
+            '/usr/bin/sh', '-c', script, 'pi-isolated', args.mode, model, args.tools, args.prompt or '']
     sys.exit(subprocess.call(cmd))

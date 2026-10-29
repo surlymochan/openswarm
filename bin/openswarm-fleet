@@ -1,13 +1,23 @@
 #!/bin/sh
 # A separate runtime for the executor candidate; it never changes the existing fleet home.
 set -eu
-root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+root=$(python3 -c 'import os, sys; print(os.path.dirname(os.path.dirname(os.path.realpath(sys.argv[1]))))' "$0")
 export OPENSWARM_HOME="${OPENSWARM_HOME:-$HOME/.claude/openswarm-executor-candidate}"
-export PATH="$HOME/.local/node-v24.14.1/bin:$HOME/tools/copilot-executor/node_modules/.bin:$HOME/.local/bin:/opt/homebrew/bin:$PATH"
-if [ -d "$HOME/Library/Application Support/openswarm-copilot" ]; then
-  export COPILOT_HOME="${COPILOT_HOME:-$HOME/Library/Application Support/openswarm-copilot}"
+export PATH="$HOME/.local/node-v24.14.1/bin:$HOME/tools/copilot-executor/node_modules/.bin:$HOME/tools/bun-runtime/node_modules/.bin:$HOME/.local/bin:/opt/homebrew/bin:$PATH"
+if [ -d "$HOME/Library/Application Support/openswarm-copilot-secure" ]; then
+  export COPILOT_HOME="${COPILOT_HOME:-$HOME/Library/Application Support/openswarm-copilot-secure}"
+  export OPENSWARM_COPILOT_BIN="${OPENSWARM_COPILOT_BIN:-$root/bin/copilot-gui-run}"
 fi
 if [ -d "$HOME/tools/pi-sandbox/node_modules" ]; then
   export OPENSWARM_PI_RUNTIME="${OPENSWARM_PI_RUNTIME:-$HOME/tools/pi-sandbox}"
+fi
+if [ -d "$HOME/work/openbot-executor-base/node_modules" ]; then
+  export OPENSWARM_PI_DEPS_ROOT="${OPENSWARM_PI_DEPS_ROOT:-$HOME/work/openbot-executor-base}"
+fi
+if [ -x "$HOME/tools/bun-runtime/node_modules/.bin/bun" ]; then
+  export OPENSWARM_PI_BUN_RUNTIME="${OPENSWARM_PI_BUN_RUNTIME:-$HOME/tools/bun-runtime}"
+fi
+if [ -S /run/openswarm-pi/broker.sock ]; then
+  export OPENSWARM_PI_BROKER_SOCKET="${OPENSWARM_PI_BROKER_SOCKET:-/run/openswarm-pi/broker.sock}"
 fi
 exec "$root/bin/openswarm" "$@"

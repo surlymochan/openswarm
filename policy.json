@@ -75,7 +75,9 @@
     "weighted": false
   },
   "codex": {
-    "default_model": "gpt-5.6-terra",
+    "default_model": "gpt-6-luna",
+    "default_effort": "high",
+    "require_default_model": true,
     "binary_candidates": [
       "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
       "$PATH:codex",
