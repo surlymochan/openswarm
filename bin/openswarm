@@ -6973,9 +6973,17 @@ def lane_acp_request(child, msg, event_file):
     params = msg.get("params") or {}
     options = params.get("options") or []
     kinds = ("allow_once",) if getattr(child, "lane", {}).get("backend") == "copilot" else ("allow_always", "allow_once")
-    selected = next((option for kind in kinds for option in options
-                     if isinstance(option, dict) and option.get("kind") == kind), None)
     tool_call = params.get("toolCall") or {}
+    def sandbox_bypass(value):
+        if isinstance(value, dict):
+            return any((key in ("requestSandboxBypass", "request_sandbox_bypass") and item is True)
+                       or sandbox_bypass(item) for key, item in value.items())
+        if isinstance(value, list):
+            return any(sandbox_bypass(item) for item in value)
+        return False
+    bypass = getattr(child, "lane", {}).get("backend") == "copilot" and sandbox_bypass(params)
+    selected = None if bypass else next((option for kind in kinds for option in options
+                     if isinstance(option, dict) and option.get("kind") == kind), None)
     title = tool_call.get("title")
     lane_record_event(event_file, {"type": "permission_request", "title": title,
                                    "tool_call_id": tool_call.get("toolCallId"), "kind": tool_call.get("kind"),
