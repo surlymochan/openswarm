@@ -155,7 +155,7 @@ class CursorBackend(unittest.TestCase):
         self.assertEqual(entry["backend"], "cursor")
         with open(self.log) as fh:
             argv = json.load(fh)
-        self.assertEqual(argv[argv.index("--model") + 1], "composer-2.5[fast=false]")
+        self.assertEqual(argv[argv.index("--model") + 1], "composer-2.5")
         self.assertEqual(argv[argv.index("--output-format") + 1], "stream-json")
         for flag in ("-p", "--trust", "--force", "--"):
             self.assertIn(flag, argv)
@@ -199,7 +199,7 @@ class CursorBackend(unittest.TestCase):
         child.close()
         with open(self.log) as stream:
             argv = json.load(stream)
-        self.assertEqual(argv[argv.index("--model") + 1], "composer-2.5[fast=false]")
+        self.assertEqual(argv[argv.index("--model") + 1], "composer-2.5")
         self.assertIn("--sandbox", argv)
         with self.assertRaises(RuntimeError):
             child.start("test", model="composer-2.5[fast=true]")

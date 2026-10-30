@@ -4102,7 +4102,8 @@ def exec_cursor(d, st, prompt, wd, rdir, timeout, evp):
         with open(evp + ".err", "w") as f:
             f.write("cursor-agent not found\n")
         return 127, None, {"usage": cursor_usage(None)}, "cursor-agent not found"
-    cmd = [binary, "-p", "--trust", "--force", "--sandbox", "enabled", "--model", model,
+    cli_model = "composer-2.5" if model == "composer-2.5[fast=false]" else model
+    cmd = [binary, "-p", "--trust", "--force", "--sandbox", "enabled", "--model", cli_model,
            "--output-format", "stream-json"]
     if d.get("_resume_session"):
         cmd.append("--continue")
@@ -6787,7 +6788,7 @@ class CursorHeadlessChild(AgyChild):
         selected = model or self.lane["model"]
         if selected != "composer-2.5[fast=false]":
             raise RuntimeError("Cursor headless lane requires explicit standard Composer 2.5")
-        cmd = [binary, "-p", "--trust", "--force", "--sandbox", "enabled", "--model", selected,
+        cmd = [binary, "-p", "--trust", "--force", "--sandbox", "enabled", "--model", "composer-2.5",
                "--output-format", "stream-json"]
         if conversation:
             cmd.append("--continue")
