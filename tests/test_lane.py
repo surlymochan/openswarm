@@ -347,6 +347,21 @@ class LaneTests(unittest.TestCase):
             return []
         return [json.loads(line) for line in path.read_text().splitlines()]
 
+    def test_review_discards_changes_and_agent_commit(self):
+        self.set_config("cursor")
+        base = self.git("rev-parse", "HEAD")
+        self.start_lane()
+        for prompt in ("review with accidental edit", "review LANE_TEST_AGENT_COMMIT"):
+            run_id = self.assign(prompt, "--read-only")
+            self.assertEqual(self.wait_run(run_id)["status"], "done")
+            result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+            wt = self.data / "lanes" / self.lane_name / "wt"
+            self.assertIsNone(result["commit"])
+            self.assertTrue(result["review_changes_discarded"])
+            self.assertFalse((wt / "lane_result.txt").exists())
+            self.assertEqual(subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=wt, text=True).strip(), base)
+            self.assertEqual(self.git("rev-parse", "HEAD"), base)
+
     def test_cursor_assign_selects_model_and_commits_without_verify(self):
         self.set_config("cursor")
         config_path = self.data / "lanes.json"

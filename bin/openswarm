@@ -6882,9 +6882,7 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                 answer["state"] = jload(lane_state_path(lane["name"]), {})
             elif op == "assign":
                 state = jload(lane_state_path(lane["name"]), {}) or {}
-                if lane["backend"] == "copilot" and (req.get("read_only") or req.get("card_type") in READ_ONLY_CARD_TYPES):
-                    answer = {"ok": False, "error": "Copilot lane read-only isolation is unavailable"}
-                elif (lane["backend"] == "pi" and (load_policy().get("pi") or {}).get("require_isolation", True)
+                if (lane["backend"] == "pi" and (load_policy().get("pi") or {}).get("require_isolation", True)
                         and (req.get("read_only") or req.get("card_type") in READ_ONLY_CARD_TYPES)):
                     answer = {"ok": False, "error": "isolated Pi does not yet support read-only runs"}
                 elif state.get("state") != "idle" or current.get("run_id"):
@@ -7462,7 +7460,10 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
         if head_rc == 0 and head.strip() != ws["base"]:
             ancestor_rc, _, _ = git(["merge-base", "--is-ancestor", ws["base"], head.strip()], ws["root"])
             changed = changed or ancestor_rc == 0
-    fin = finalize_workspace(ws, title, lane["backend"], rdir, keep=True)
+    read_only = spec.get("read_only") or spec.get("card_type") in READ_ONLY_CARD_TYPES
+    fin = ({"branch": None, "commit": None, "diffstat": "", "excluded_files": [],
+            "patch": None, "worktree": ws["root"], "merge_hint": None}
+           if read_only else finalize_workspace(ws, title, lane["backend"], rdir, keep=True))
     verify = None
     prepare_error = None
     if spec.get("verify") and error_class not in ("risk_blocked", "rate_limit") and (final is not None or changed):
@@ -7511,18 +7512,25 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
     else:
         status = (final or {}).get("status") or "failed"
         status, verify_note = adjust_status_for_verify(status, verify)
-    read_only = spec.get("read_only") or spec.get("card_type") in READ_ONLY_CARD_TYPES
     status, verify_note = adjust_status_for_change_evidence(
         status, verify_note, commit=fin.get("commit"), workspace_changed=changed, changed=changed,
         read_only=read_only, verify=verify)
     if ws.get("mode") == "worktree":
         detach_at = fin.get("commit") or ws["base"]
-        lane_git(["checkout", "--detach", detach_at], ws["root"])
+        if read_only:
+            for command in (["checkout", "--detach", "-f", detach_at],
+                            ["clean", "-fdx", "-e", "/.openswarm-tmp/"],
+                            ["branch", "-D", ws["branch"]]):
+                cleanup_rc, _, cleanup_err = lane_git(command, ws["root"])
+                if cleanup_rc:
+                    raise RuntimeError(f"review worktree cleanup failed: {cleanup_err[:250]}")
+        else:
+            lane_git(["checkout", "--detach", detach_at], ws["root"])
     out = {"id": rid, "status": status, "error_class": error_class, "title": title, "lane": lane["name"],
            "prepare": ws.get("prepare", []), "workspace_note": ws.get("workspace_note"), "verify": verify,
            "verify_note": verify_note, "backend": lane["backend"], "model": model, "effort": lane.get("effort"),
            **({"resolved_model": model} if lane["backend"] in ("cursor", "copilot") else {}),
-           "risk_blocks": spec.get("risk_blocks", []),
+           "risk_blocks": spec.get("risk_blocks", []), "review_changes_discarded": bool(read_only and changed),
            "usage": usage, "seconds": round(sum(attempt["seconds"] for attempt in attempts), 3), "result": final, "workspace":
            {k: v for k, v in ws.items() if k in ("mode", "path", "repo", "base", "note", "lane")},
            **fin, "attempts": attempts, "run_dir": rdir}
