@@ -1,9 +1,12 @@
 import json
 import os
 from pathlib import Path
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -12,6 +15,56 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class PiLocalBridgeTests(unittest.TestCase):
+    def test_client_cancellation_stops_waiting_ssh(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            token, marker, ssh = root / 'token', root / 'pid', root / 'fake-ssh'
+            token.write_text('test-only-secret')
+            ssh.write_text('#!' + sys.executable + '\nimport os,sys,time\n'
+                           'data=b""\n'
+                           'while not data.endswith(b"\\r\\n\\r\\n"): data+=sys.stdin.buffer.read(1)\n'
+                           'size=int(next(x.split(b":",1)[1] for x in data.split(b"\\r\\n") if x.lower().startswith(b"content-length:")))\n'
+                           'sys.stdin.buffer.read(size)\n'
+                           'p=os.environ["FAKE_PID"];open(p+".tmp","w").write(str(os.getpid()));os.replace(p+".tmp",p)\n'
+                           'time.sleep(30)\n')
+            ssh.chmod(0o700)
+            process = subprocess.Popen([sys.executable, str(ROOT / 'bin/pi-local-http-bridge.py'),
+                                        '--port', '0', '--token-file', str(token), '--ssh', str(ssh)],
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                       env={**os.environ, 'FAKE_PID': str(marker)})
+            child_stopped = False
+            try:
+                port = int(process.stdout.readline().split()[1])
+                client = socket.create_connection(('127.0.0.1', port), timeout=5)
+                body = b'{}'
+                client.sendall(b'POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nx-api-key: test-only-secret\r\n'
+                               b'Content-Length: 2\r\n\r\n' + body)
+                deadline = time.monotonic() + 5
+                while not marker.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(marker.exists(), 'relay did not start')
+                pid = int(marker.read_text())
+                client.close()
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        child_stopped = True
+                        break
+                    time.sleep(0.01)
+                else:
+                    self.fail('SSH child survived client cancellation')
+            finally:
+                process.terminate()
+                process.wait(timeout=5)
+                if marker.exists() and not child_stopped:
+                    try:
+                        os.kill(int(marker.read_text()), signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                process.stdout.close()
+                process.stderr.close()
+
     def test_stream_auth_and_restart(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

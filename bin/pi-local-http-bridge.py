@@ -5,7 +5,9 @@ import hmac
 import http.server
 import os
 from pathlib import Path
+import select
 import signal
+import socket
 import subprocess
 import threading
 
@@ -71,12 +73,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         sender = threading.Thread(target=forward_request, daemon=True)
         sender.start()
+        sender.join()
         try:
             while True:
-                chunk = os.read(proc.stdout.fileno(), 65536)
-                if not chunk:
+                ready, _, _ = select.select([proc.stdout, self.connection], [], [])
+                if self.connection in ready:
+                    # The request body was already sent. EOF means Pi cancelled; unexpected
+                    # pipelined bytes are also unsupported on this close-after-response relay.
+                    if not self.connection.recv(1, socket.MSG_PEEK):
+                        break
                     break
-                self.connection.sendall(chunk)
+                if proc.stdout in ready:
+                    chunk = os.read(proc.stdout.fileno(), 65536)
+                    if not chunk:
+                        break
+                    self.connection.sendall(chunk)
         except OSError:
             pass
         finally:
