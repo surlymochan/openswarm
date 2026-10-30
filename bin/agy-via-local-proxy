@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Launch Antigravity with Keychain credentials in a volatile home."""
+import base64
+import json
+import os
+import pathlib
+import plistlib
+import signal
+import subprocess
+import sys
+
+service = 'openbot-agy-nick-oauth'
+account = 'openswarm'
+original_home = pathlib.Path.home()
+volume = pathlib.Path('/Volumes/OpenBotAgyVolatile')
+home = volume / 'home'
+token_path = home / '.gemini/antigravity-cli/antigravity-oauth-token'
+
+def keychain_read():
+    proc = subprocess.run(['/usr/bin/security', 'find-generic-password', '-a', account, '-s', service, '-w'],
+                          capture_output=True, text=True, timeout=20)
+    if proc.returncode:
+        raise RuntimeError('Antigravity credential is unavailable from the login keychain')
+    return base64.b64decode(proc.stdout.strip(), validate=True)
+
+def keychain_write(data):
+    encoded = base64.b64encode(data).decode('ascii')
+    command = 'add-generic-password -a openswarm -s openbot-agy-nick-oauth -U -T /usr/bin/security -w ' + encoded + '\n'
+    proc = subprocess.run(['/usr/bin/security', '-i'], input=command, capture_output=True, text=True, timeout=20)
+    if proc.returncode:
+        raise RuntimeError('Antigravity credential could not be saved to the login keychain')
+
+def is_ram_volume():
+    info = plistlib.loads(subprocess.check_output(['/usr/bin/hdiutil', 'info', '-plist'], timeout=20))
+    return any(image.get('image-path', '').startswith('ram://') and
+               any(entity.get('mount-point') == str(volume) for entity in image.get('system-entities', []))
+               for image in info.get('images', []))
+
+def ensure_home():
+    if not os.path.ismount(volume):
+        attach = subprocess.run(['/usr/bin/hdiutil', 'attach', '-nomount', 'ram://131072'],
+                                capture_output=True, text=True, timeout=30, check=True)
+        device = attach.stdout.split()[0]
+        subprocess.run(['/usr/sbin/diskutil', 'eraseVolume', 'HFS+', volume.name, device],
+                       capture_output=True, timeout=60, check=True)
+    if not is_ram_volume():
+        raise RuntimeError('Antigravity volatile volume is unavailable')
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    home.chmod(0o700)
+    token_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not token_path.exists():
+        token_path.write_bytes(keychain_read())
+        token_path.chmod(0o600)
+    json.loads(token_path.read_text())
+
+try:
+    ensure_home()
+    original_refresh = json.loads(token_path.read_text()).get('token', {}).get('refresh_token')
+    env = dict(os.environ, HOME=str(home), HTTPS_PROXY='http://127.0.0.1:7890',
+               https_proxy='http://127.0.0.1:7890')
+    child = subprocess.Popen([str(original_home / '.local/bin/agy'), *sys.argv[1:]], env=env)
+    def forward(signum, _frame):
+        if child.poll() is None:
+            child.send_signal(signum)
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, forward)
+    rc = child.wait()
+    if token_path.exists():
+        updated = token_path.read_bytes()
+        current_refresh = json.loads(updated).get('token', {}).get('refresh_token')
+        if current_refresh != original_refresh:
+            keychain_write(updated)
+    sys.exit(rc if rc >= 0 else 128 - rc)
+except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+    print('Antigravity startup failed: ' + str(error), file=sys.stderr)
+    sys.exit(1)

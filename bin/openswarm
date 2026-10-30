@@ -2834,10 +2834,21 @@ def plan_codex(prof, st, policy, forced, notes):
         return None, "no working codex binary"
     want = policy["difficulty_map"][str(prof["difficulty"])]
     tier, effort = want["tier"], want["effort"]
+    config = policy.get("codex") or {}
+    required_model = config.get("default_model") if config.get("require_default_model") and not prof.get("model") else None
+    if required_model:
+        if "account availability unverified" in (cx.get("models_source") or ""):
+            return None, "Codex account model availability could not be verified"
+        selected = next((m for m in cx["models"] if m.get("id") == required_model), None)
+        if not selected:
+            return None, f"configured Codex model {required_model} is unavailable for this account"
+        tier = selected["tier"]
     br = breakers()
     for t in TIER_FALLBACK[tier]:
         cands = [m for m in cx["models"] if m["tier"] == t and f"codex/{m['id']}" not in br
                  and f"codex/limit/{m['limit_id']}" not in br]
+        if required_model:
+            cands = [m for m in cands if m["id"] == required_model]
         preferred = (policy.get("codex") or {}).get("default_model")
         cands.sort(key=lambda m: (m["id"] != preferred if preferred else False, m["legacy"], m["priority"]))
         if prof.get("context_tokens") and cands:
@@ -2870,6 +2881,10 @@ def plan_codex(prof, st, policy, forced, notes):
             notes.append("codex quota unknown (no recent rollout); using defaults")
         if t != tier:
             notes.append(f"codex tier {tier} unavailable, using {t}")
+        if required_model and config.get("default_effort"):
+            effort = config["default_effort"]
+            if effort not in m["efforts"]:
+                return None, f"configured Codex effort {effort} is unavailable for {required_model}"
         return {"backend": "codex", "model": m["id"], "effort": clamp_effort(effort, m["efforts"], policy),
                 "tier": t, "limit_id": m["limit_id"]}, None
     return None, "codex unavailable (limits/breakers)"
@@ -2964,13 +2979,14 @@ def copilot_bin():
 def plan_copilot(prof, st, policy, forced, notes):
     if not copilot_bin():
         return None, "no working copilot binary"
-    model = prof.get("model") or (policy.get("copilot") or {}).get("default_model")
+    cfg = policy.get("copilot") or {}
+    model = prof.get("model") or (cfg.get("complex_model") if prof.get("difficulty", 3) >= cfg.get("complex_difficulty", 4) else cfg.get("default_model"))
     if not model:
         return None, "copilot requires a verified model selection"
     if f"copilot/{model}" in breakers() or "copilot/all" in breakers():
         return None, "copilot breaker open"
     notes.append("copilot availability and usage depend on the signed-in account")
-    return {"backend": "copilot", "model": model, "effort": None,
+    return {"backend": "copilot", "model": model, "effort": prof.get("effort") or cfg.get("default_effort", "medium"),
             "tier": policy["difficulty_map"][str(prof["difficulty"])]["tier"]}, None
 
 
@@ -3086,8 +3102,6 @@ def probe_pi(policy):
 def plan_pi(prof, st, policy, forced, notes):
     known = st.get("pi") if isinstance(st.get("pi"), dict) else None
     cfg = policy.get("pi") or {}
-    if cfg.get("require_isolation", True) and prof.get("read_only"):
-        return None, "isolated Pi does not yet support read-only runs"
     binary = pi_bin() if cfg.get("require_isolation", True) else (
         known.get("binary") if known is not None and "binary" in known else pi_bin())
     if not binary:
@@ -3300,6 +3314,58 @@ def provider_concurrency_limits(policy, keys):
     return limits
 
 
+# Tokens stay in this supervisor process. Lost supervisors intentionally leave a
+# persistent reservation for manual, evidence-backed recovery: no unsafe TTL.
+_FLEET_RESERVATIONS = {}
+
+
+def fleet_guard_command():
+    path = envvar("FLEET_GUARD_CONFIG", "/etc/openswarm-fleet-capacity.json")
+    if not os.path.exists(path):
+        marker = os.path.join(SKILL_DIR, ".fleet-guard-required")
+        if os.path.exists(marker) or envvar("FLEET_GUARD_REQUIRED") == "1":
+            raise RuntimeError("fleet capacity configuration is required but missing")
+        return None
+    try:
+        with open(path, encoding="utf-8") as stream:
+            config = json.load(stream)
+        command = config["command"]
+        if not isinstance(command, list) or not command or any(not isinstance(x, str) or not x for x in command):
+            raise ValueError("invalid command")
+        return command
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise RuntimeError(f"fleet capacity configuration invalid: {error}")
+
+
+def fleet_guard_call(command, payload):
+    try:
+        result = subprocess.run(command, input=json.dumps(payload), text=True, capture_output=True, timeout=15)
+        answer = json.loads(result.stdout)
+        if result.returncode != 0 or not answer.get("ok"):
+            raise ValueError(answer.get("error") or "coordinator rejected request")
+        return answer
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(f"fleet capacity coordinator unavailable: {error}")
+
+
+def release_fleet_slot(rdir):
+    item = _FLEET_RESERVATIONS.get(os.path.realpath(rdir))
+    if not item:
+        return True
+    command, payload = item
+    for attempt in range(3):
+        try:
+            fleet_guard_call(command, {"op": "release", "run_id": payload["run_id"], "token": payload["token"]})
+            break
+        except RuntimeError as error:
+            if attempt == 2:
+                set_status(rdir, fleet_reservation_error=str(error))
+                return False
+            time.sleep(0.2 * (attempt + 1))
+    _FLEET_RESERVATIONS.pop(os.path.realpath(rdir), None)
+    return True
+
+
 def reserve_provider_slot(rdir, backend, provider, policy, lane_name=None, keep_waiting=None, poll=0.1):
     """Atomically admit a turn against provider/backend caps stored in policy.concurrency."""
     keys = concurrency_keys(backend, provider)
@@ -3308,6 +3374,11 @@ def reserve_provider_slot(rdir, backend, provider, policy, lane_name=None, keep_
     os.makedirs(DATA, exist_ok=True)
     os.makedirs(rdir, exist_ok=True)
     status_path = os.path.join(rdir, "status.json")
+    command = fleet_guard_command()
+    reservation_key = os.path.realpath(rdir)
+    token = uuid.uuid4().hex
+    payload = {"op": "acquire", "token": token, "run_id": os.path.basename(rdir),
+               "backend": backend, "provider": provider}
     while True:
         with open(lock_path, "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -3339,8 +3410,26 @@ def reserve_provider_slot(rdir, backend, provider, policy, lane_name=None, keep_
                     if key in row_keys:
                         counts[key] += 1
             if all(counts[key] < cap for key, cap in limits.items()):
+                admitted = True
+                if command:
+                    try:
+                        admitted = bool(fleet_guard_call(command, payload).get("admitted"))
+                    except RuntimeError as error:
+                        admitted = False
+                        set_status(rdir, fleet_reservation_error=str(error))
+                if admitted and command:
+                    _FLEET_RESERVATIONS[reservation_key] = (command, payload)
+            else:
+                admitted = False
+            if admitted and keep_waiting and not keep_waiting():
+                # The coordinator call may have taken longer than the task's
+                # budget or overlapped cancellation. Do not start an executor.
+                release_fleet_slot(rdir)
+                return False
+            if admitted:
                 set_status(rdir, state="running", backend=backend, provider=provider,
-                           concurrency_keys=keys, **({"lane": lane_name} if lane_name else {}))
+                           concurrency_keys=keys, fleet_reservation_error=None, queue_reason=None,
+                           **({"lane": lane_name} if lane_name else {}))
                 if lane_name:
                     lane_write_state(lane_name, turn_state="running", concurrency_keys=keys)
                 return True
@@ -3351,7 +3440,7 @@ def reserve_provider_slot(rdir, backend, provider, policy, lane_name=None, keep_
                 lane_write_state(lane_name, turn_state="queued", concurrency_keys=keys)
         if keep_waiting and not keep_waiting():
             return False
-        time.sleep(max(0.01, poll))
+        time.sleep(max(1.0 if command else 0.01, poll))
 
 
 def rate_limit_policy(policy):
@@ -3373,13 +3462,29 @@ def rate_limit_delay(policy, retry):
                           delays[min(max(0, retry), len(delays) - 1)] * 1.2)
 
 
-def executor_error_class(rc, final, err_text):
+def agy_upstream_forbidden(backend, text):
+    return backend == "agy" and bool(re.search(r"\b403\b", text or "")) and "html response" in (text or "").lower()
+
+
+def agy_quota_reset_seconds(backend, text):
+    if backend != "agy":
+        return None
+    match = re.search(r"\bresets in\s+(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?\b", text or "", re.I)
+    if not match or not any(match.groups()):
+        return None
+    hours, minutes, seconds = (int(x or 0) for x in match.groups())
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def executor_error_class(rc, final, err_text, backend=None):
     if rc == 133:
         return "risk_blocked"
     if rc == 134:
         return "executor_io_lost"
     if rc == 124:
         return "budget_exceeded"
+    if rc != 0 and agy_upstream_forbidden(backend, err_text):
+        return "upstream_forbidden"
     if rc != 0 and MODEL_UNAVAILABLE_RE.search(err_text or ""):
         return "model_unavailable"
     if rc != 0 and AUTH_ERROR_RE.search(err_text or ""):
@@ -3437,7 +3542,13 @@ def run_executor_with_rate_limit(backend, decision, state, prompt, wd, rdir, bud
         rc, final, meta, err_text = EXECUTORS[backend](call_decision, state, current_prompt, wd,
                                                        rdir, timeout, event_file)
         seconds = round(NOW() - started, 3)
-        error_class = executor_error_class(rc, final, err_text)
+        error_class = executor_error_class(rc, final, err_text, backend)
+        if error_class in (None, "rate_limit") or (
+                backend == "agy" and rc == 1 and (error_class == "upstream_forbidden"
+                                                   or (meta or {}).get("finished_reason"))):
+            release_fleet_slot(rdir)
+        elif os.path.realpath(rdir) in _FLEET_RESERVATIONS:
+            set_status(rdir, fleet_reservation_error="retained after abnormal executor exit; inspect descendants")
         set_status(rdir, state="routing", concurrency_keys=[])
         attempt = {"backend": backend, "model": decision.get("model"), "effort": decision.get("effort"),
                    "rc": rc, "seconds": seconds, "error_class": error_class, "meta": meta,
@@ -3451,8 +3562,10 @@ def run_executor_with_rate_limit(backend, decision, state, prompt, wd, rdir, bud
                      (err_text or "rate limited")[-200:])
         can_resume = (backend in ("pi", "cursor", "agy") or
                       (backend == "codex" and (meta or {}).get("thread_id"))) and (meta or {}).get("resume_supported") is not False
-        can_retry = retries < max_retries and can_resume
-        wait_seconds = rate_limit_delay(policy, retries) if can_retry else 0
+        reset_seconds = agy_quota_reset_seconds(backend, err_text)
+        can_retry = (retries < max_retries and can_resume
+                     and (reset_seconds is None or NOW() + reset_seconds < budget_deadline))
+        wait_seconds = max(rate_limit_delay(policy, retries), reset_seconds or 0) if can_retry else 0
         lane_record_event(event_file, {"type": "RATELIMIT", "retry": retries + 1 if can_retry else retries,
                                        "max_retries": max_retries, "wait_seconds": round(wait_seconds, 3),
                                        "backend": backend, "provider": provider})
@@ -4091,10 +4204,13 @@ def agy_event(event):
 def agy_result(event):
     """The result envelope of an agy stream: conversation id, status, response, error and usage."""
     _kind, payload = agy_event(event)
+    finished_reason = payload.get("finished_reason")
+    stopped_early = isinstance(finished_reason, str) and bool(finished_reason.strip())
     return {"conversation_id": payload.get("conversation_id") or payload.get("conversationId"),
-            "status": str(payload.get("status") or "").upper(),
+            "status": "ERROR" if stopped_early else str(payload.get("status") or "").upper(),
             "response": payload.get("response") or payload.get("text") or "",
-            "error": payload.get("error"),
+            "error": payload.get("error") or (f"agy turn ended early: {finished_reason}" if stopped_early else None),
+            "finished_reason": finished_reason if stopped_early else None,
             "usage": agy_usage(payload.get("usage"))}
 
 
@@ -4139,7 +4255,7 @@ def exec_agy(d, st, prompt, wd, rdir, timeout, evp):
         return 127, None, {"usage": agy_usage(None)}, "agy not found"
     cmd = agy_command(binary, model, prompt, d.get("effort"), d.get("_resume_session"), cfg)
     rc = run_proc(cmd, wd, os.environ.copy(), timeout, evp)
-    usage, response, errors, conversation = agy_usage(None), None, [], None
+    usage, response, errors, conversation, finished_reason = agy_usage(None), None, [], None, None
     try:
         streamed = open(evp, errors="ignore")
     except OSError:
@@ -4157,6 +4273,7 @@ def exec_agy(d, st, prompt, wd, rdir, timeout, evp):
                 if kind != "result":
                     continue
                 result = agy_result(ev)
+                finished_reason = result["finished_reason"] or finished_reason
                 if result["conversation_id"]:
                     conversation = result["conversation_id"]
                 if any(result["usage"].values()):
@@ -4173,9 +4290,10 @@ def exec_agy(d, st, prompt, wd, rdir, timeout, evp):
     err_text = "\n".join(errors) + err_tail
     if errors and rc == 0:
         rc = 1
-    final = extract_json(response) if isinstance(response, str) else (
-        response if isinstance(response, dict) and "status" in response else None)
-    return rc, final, {"usage": usage, "conversation_id": conversation}, err_text
+    final = None if finished_reason else (extract_json(response) if isinstance(response, str) else (
+        response if isinstance(response, dict) and "status" in response else None))
+    return rc, final, {"usage": usage, "conversation_id": conversation,
+                       "finished_reason": finished_reason}, err_text
 
 
 PI_USAGE_KEYS = ("input", "output", "cacheRead", "cacheWrite")
@@ -4240,7 +4358,8 @@ def exec_pi(d, st, prompt, wd, rdir, timeout, evp):
         cmd += ["--model", d["model"]]
     if d.get("_resume_session"):
         cmd.append("--continue")
-    cmd += ["--tools", PI_TOOLS, prompt]
+    read_only = (d.get("profile") or {}).get("read_only") is True
+    cmd += ["--tools", "read,grep,find,ls" if isolated and read_only else PI_TOOLS, prompt]
     rc = run_proc(cmd, wd, os.environ.copy(), timeout, evp)
     usage, text, errors = pi_usage(evp)
     final = extract_json(text) if isinstance(text, str) else None
@@ -4262,8 +4381,10 @@ def exec_copilot(d, st, prompt, wd, rdir, timeout, evp):
         return 127, None, {"usage": {}}, "copilot binary or model unavailable"
     cmd = [binary, "-p", prompt, "--model", d["model"], "--output-format", "json",
            "--sandbox", "--assisted-approval", "--no-ask-user", "--disable-builtin-mcps"]
+    if d.get("effort"):
+        cmd += ["--reasoning-effort", d["effort"]]
     rc = run_proc(cmd, wd, os.environ.copy(), timeout, evp)
-    final, errors, session_error, resolved_model = None, [], False, None
+    final, errors, session_error, resolved_model, saw_result = None, [], False, None, False
     usage = {k: 0 for k in CURSOR_USAGE_KEYS}
     with open(evp, errors="ignore") as stream:
         for line in stream:
@@ -4276,8 +4397,10 @@ def exec_copilot(d, st, prompt, wd, rdir, timeout, evp):
             data = event.get("data") if isinstance(event.get("data"), dict) else {}
             if event.get("type") == "session.auto_mode_resolved" and isinstance(data.get("chosenModel"), str):
                 resolved_model = data["chosenModel"]
-            if event.get("type") == "result" and event.get("exitCode") not in (None, 0):
-                session_error = True
+            if event.get("type") == "result":
+                saw_result = True
+                if event.get("exitCode") != 0:
+                    session_error = True
             if event.get("type") == "assistant.message" and isinstance(data.get("content"), str):
                 final = extract_json(data["content"]) or final
             elif event.get("type") == "assistant.usage":
@@ -4292,7 +4415,7 @@ def exec_copilot(d, st, prompt, wd, rdir, timeout, evp):
             errors.append(stream.read()[-3000:])
     except OSError:
         pass
-    if rc == 0 and (session_error or final is None):
+    if rc == 0 and (session_error or final is None or not saw_result):
         rc = 1
     return rc, final, {"usage": usage, "resolved_model": resolved_model or d["model"]}, "\n".join(errors)
 
@@ -4760,7 +4883,12 @@ def cmd_run(args, policy):
         return
     set_status(rdir, id=rid, state="routing", title=title, profile=prof, started=NOW(),
                budget_minutes=budget_min, runner_pid=os.getpid(), cwd=os.path.abspath(args.cwd))
-    ws = prepare_workspace(os.path.abspath(args.cwd), rid, not args.no_worktree, getattr(args, "base", None))
+    ws = prepare_workspace(os.path.abspath(args.cwd), rid, not args.no_worktree or prof["read_only"], getattr(args, "base", None))
+    if prof["read_only"] and ws["mode"] != "worktree":
+        jsave(f"{rdir}/result.json", {"id": rid, "status": "failed", "error_class": "worktree_unavailable",
+                                      "error": "review tasks require a committed Git worktree", "run_dir": rdir})
+        set_status(rdir, state="finished", status="failed", error_class="worktree_unavailable", finished=NOW())
+        raise SystemExit("openswarm: review tasks require a committed Git worktree")
     note = ws.get("workspace_note") or workspace_note(ws.get("repo") or ws["path"])
     if note:
         set_status(rdir, workspace_note=note)
@@ -4847,16 +4975,25 @@ def cmd_run(args, policy):
     attempts[-1]["quota_after"] = quota_used(st_after, decision)
     workspace_changed = ws["mode"] == "worktree" and bool(git(["status", "--porcelain"], ws["root"])[1].strip())
     # Commit first and verify the committed tree: some suites (release builders) refuse dirty sources.
-    fin = finalize_workspace(ws, title, decision["backend"], rdir, keep=True)
+    read_only = prof["read_only"]
+    fin = ({"branch": None, "commit": None, "diffstat": "", "excluded_files": [],
+            "patch": None, "worktree": ws["root"], "merge_hint": None}
+           if read_only else finalize_workspace(ws, title, decision["backend"], rdir, keep=True))
     changed = changed_paths(ws.get("repo") or ws.get("path"), ws.get("base"), fin.get("commit"),
                             (result or {}).get("files_changed"))
-    read_only = getattr(args, "read_only", False) or prof.get("type") in READ_ONLY_CARD_TYPES or card_type in READ_ONLY_CARD_TYPES
     read_only_output = read_only and read_only_output_exists(ws.get("path"), (result or {}).get("files_changed"))
+    if read_only:
+        for command in (["checkout", "--detach", "-f", ws["base"]], ["clean", "-ffdx"], ["branch", "-D", ws["branch"]]):
+            cleanup_rc, _, cleanup_err = git(command, ws["root"])
+            if cleanup_rc:
+                raise RuntimeError(f"review worktree cleanup failed: {cleanup_err[:250]}")
+        ws["linked"] = link_dependency_dirs(ws["repo"], ws["root"])
+        exclude_dependency_links(ws["root"], ws["linked"])
     verify = None
     prepare_error = None
     if args.verify and not budget_denial and attempts[-1]["error_class"] not in ("risk_blocked", "rate_limit") \
             and (result is not None or workspace_changed or changed):
-        if lockfiles_changed(ws):
+        if read_only or lockfiles_changed(ws):
             prepared = run_workspace_prepare(ws["repo"], ws["root"], "before_verify")
             if prepared:
                 prepare.append(prepared)
@@ -4878,6 +5015,11 @@ def cmd_run(args, policy):
             verify["baseline"] = {"error": base.get("error")}
     has_changes = bool(fin.get("commit") or workspace_changed or (changed and not read_only))
     pass_fields = exec_pass_fields(has_changes, read_only_output, bool(args.verify), verify)
+    if read_only and args.keep_worktree and verify:
+        for command in (["reset", "--hard", ws["base"]], ["clean", "-ffdx"]):
+            cleanup_rc, _, cleanup_err = git(command, ws["root"])
+            if cleanup_rc:
+                raise RuntimeError(f"review worktree cleanup failed: {cleanup_err[:250]}")
     if not args.keep_worktree:
         cleanup_worktree(ws, fin.get("commit"))
         fin["worktree"] = None
@@ -4967,13 +5109,13 @@ def review_available(policy):
     state = jload(state_path, {}) or {}
     available = {}
     for backend in REVIEW_BACKENDS:
-        if backend == "pi" and (policy.get("pi") or {}).get("require_isolation", True):
-            continue
         known = state.get(backend) if isinstance(state.get(backend), dict) else {}
         override_name = {"agy": "AGY_BIN", "pi": "PI_BIN", "cursor": "CURSOR_BIN"}.get(backend)
         explicit_override = envvar(override_name) if override_name else None
         binary = None
-        if explicit_override:
+        if backend == "pi" and (policy.get("pi") or {}).get("require_isolation", True):
+            binary = pi_bin()
+        elif explicit_override:
             binary = {"agy": agy_bin, "pi": pi_bin, "cursor": cursor_bin}[backend]()
         elif known.get("binary") and os.access(known["binary"], os.X_OK):
             binary = known["binary"]
@@ -5089,6 +5231,8 @@ def review_command(reviewer, prompt, repo, scratch_dir, policy):
                    "--skip-git-repo-check", "--output-schema", schema, "-o", output]
         if model:
             command += ["--model", model]
+        if cfg.get("default_effort"):
+            command += ["-c", f'model_reasoning_effort="{cfg["default_effort"]}"']
         command.append(prompt)
     elif backend == "agy":
         schema = os.path.join(scratch_dir, "review-schema.json")
@@ -5099,7 +5243,9 @@ def review_command(reviewer, prompt, repo, scratch_dir, policy):
             command += ["--model", model]
     elif backend == "pi":
         if cfg.get("require_isolation", True):
-            raise ValueError("isolated Pi does not yet support read-only reviews")
+            expected = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pi-isolated")
+            if os.path.realpath(binary) != os.path.realpath(expected):
+                raise ValueError("read-only Pi review requires the isolated launcher")
         session_dir = os.path.join(scratch_dir, "pi-sessions")
         command = [binary, "-p", "--mode", "json", "--session-dir", session_dir]
         if reviewer.get("provider") or cfg.get("provider"):
@@ -5198,6 +5344,8 @@ def redact_review_raw(value):
 def invoke_reviewer(reviewer, prompt, repo, rdir, policy):
     os.makedirs(rdir, exist_ok=True)
     raw_attempts = []
+    slot_dir = os.path.join(RUNS, "review-slot-" + uuid.uuid4().hex)
+    acquired, safe_release = False, True
 
     def output_text(value):
         if isinstance(value, bytes):
@@ -5217,6 +5365,14 @@ def invoke_reviewer(reviewer, prompt, repo, rdir, policy):
             retries = review_settings(policy).get("max_retries", 1)
             if isinstance(retries, bool) or not isinstance(retries, int) or retries not in (0, 1):
                 raise ValueError("review.max_retries must be 0 or 1")
+            os.makedirs(slot_dir, exist_ok=True)
+            set_status(slot_dir, id=os.path.basename(slot_dir), runner_pid=os.getpid(), state="queued")
+            deadline = NOW() + timeout
+            backend = reviewer["backend"]
+            provider = execution_provider(backend, decision=reviewer, policy=policy)
+            acquired = reserve_provider_slot(slot_dir, backend, provider, policy, keep_waiting=lambda: NOW() < deadline)
+            if not acquired:
+                raise RuntimeError("review timed out waiting for a fleet capacity slot")
             repair_prompt = (prompt + "\n\nYour previous response did not match the required findings schema. "
                              "Return only JSON, with no prose or markdown, using exactly this shape: "
                              + json.dumps(REVIEW_FINDINGS_SCHEMA, ensure_ascii=False))
@@ -5229,8 +5385,10 @@ def invoke_reviewer(reviewer, prompt, repo, rdir, policy):
                     pass
                 command = review_command(reviewer, active_prompt, repo, scratch_dir, policy)
                 try:
+                    safe_release = False
                     completed = subprocess.run(command, cwd=repo, stdin=subprocess.DEVNULL,
                                                capture_output=True, text=True, timeout=timeout, check=False)
+                    safe_release = True
                 except subprocess.TimeoutExpired as error:
                     raw = (open(output_path, encoding="utf-8").read() if os.path.isfile(output_path)
                            else output_text(error.stdout))
@@ -5258,6 +5416,11 @@ def invoke_reviewer(reviewer, prompt, repo, rdir, policy):
                     raise RuntimeError(f"reviewer returned no findings JSON{suffix}")
     finally:
         save_raw()
+        if acquired and safe_release and release_fleet_slot(slot_dir):
+            set_status(slot_dir, state="finished", finished=NOW())
+            shutil.rmtree(slot_dir, ignore_errors=True)
+        elif not acquired:
+            shutil.rmtree(slot_dir, ignore_errors=True)
 
 
 def update_peer_review_ledger(run_id, peer_review):
@@ -6443,6 +6606,8 @@ class LaneChild:
             if not binary:
                 raise RuntimeError("copilot binary not found")
             cmd = [binary, "--sandbox", "--disable-builtin-mcps", "--acp"]
+            if lane.get("effort"):
+                cmd += ["--reasoning-effort", lane["effort"]]
         else:
             binary = envvar("CURSOR_BIN") or lane.get("binary") or cursor_bin()
             if not binary:
@@ -6552,6 +6717,8 @@ class LaneChild:
             self.backlog = deferred + self.backlog
 
     def close(self):
+        if self.proc is None:
+            return
         if self.alive():
             kill_tree(self.proc.pid, grace=1)
         try:
@@ -6636,6 +6803,8 @@ class AgyChild:
         return "".join(self.stderr_lines)
 
     def close(self):
+        if self.proc is None:
+            return
         if self.alive():
             kill_tree(self.proc.pid, grace=1)
         try:
@@ -6649,10 +6818,57 @@ class AgyChild:
                 pass
 
 
+class CursorHeadlessChild(AgyChild):
+    """Use Cursor print mode to preserve an explicit non-fast model selection."""
+    def start(self, prompt, model=None, effort=None, conversation=None):
+        binary = envvar("CURSOR_BIN") or self.lane.get("binary") or cursor_bin()
+        if not binary:
+            raise RuntimeError("cursor-agent binary not found")
+        selected = model or self.lane["model"]
+        if selected != "composer-2.5[fast=false]":
+            raise RuntimeError("Cursor headless lane requires explicit standard Composer 2.5")
+        cmd = [binary, "-p", "--trust", "--force", "--sandbox", "enabled", "--model", selected,
+               "--output-format", "stream-json"]
+        if conversation:
+            cmd.append("--continue")
+        cmd += ["--", prompt]
+        proc = subprocess.Popen(cmd, cwd=self.cwd, env=self.env, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+                                start_new_session=True)
+        events, stderr_lines = queue.Queue(), []
+        self.proc, self.events, self.stderr_lines = proc, events, stderr_lines
+        threading.Thread(target=self._read_stdout, args=(proc, events), daemon=True).start()
+        threading.Thread(target=self._read_stderr, args=(proc, stderr_lines), daemon=True).start()
+        return proc.pid
+
+    def _read_stdout(self, proc, events):
+        try:
+            for line in proc.stdout:
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if event.get("type") == "result":
+                    event["response"] = event.get("result") or ""
+                    event["status"] = "ERROR" if event.get("is_error") else "SUCCESS"
+                    event["conversation_id"] = event.get("session_id")
+                    if event.get("is_error"):
+                        event["error"] = event["response"]
+                events.put(event)
+        finally:
+            events.put(None)
+
+
+def lane_headless(lane):
+    return lane["backend"] == "agy" or (lane["backend"] == "cursor" and lane.get("mode") == "headless")
+
+
 def lane_child(lane, cwd, policy):
     """The resident child of a lane: a long-lived RPC/ACP process, or one agy process per turn."""
     if lane["backend"] == "agy":
         return AgyChild(lane, cwd, policy)
+    if lane_headless(lane):
+        return CursorHeadlessChild(lane, cwd, policy)
     return LaneChild(lane, cwd, policy)
 
 
@@ -6749,13 +6965,13 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                         answer = {"ok": False, "error": f"lane {lane['name']} is idle"}
                     else:
                         text = str(req.get("text") or "")
-                        if lane["backend"] in ("cursor", "hermes", "copilot"):
+                        if lane["backend"] in ("cursor", "hermes", "copilot") and not lane_headless(lane):
                             event_file = current.get("_event_file") or os.path.join(
                                 RUNS, current.get("run_id", ""), f"events.1.{lane['backend']}.jsonl")
                             lane_record_event(event_file, {"type": "steer", "mode": "cancel-and-continue", "text": text})
                             turn.setdefault("steer_queue", []).append(text)
                             lane_cursor_cancel(child, turn)
-                        elif lane["backend"] == "agy":
+                        elif lane_headless(lane):
                             event_file = current.get("_event_file") or os.path.join(
                                 RUNS, current.get("run_id", ""), f"events.1.{lane['backend']}.jsonl")
                             lane_record_event(event_file, {"type": "steer", "mode": "abort-and-resume", "text": text})
@@ -6774,6 +6990,8 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                 elif op == "abort":
                     if not active:
                         answer = {"ok": False, "error": f"lane {lane['name']} is idle"}
+                    elif req.get("run_id") and req["run_id"] != current.get("run_id"):
+                        answer = {"ok": False, "error": "lane is running a different run"}
                     else:
                         current["stop_requested"] = True
                         current["abort_requested"] = True
@@ -6820,7 +7038,7 @@ def lane_abort_child(lane, child, turn):
             child.send({"jsonrpc": "2.0", "method": "session/cancel",
                         "params": {"sessionId": turn["session_id"]}})
             turn["cursor_cancel_sent"] = True
-        elif lane["backend"] == "agy":
+        elif lane_headless(lane):
             lane_agy_stop(child)
         else:
             turn["abort_pending"] = True
@@ -6864,7 +7082,7 @@ def lane_begin_turn(lane, child, prompt, worktree, event_file, turn):
         pid = "prompt-" + uuid.uuid4().hex
         child.send({"id": pid, "type": "prompt", "message": prompt})
         turn["id"] = pid
-    elif lane["backend"] == "agy":
+    elif lane_headless(lane):
         turn["id"] = "agy-" + uuid.uuid4().hex
         turn["prompt"] = prompt
         child.start(prompt, model=lane["model"], effort=lane.get("effort"))
@@ -6931,7 +7149,7 @@ def lane_continue_turn(lane, child, prompt, event_file, turn):
         req_id = "prompt-" + uuid.uuid4().hex
         child.send({"id": req_id, "type": "prompt", "message": prompt})
         turn["id"] = req_id
-    elif lane["backend"] == "agy":
+    elif lane_headless(lane):
         turn["id"] = "agy-" + uuid.uuid4().hex
         child.start(prompt, model=lane["model"], effort=lane.get("effort"),
                     conversation=turn.get("conversation_id"))
@@ -6973,17 +7191,9 @@ def lane_acp_request(child, msg, event_file):
     params = msg.get("params") or {}
     options = params.get("options") or []
     kinds = ("allow_once",) if getattr(child, "lane", {}).get("backend") == "copilot" else ("allow_always", "allow_once")
-    tool_call = params.get("toolCall") or {}
-    def sandbox_bypass(value):
-        if isinstance(value, dict):
-            return any((key in ("requestSandboxBypass", "request_sandbox_bypass") and item is True)
-                       or sandbox_bypass(item) for key, item in value.items())
-        if isinstance(value, list):
-            return any(sandbox_bypass(item) for item in value)
-        return False
-    bypass = getattr(child, "lane", {}).get("backend") == "copilot" and sandbox_bypass(params)
-    selected = None if bypass else next((option for kind in kinds for option in options
+    selected = next((option for kind in kinds for option in options
                      if isinstance(option, dict) and option.get("kind") == kind), None)
+    tool_call = params.get("toolCall") or {}
     title = tool_call.get("title")
     lane_record_event(event_file, {"type": "permission_request", "title": title,
                                    "tool_call_id": tool_call.get("toolCallId"), "kind": tool_call.get("kind"),
@@ -7026,6 +7236,8 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
         lane_continue_turn(lane, child, prompt, event_file, turn)
     else:
         lane_begin_turn(lane, child, prompt, ws["path"], event_file, turn)
+    if lane_headless(lane):
+        set_status(rdir, executor_pid=child.pid)
     while pending:
         kind, value = pending.pop(0)
         if kind == "steer":
@@ -7035,7 +7247,7 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
                                        "input": [{"type": "text", "text": value}]}})
             elif lane["backend"] == "pi":
                 child.send({"id": f"steer-{uuid.uuid4().hex}", "type": "steer", "message": value})
-            elif lane["backend"] == "agy":
+            elif lane_headless(lane):
                 turn.setdefault("steer_queue", []).append(value)
                 lane_agy_stop(child)
             else:
@@ -7060,13 +7272,14 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
                     "Correction to the interrupted task: apply this update while continuing the task.\n\n"
                     + correction + "\n\n" + REPORT_INSTRUCTION,
                     model=lane["model"], effort=lane.get("effort"), conversation=turn.get("conversation_id"))
+        set_status(rdir, executor_pid=child.pid)
         turn["id"] = "agy-" + uuid.uuid4().hex
         return True
 
     def lane_failure(detail):
         """Error class of a lane turn that ended without a report (agy reports auth failures on stderr)."""
         text = detail or ""
-        if lane["backend"] == "agy":
+        if lane_headless(lane):
             text = child.stderr_text()[-600:] or text
         if AUTH_ERROR_RE.search(text):
             return "auth", text
@@ -7102,7 +7315,7 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
         msg = child.next_event(0.15)
         if msg is False:
             if not child.alive():
-                if lane["backend"] == "agy":
+                if lane_headless(lane):
                     msg = child.next_event(1.0)  # a finished process may still have events in its pipe
                     if msg is False:
                         if agy_resume_steer():
@@ -7113,7 +7326,7 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
                     return None, usage, "risk_blocked" if spec.get("risk_blocks") else "exec_error", 1, event_file, "resident executor process exited"
             continue
         if msg is None:
-            if lane["backend"] == "agy":
+            if lane_headless(lane):
                 if agy_resume_steer():
                     continue
                 error_class, detail = lane_failure("resident executor stdout closed")
@@ -7180,7 +7393,7 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
                                        if isinstance(b, dict) and b.get("type") == "text")
                         final = extract_json(text) or final
                 ended = True
-        elif lane["backend"] == "agy":
+        elif lane_headless(lane):
             lane_record_event(event_file, msg)
             kind, payload = agy_event(msg)
             if payload.get("conversation_id"):
@@ -7188,6 +7401,8 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
             if kind != "result":
                 continue
             result = agy_result(msg)
+            if result.get("finished_reason"):
+                spec["_agy_finished_early"] = result["finished_reason"]
             if result["conversation_id"]:
                 turn["conversation_id"] = result["conversation_id"]
             if any(result["usage"].values()):
@@ -7234,10 +7449,13 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
                     final = extract_json("".join(turn.get("cursor_text") or [])) or final
                     ended = True
         if not child.alive() and not ended:
-            if lane["backend"] == "agy":
+            if lane_headless(lane):
                 # Drain buffered events and EOF before deciding whether to resume a steer.
                 continue
             return None, usage, "risk_blocked" if spec.get("risk_blocks") else "exec_error", 1, event_file, "resident executor process exited"
+    # An end-of-turn event is an acknowledgement that this turn has stopped,
+    # including cancelled and failed turns. Clear this marker before each retry.
+    spec["_turn_completed"] = True
     if spec.get("risk_blocks"):
         return final, usage, "risk_blocked", 133, event_file, None
     if spec.get("abort_requested"):
@@ -7246,7 +7464,9 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
         return final, usage, "budget_exceeded", 124, event_file, None
     if errors:
         text = " ".join(errors)
-        if AUTH_ERROR_RE.search(text):
+        if agy_upstream_forbidden(lane["backend"], text):
+            error_class = "upstream_forbidden"
+        elif AUTH_ERROR_RE.search(text):
             error_class = "auth"
         elif RATE_LIMIT_RE.search(text):
             error_class = "rate_limit"
@@ -7261,13 +7481,14 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
 
 
 def lane_wait_rate_limit(seconds, lane, spec, child, server, turn, pending):
-    deadline = NOW() + seconds
+    budget_deadline = spec["started"] + max(0, float(spec.get("budget_minutes") or 0)) * 60
+    deadline = min(NOW() + seconds, budget_deadline)
     while NOW() < deadline:
         lane_control_messages(server, lane, spec, child, turn, pending)
         if spec.get("abort_requested") or spec.get("down_requested") or not child.alive():
             return False
         time.sleep(min(0.1, max(0, deadline - NOW())))
-    return True
+    return NOW() < budget_deadline
 
 
 def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file, attempts=None):
@@ -7287,11 +7508,24 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
         if head_rc == 0 and head.strip() != ws["base"]:
             ancestor_rc, _, _ = git(["merge-base", "--is-ancestor", ws["base"], head.strip()], ws["root"])
             changed = changed or ancestor_rc == 0
-    fin = finalize_workspace(ws, title, lane["backend"], rdir, keep=True)
+    read_only = spec.get("read_only") or spec.get("card_type") in READ_ONLY_CARD_TYPES
+    fin = ({"branch": None, "commit": None, "diffstat": "", "excluded_files": [],
+            "patch": None, "worktree": ws["root"], "merge_hint": None}
+           if read_only else finalize_workspace(ws, title, lane["backend"], rdir, keep=True))
+    read_only_output = read_only and read_only_output_exists(ws.get("path"), (final or {}).get("files_changed"))
+    if read_only and ws.get("mode") == "worktree":
+        for command in (["checkout", "--detach", "-f", ws["base"]],
+                        ["clean", "-ffdx", "-e", "/.openswarm-tmp/"],
+                        ["branch", "-D", ws["branch"]]):
+            cleanup_rc, _, cleanup_err = lane_git(command, ws["root"])
+            if cleanup_rc:
+                raise RuntimeError(f"review worktree cleanup failed: {cleanup_err[:250]}")
+        ws["linked"] = link_dependency_dirs(ws["repo"], ws["root"])
+        exclude_dependency_links(ws["root"], ws["linked"])
     verify = None
     prepare_error = None
     if spec.get("verify") and error_class not in ("risk_blocked", "rate_limit") and (final is not None or changed):
-        if lockfiles_changed(ws):
+        if read_only or lockfiles_changed(ws):
             prepared = run_workspace_prepare(ws["repo"], ws["root"], "before_verify")
             if prepared:
                 ws.setdefault("prepare", []).append(prepared)
@@ -7336,18 +7570,22 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
     else:
         status = (final or {}).get("status") or "failed"
         status, verify_note = adjust_status_for_verify(status, verify)
-    read_only = spec.get("read_only") or spec.get("card_type") in READ_ONLY_CARD_TYPES
     status, verify_note = adjust_status_for_change_evidence(
         status, verify_note, commit=fin.get("commit"), workspace_changed=changed, changed=changed,
         read_only=read_only, verify=verify)
-    if ws.get("mode") == "worktree":
+    if read_only and verify:
+        for command in (["reset", "--hard", ws["base"]], ["clean", "-ffdx", "-e", "/.openswarm-tmp/"]):
+            cleanup_rc, _, cleanup_err = lane_git(command, ws["root"])
+            if cleanup_rc:
+                raise RuntimeError(f"review worktree cleanup failed: {cleanup_err[:250]}")
+    if ws.get("mode") == "worktree" and not read_only:
         detach_at = fin.get("commit") or ws["base"]
         lane_git(["checkout", "--detach", detach_at], ws["root"])
     out = {"id": rid, "status": status, "error_class": error_class, "title": title, "lane": lane["name"],
            "prepare": ws.get("prepare", []), "workspace_note": ws.get("workspace_note"), "verify": verify,
            "verify_note": verify_note, "backend": lane["backend"], "model": model, "effort": lane.get("effort"),
            **({"resolved_model": model} if lane["backend"] in ("cursor", "copilot") else {}),
-           "risk_blocks": spec.get("risk_blocks", []),
+           "risk_blocks": spec.get("risk_blocks", []), "review_changes_discarded": bool(read_only and changed),
            "usage": usage, "seconds": round(sum(attempt["seconds"] for attempt in attempts), 3), "result": final, "workspace":
            {k: v for k, v in ws.items() if k in ("mode", "path", "repo", "base", "note", "lane")},
            **fin, "attempts": attempts, "run_dir": rdir}
@@ -7355,7 +7593,6 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
     changed = changed_paths(ws.get("repo") or ws.get("root"), ws.get("base"), fin.get("commit"),
                             (final or {}).get("files_changed"))
     read_only = spec.get("read_only") or spec.get("card_type") in READ_ONLY_CARD_TYPES
-    read_only_output = read_only and read_only_output_exists(ws.get("path"), (final or {}).get("files_changed"))
     pass_fields = exec_pass_fields(bool(fin.get("commit") or (changed and not read_only)), read_only_output,
                                    bool(spec.get("verify")), verify)
     append_ledger({"id": rid, "ts": NOW(), "title": title, "status": status, "lane": lane["name"],
@@ -7428,6 +7665,7 @@ def lane_do_run(lane, spec, child, server, current):
         final, usage, error_class, rc, evp, error_tail = None, {}, "exec_error", 1, None, None
         attempt_lane = lane
         attempt_number = 0
+        forbidden_retried = False
         _, max_rate_retries = rate_limit_policy(load_policy())
         for number, model in enumerate(models, 1):
             attempt_lane = dict(lane, model=model)
@@ -7453,22 +7691,54 @@ def lane_do_run(lane, spec, child, server, current):
                                      "events": evp, "error_tail": error_tail})
                     break
                 started = NOW()
+                spec.pop("_turn_completed", None)
+                spec.pop("_agy_finished_early", None)
                 final, usage, error_class, rc, evp, error_tail = lane_run_turn(
                     attempt_lane, child, spec, retry_prompt, ws, rdir, server, turn, pending,
                     attempt=attempt_number, continuation=continuation)
+                if lane["backend"] == "agy" and error_class is None:
+                    lane_write_state(lane["name"], quota_model=None, quota_until=None)
+                # Stop headless requests before releasing their slot after an
+                # early result, rate limit or upstream 403.
+                if ((error_class == "upstream_forbidden" and lane["backend"] == "agy")
+                        or (error_class == "rate_limit" and lane_headless(lane))
+                        or (lane["backend"] == "agy" and spec.get("_agy_finished_early"))):
+                    child.close()
+                stopped_early = lane["backend"] == "agy" and spec.get("_agy_finished_early")
+                if (not stopped_early or not child.alive()) and (error_class in (None, "rate_limit")
+                        or spec.get("_turn_completed") or (error_class == "upstream_forbidden"
+                                                           and lane["backend"] == "agy" and not child.alive())):
+                    release_fleet_slot(rdir)
+                elif os.path.realpath(rdir) in _FLEET_RESERVATIONS:
+                    set_status(rdir, fleet_reservation_error="retained after abnormal executor exit; inspect descendants")
                 attempts.append({"backend": attempt_lane["backend"], "model": model,
                                  "effort": attempt_lane.get("effort"), "rc": rc,
                                  "seconds": round(NOW() - started, 3), "error_class": error_class,
                                  "meta": {"usage": usage}, "events": evp, "error_tail": error_tail})
                 if allow_fallback and error_class == "exec_error" and MODEL_UNAVAILABLE_RE.search(error_tail or ""):
                     error_class = attempts[-1]["error_class"] = "model_unavailable"
+                # A transient Google 403 can occur before any work starts. Retry once
+                # only after the old request released its slot and left no edits.
+                if (error_class == "upstream_forbidden" and lane["backend"] == "agy" and not forbidden_retried
+                        and not spec.get("abort_requested") and NOW() + 10 < deadline
+                        and os.path.realpath(rdir) not in _FLEET_RESERVATIONS
+                        and not git(["status", "--porcelain"], ws["root"])[1].strip()):
+                    forbidden_retried = True
+                    child.proc = None
+                    turn = {}
+                    continuation, retry_prompt = False, prompt
+                    continue
                 if error_class != "rate_limit":
                     break
                 trip_breaker(rate_limit_breaker_key(attempt_lane["backend"], attempt_lane,
                                                      error_tail or "rate limited"),
                              load_policy(), error_tail or "rate limited")
-                can_retry = retries < max_rate_retries and not spec.get("abort_requested")
-                wait_seconds = rate_limit_delay(load_policy(), retries) if can_retry else 0
+                reset_seconds = agy_quota_reset_seconds(attempt_lane["backend"], error_tail)
+                if reset_seconds is not None and reset_seconds > 0:
+                    lane_write_state(lane["name"], quota_model=model, quota_until=NOW() + reset_seconds)
+                can_retry = (retries < max_rate_retries and not spec.get("abort_requested")
+                             and (reset_seconds is None or NOW() + reset_seconds < deadline))
+                wait_seconds = max(rate_limit_delay(load_policy(), retries), reset_seconds or 0) if can_retry else 0
                 rate_event = {"type": "RATELIMIT", "retry": retries + 1 if can_retry else retries,
                               "max_retries": max_rate_retries, "wait_seconds": round(wait_seconds, 3),
                               "backend": attempt_lane["backend"], "provider": provider}
@@ -7476,6 +7746,8 @@ def lane_do_run(lane, spec, child, server, current):
                 lane_record_event(next_event if can_retry else evp, rate_event)
                 if not can_retry:
                     break
+                if lane_headless(lane):
+                    child.proc = None
                 set_status(os.path.join(RUNS, rid), state="queued", queue_reason="rate limited", events=next_event,
                            attempt=attempt_number + 1, concurrency_keys=concurrency_keys(attempt_lane["backend"], provider))
                 lane_write_state(lane["name"], turn_state="queued", concurrency_keys=[])
@@ -7735,8 +8007,14 @@ def lane_status_rows():
             lane_state = "down"
         elif not pid_alive(pid):
             lane_state = "crashed"
+        model = state.get("resolved_model") or lane["model"]
+        quota_until = state.get("quota_until")
+        if (lane_state == "idle" and lane["backend"] == "agy" and state.get("quota_model") == model
+                and isinstance(quota_until, (int, float)) and not isinstance(quota_until, bool) and quota_until > NOW()):
+            lane_state = "quota_exhausted"
         rows.append({"name": lane["name"], "state": lane_state, "backend": lane["backend"],
-                     "model": state.get("resolved_model") or lane["model"], "pid": state.get("child_pid"), "supervisor_pid": pid,
+                     "model": model, "pid": state.get("child_pid"), "supervisor_pid": pid,
+                     "quota_reset_at": quota_until if lane_state == "quota_exhausted" else None,
                      "current_run": state.get("current_run"),
                      "run_state": state.get("turn_state"),
                      "provider": execution_provider(lane["backend"], policy=load_policy(), lane=lane),
@@ -8469,8 +8747,11 @@ def host_openswarm(host, args):
     return shell_path(binary) + " " + shlex.join([str(arg) for arg in args])
 
 
-def host_json(host, args, timeout=60):
-    rc, out, _ = host_run(host, host_openswarm(host, args), timeout=timeout)
+def host_json(host, args, timeout=60, capacity_only=False):
+    command = host_openswarm(host, args)
+    if capacity_only:
+        command = "OPENSWARM_FLEET_CAPACITY_ONLY=1 " + command
+    rc, out, _ = host_run(host, command, timeout=timeout)
     if rc:
         raise RuntimeError(f"{host['name']}: openswarm command failed (rc={rc})")
     try:
@@ -8565,6 +8846,7 @@ def instabox_states(hosts):
 
 
 def fleet_snapshot():
+    capacity_only = os.environ.get("OPENSWARM_FLEET_CAPACITY_ONLY") == "1"
     config_error = None
     try:
         lanes = lane_status_rows() if os.path.exists(envvar("LANES_FILE", os.path.join(DATA, "lanes.json"))) else []
@@ -8572,14 +8854,17 @@ def fleet_snapshot():
         lanes, config_error = [], str(error)
     runs = []
     for path in sorted(glob.glob(os.path.join(RUNS, "*", "status.json"))):
+        if capacity_only and (jload(path, {}) or {}).get("state") in ("finished", "unroutable", "dry-run"):
+            continue
         row = run_digest(os.path.basename(os.path.dirname(path)))
         if row["state"] not in ("finished", "unroutable", "dry-run", "dead"):
             runs.append(row)
     policy = load_policy()
     providers = {backend: execution_provider(backend, policy=policy)
                  for backend in ("codex", "cursor", "agy", "pi", "ocgo", "deepseek")}
+    backends = {} if capacity_only else {"agy": agy_status(policy)}
     return {"lanes": lanes, "active_runs": runs, "providers": providers,
-            "backends": {"agy": agy_status(policy)}, "lane_config_valid": config_error is None,
+            "backends": backends, "lane_config_valid": config_error is None,
             "lane_config_error": config_error}
 
 
@@ -8733,7 +9018,7 @@ def batch_provider_slot_available(spec, row):
             "running", "ready", "active"):
         return False
     try:
-        target_snapshot = host_json(target_host, ["fleet", "_snapshot"], timeout=20)
+        target_snapshot = host_json(target_host, ["fleet", "_snapshot"], timeout=20, capacity_only=True)
     except RuntimeError:
         return False
     provider = ((target_snapshot.get("providers") or {}).get(spec["backend"])) or spec.get("provider")
@@ -8749,7 +9034,7 @@ def batch_provider_slot_available(spec, row):
                 "running", "ready", "active"):
             continue
         try:
-            snapshots[name] = host_json(host, ["fleet", "_snapshot"], timeout=20)
+            snapshots[name] = host_json(host, ["fleet", "_snapshot"], timeout=20, capacity_only=True)
         except RuntimeError:
             # An unreachable host may still hold a slot; fail closed for configured fleet-wide caps.
             return False
@@ -9640,7 +9925,7 @@ def cmd_stop(args, policy):
                           "note": "the GitHub issue was cancelled; the bus runner will finalize shortly"}))
         return
     if st.get("lane"):
-        response = lane_call(st["lane"], {"op": "abort"})
+        response = lane_call(st["lane"], {"op": "abort", "run_id": args.run_id})
         print(json.dumps({"id": args.run_id, "lane": st["lane"],
                           "signalled": ["abort"] if response.get("ok") else [],
                           "response": response,
