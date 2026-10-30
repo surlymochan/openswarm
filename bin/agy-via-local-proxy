@@ -36,7 +36,7 @@ def is_ram_volume():
                any(entity.get('mount-point') == str(volume) for entity in image.get('system-entities', []))
                for image in info.get('images', []))
 
-def ensure_home():
+def ensure_home(stored_credential):
     if not os.path.ismount(volume):
         attach = subprocess.run(['/usr/bin/hdiutil', 'attach', '-nomount', 'ram://131072'],
                                 capture_output=True, text=True, timeout=30, check=True)
@@ -53,13 +53,14 @@ def ensure_home():
     home.chmod(0o700)
     token_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if not token_path.exists():
-        token_path.write_bytes(keychain_read())
+        token_path.write_bytes(stored_credential)
         token_path.chmod(0o600)
     json.loads(token_path.read_text())
 
 try:
-    ensure_home()
-    original_refresh = json.loads(token_path.read_text()).get('token', {}).get('refresh_token')
+    stored_credential = keychain_read()
+    stored_refresh = json.loads(stored_credential).get('token', {}).get('refresh_token')
+    ensure_home(stored_credential)
     env = dict(os.environ, HOME=str(home), HTTPS_PROXY='http://127.0.0.1:7890',
                https_proxy='http://127.0.0.1:7890')
     child = subprocess.Popen([str(original_home / '.local/bin/agy'), *sys.argv[1:]], env=env)
@@ -72,7 +73,7 @@ try:
     if token_path.exists():
         updated = token_path.read_bytes()
         current_refresh = json.loads(updated).get('token', {}).get('refresh_token')
-        if current_refresh != original_refresh:
+        if current_refresh != stored_refresh:
             keychain_write(updated)
     sys.exit(rc if rc >= 0 else 128 - rc)
 except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
