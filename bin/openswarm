@@ -2977,8 +2977,6 @@ def copilot_bin():
 
 
 def plan_copilot(prof, st, policy, forced, notes):
-    if prof.get("read_only"):
-        return None, "Copilot read-only isolation is unavailable"
     if not copilot_bin():
         return None, "no working copilot binary"
     cfg = policy.get("copilot") or {}
@@ -4863,7 +4861,12 @@ def cmd_run(args, policy):
         return
     set_status(rdir, id=rid, state="routing", title=title, profile=prof, started=NOW(),
                budget_minutes=budget_min, runner_pid=os.getpid(), cwd=os.path.abspath(args.cwd))
-    ws = prepare_workspace(os.path.abspath(args.cwd), rid, not args.no_worktree, getattr(args, "base", None))
+    ws = prepare_workspace(os.path.abspath(args.cwd), rid, not args.no_worktree or prof["read_only"], getattr(args, "base", None))
+    if prof["read_only"] and ws["mode"] != "worktree":
+        jsave(f"{rdir}/result.json", {"id": rid, "status": "failed", "error_class": "worktree_unavailable",
+                                      "error": "review tasks require a committed Git worktree", "run_dir": rdir})
+        set_status(rdir, state="finished", status="failed", error_class="worktree_unavailable", finished=NOW())
+        raise SystemExit("openswarm: review tasks require a committed Git worktree")
     note = ws.get("workspace_note") or workspace_note(ws.get("repo") or ws["path"])
     if note:
         set_status(rdir, workspace_note=note)
@@ -4950,10 +4953,12 @@ def cmd_run(args, policy):
     attempts[-1]["quota_after"] = quota_used(st_after, decision)
     workspace_changed = ws["mode"] == "worktree" and bool(git(["status", "--porcelain"], ws["root"])[1].strip())
     # Commit first and verify the committed tree: some suites (release builders) refuse dirty sources.
-    fin = finalize_workspace(ws, title, decision["backend"], rdir, keep=True)
+    read_only = prof["read_only"]
+    fin = ({"branch": None, "commit": None, "diffstat": "", "excluded_files": [],
+            "patch": None, "worktree": ws["root"], "merge_hint": None}
+           if read_only else finalize_workspace(ws, title, decision["backend"], rdir, keep=True))
     changed = changed_paths(ws.get("repo") or ws.get("path"), ws.get("base"), fin.get("commit"),
                             (result or {}).get("files_changed"))
-    read_only = getattr(args, "read_only", False) or prof.get("type") in READ_ONLY_CARD_TYPES or card_type in READ_ONLY_CARD_TYPES
     read_only_output = read_only and read_only_output_exists(ws.get("path"), (result or {}).get("files_changed"))
     verify = None
     prepare_error = None
@@ -4981,6 +4986,11 @@ def cmd_run(args, policy):
             verify["baseline"] = {"error": base.get("error")}
     has_changes = bool(fin.get("commit") or workspace_changed or (changed and not read_only))
     pass_fields = exec_pass_fields(has_changes, read_only_output, bool(args.verify), verify)
+    if read_only and args.keep_worktree:
+        for command in (["checkout", "--detach", "-f", ws["base"]], ["clean", "-fdx"], ["branch", "-D", ws["branch"]]):
+            cleanup_rc, _, cleanup_err = git(command, ws["root"])
+            if cleanup_rc:
+                raise RuntimeError(f"review worktree cleanup failed: {cleanup_err[:250]}")
     if not args.keep_worktree:
         cleanup_worktree(ws, fin.get("commit"))
         fin["worktree"] = None

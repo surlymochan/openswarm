@@ -10,10 +10,11 @@ xs = _load.load()
 
 
 class CopilotReadonlyTests(unittest.TestCase):
-    def test_readonly_profile_is_not_routed_to_copilot(self):
-        decision, reason = xs.plan_copilot({'read_only': True, 'difficulty': 3}, {}, xs.load_policy(), True, [])
-        self.assertIsNone(decision)
-        self.assertIn('read-only isolation is unavailable', reason)
+    def test_readonly_profile_can_use_copilot(self):
+        from unittest import mock
+        with mock.patch.object(xs, 'copilot_bin', return_value='/bin/true'):
+            decision, _ = xs.plan_copilot({'read_only': True, 'difficulty': 3}, {}, xs.load_policy(), True, [])
+        self.assertEqual(decision['backend'], 'copilot')
 
 if __name__ == '__main__':
     unittest.main()
