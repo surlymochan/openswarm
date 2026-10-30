@@ -485,6 +485,24 @@ class LaneTests(unittest.TestCase):
         self.cli("lane", "abort", self.lane_name)
         self.wait_run(run_id)
 
+    def test_agy_early_timeout_is_not_success_and_releases_capacity(self):
+        self.set_config("agy")
+        self.env["FAKE_AGY_MODE"] = "print-timeout"
+        self.env["OPENSWARM_FLEET_CAPACITY_DIR"] = str(self.root / "capacity")
+        guard = self.root / "guard.json"
+        guard.write_text(json.dumps({"command": [str(ROOT / "bin/fleet-capacity"), "gocc"]}))
+        self.env["OPENSWARM_FLEET_GUARD_CONFIG"] = str(guard)
+        self.start_lane()
+        run_id = self.assign("review the fixture")
+        self.wait_run(run_id)
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertNotEqual(result["status"], "done")
+        self.assertIn("print_timeout", result["attempts"][0]["error_tail"])
+        status = subprocess.run([str(ROOT / "bin/fleet-capacity"), "gocc"],
+                                input=json.dumps({"op": "status"}), text=True,
+                                capture_output=True, env=self.env, check=True)
+        self.assertEqual(json.loads(status.stdout)["reservations"], [])
+
     def test_agy_403_stops_process_and_releases_fleet_slot(self):
         self.set_config("agy")
         self.env["FAKE_AGY_MODE"] = "forbidden"

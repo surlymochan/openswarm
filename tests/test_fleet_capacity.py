@@ -148,5 +148,20 @@ class FleetCapacityTests(unittest.TestCase):
             self.assertEqual([c.args[1]['op'] for c in call.call_args_list], ['acquire', 'release'])
             self.assertNotIn(os.path.realpath(rdir), xs._FLEET_RESERVATIONS)
 
+    def test_early_agy_result_releases_one_shot_reservation(self):
+        rdir = os.path.join(self.temp.name, 'runs', 'early-agy')
+        os.makedirs(rdir)
+        fake = mock.Mock(return_value=(1, None, {'usage':{}, 'finished_reason':'print_timeout'},
+                                      'agy turn ended early: print_timeout'))
+        with mock.patch.dict(os.environ, {'OPENSWARM_FLEET_CAPACITY_DIR': self.temp.name}), \
+             mock.patch.object(xs, 'fleet_guard_command', return_value=[str(BIN), 'gocc']), \
+             mock.patch.dict(xs.EXECUTORS, {'agy':fake}):
+            attempts, final, error = xs.run_executor_with_rate_limit(
+                'agy', {'backend':'agy', 'model':'gemini-3.8-flash-medium', 'effort':None}, {}, 'task', self.temp.name, rdir,
+                xs.NOW() + 30, xs.load_policy())
+        self.assertEqual(error, 'exec_error')
+        self.assertIsNone(final)
+        self.assertEqual(self.call('gocc', op='status')['reservations'], [])
+
 if __name__ == '__main__':
     unittest.main()

@@ -3529,9 +3529,10 @@ def run_executor_with_rate_limit(backend, decision, state, prompt, wd, rdir, bud
                                                        rdir, timeout, event_file)
         seconds = round(NOW() - started, 3)
         error_class = executor_error_class(rc, final, err_text, backend)
-        # run_proc has reaped a normal 403 exit; it must not strand capacity.
+        # run_proc has reaped a normal 403 or reported early-result exit.
         if error_class in (None, "rate_limit") or (
-                backend == "agy" and error_class == "upstream_forbidden" and rc == 1):
+                backend == "agy" and rc == 1 and (error_class == "upstream_forbidden"
+                                                   or (meta or {}).get("finished_reason"))):
             release_fleet_slot(rdir)
         elif os.path.realpath(rdir) in _FLEET_RESERVATIONS:
             set_status(rdir, fleet_reservation_error="retained after abnormal executor exit; inspect descendants")
@@ -4188,10 +4189,13 @@ def agy_event(event):
 def agy_result(event):
     """The result envelope of an agy stream: conversation id, status, response, error and usage."""
     _kind, payload = agy_event(event)
+    finished_reason = payload.get("finished_reason")
+    stopped_early = isinstance(finished_reason, str) and bool(finished_reason.strip())
     return {"conversation_id": payload.get("conversation_id") or payload.get("conversationId"),
-            "status": str(payload.get("status") or "").upper(),
+            "status": "ERROR" if stopped_early else str(payload.get("status") or "").upper(),
             "response": payload.get("response") or payload.get("text") or "",
-            "error": payload.get("error"),
+            "error": payload.get("error") or (f"agy turn ended early: {finished_reason}" if stopped_early else None),
+            "finished_reason": finished_reason if stopped_early else None,
             "usage": agy_usage(payload.get("usage"))}
 
 
@@ -4236,7 +4240,7 @@ def exec_agy(d, st, prompt, wd, rdir, timeout, evp):
         return 127, None, {"usage": agy_usage(None)}, "agy not found"
     cmd = agy_command(binary, model, prompt, d.get("effort"), d.get("_resume_session"), cfg)
     rc = run_proc(cmd, wd, os.environ.copy(), timeout, evp)
-    usage, response, errors, conversation = agy_usage(None), None, [], None
+    usage, response, errors, conversation, finished_reason = agy_usage(None), None, [], None, None
     try:
         streamed = open(evp, errors="ignore")
     except OSError:
@@ -4254,6 +4258,7 @@ def exec_agy(d, st, prompt, wd, rdir, timeout, evp):
                 if kind != "result":
                     continue
                 result = agy_result(ev)
+                finished_reason = result["finished_reason"] or finished_reason
                 if result["conversation_id"]:
                     conversation = result["conversation_id"]
                 if any(result["usage"].values()):
@@ -4270,9 +4275,10 @@ def exec_agy(d, st, prompt, wd, rdir, timeout, evp):
     err_text = "\n".join(errors) + err_tail
     if errors and rc == 0:
         rc = 1
-    final = extract_json(response) if isinstance(response, str) else (
-        response if isinstance(response, dict) and "status" in response else None)
-    return rc, final, {"usage": usage, "conversation_id": conversation}, err_text
+    final = None if finished_reason else (extract_json(response) if isinstance(response, str) else (
+        response if isinstance(response, dict) and "status" in response else None))
+    return rc, final, {"usage": usage, "conversation_id": conversation,
+                       "finished_reason": finished_reason}, err_text
 
 
 PI_USAGE_KEYS = ("input", "output", "cacheRead", "cacheWrite")
