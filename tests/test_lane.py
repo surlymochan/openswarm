@@ -690,6 +690,20 @@ class LaneTests(unittest.TestCase):
         next_id = self.assign("next task after abort")
         self.assertEqual(self.wait_run(next_id)["status"], "done")
 
+    def test_executor_crash_releases_fleet_slot(self):
+        self.set_config("cursor")
+        guard = self.root / "fleet-guard.json"
+        guard.write_text(json.dumps({"command": [str(ROOT / "bin/fleet-capacity"), "gores1"]}))
+        self.env["OPENSWARM_FLEET_GUARD_CONFIG"] = str(guard)
+        self.env["OPENSWARM_FLEET_CAPACITY_DIR"] = str(self.root / "fleet")
+        self.start_lane()
+        run_id = self.assign("LANE_TEST_CRASH")
+        self.wait_run(run_id)
+        status = subprocess.run([str(ROOT / "bin/fleet-capacity"), "gores1"],
+                                input=json.dumps({"op": "status"}), env=self.env, text=True,
+                                capture_output=True, check=True)
+        self.assertEqual(json.loads(status.stdout)["reservations"], [])
+
     def test_stop_of_old_run_does_not_abort_the_next_run(self):
         self.start_lane()
         old = self.assign("first completed task")
