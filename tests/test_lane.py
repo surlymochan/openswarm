@@ -498,6 +498,7 @@ class LaneTests(unittest.TestCase):
         result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
         self.assertNotEqual(result["status"], "done")
         self.assertIn("print_timeout", result["attempts"][0]["error_tail"])
+        self.assertFalse(process_alive(self.run_state(run_id)['executor_pid']))
         status = subprocess.run([str(ROOT / "bin/fleet-capacity"), "gocc"],
                                 input=json.dumps({"op": "status"}), text=True,
                                 capture_output=True, env=self.env, check=True)

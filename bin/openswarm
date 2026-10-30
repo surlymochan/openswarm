@@ -7367,6 +7367,8 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
             if kind != "result":
                 continue
             result = agy_result(msg)
+            if result.get("finished_reason"):
+                spec["_agy_finished_early"] = result["finished_reason"]
             if result["conversation_id"]:
                 turn["conversation_id"] = result["conversation_id"]
             if any(result["usage"].values()):
@@ -7640,16 +7642,20 @@ def lane_do_run(lane, spec, child, server, current):
                     break
                 started = NOW()
                 spec.pop("_turn_completed", None)
+                spec.pop("_agy_finished_early", None)
                 final, usage, error_class, rc, evp, error_tail = lane_run_turn(
                     attempt_lane, child, spec, retry_prompt, ws, rdir, server, turn, pending,
                     attempt=attempt_number, continuation=continuation)
-                # Stop headless requests before releasing their slot after a
-                # rate limit or an upstream 403.
+                # Stop headless requests before releasing their slot after an
+                # early result, rate limit or upstream 403.
                 if ((error_class == "upstream_forbidden" and lane["backend"] == "agy")
-                        or (error_class == "rate_limit" and lane_headless(lane))):
+                        or (error_class == "rate_limit" and lane_headless(lane))
+                        or (lane["backend"] == "agy" and spec.get("_agy_finished_early"))):
                     child.close()
-                if error_class in (None, "rate_limit") or spec.get("_turn_completed") or (
-                        error_class == "upstream_forbidden" and lane["backend"] == "agy" and not child.alive()):
+                stopped_early = lane["backend"] == "agy" and spec.get("_agy_finished_early")
+                if (not stopped_early or not child.alive()) and (error_class in (None, "rate_limit")
+                        or spec.get("_turn_completed") or (error_class == "upstream_forbidden"
+                                                           and lane["backend"] == "agy" and not child.alive())):
                     release_fleet_slot(rdir)
                 elif os.path.realpath(rdir) in _FLEET_RESERVATIONS:
                     set_status(rdir, fleet_reservation_error="retained after abnormal executor exit; inspect descendants")

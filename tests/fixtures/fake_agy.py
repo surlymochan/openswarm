@@ -43,6 +43,7 @@ if mode == "print-timeout":
     partial = {"status":"done", "summary":"partial", "files_changed":[], "tests":"none", "followups":[]}
     send({"event":"result", "result":{"status":"SUCCESS", "finished_reason":"print_timeout",
                                         "response":json.dumps(partial)}})
+    time.sleep(30)  # An early result can arrive before the process actually exits.
     sys.exit(0)
 if mode == "forbidden-once":
     marker = os.environ["FAKE_AGY_ONCE_MARKER"]
