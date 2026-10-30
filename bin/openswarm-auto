@@ -11,11 +11,19 @@ home = Path.home()
 cli = str(home / '.local/bin/openswarm')
 ssh = ['/usr/bin/ssh', '-T', '-F', str(home / '.ssh/openswarm-fleet/config'), 'openswarm-pi-broker']
 
+class LaneBusy(RuntimeError):
+    pass
+
 def remote(payload):
     p = subprocess.run(ssh, input=json.dumps(payload), capture_output=True, text=True, timeout=35)
     try: result = json.loads(p.stdout)
     except ValueError: raise RuntimeError('gocc dispatch gateway unavailable')
-    if p.returncode or not result.get('ok'): raise RuntimeError('gocc dispatch gateway rejected request')
+    if p.returncode or not result.get('ok'):
+        reply = result.get('result')
+        if (payload.get('op') == 'assign' and isinstance(reply, dict) and reply.get('ok') is False
+                and reply.get('error') == f"lane {payload.get('lane')} is busy (busy)"):
+            raise LaneBusy('remote lane is busy')
+        raise RuntimeError('gocc dispatch gateway rejected request')
     return result['result']
 
 def local_lanes():
@@ -101,9 +109,12 @@ def main():
             if proc.returncode or not response.get('id'):
                 raise RuntimeError('local dispatch acknowledgement unavailable')
         else:
-            response = remote({'op':'assign','lane':lane,'prompt':prompt,'base':base,
-                               'title':args.title,'verify':args.verify,'budget_minutes':args.budget_minutes,
-                               'read_only':read_only})
+            try:
+                response = remote({'op':'assign','lane':lane,'prompt':prompt,'base':base,
+                                   'title':args.title,'verify':args.verify,'budget_minutes':args.budget_minutes,
+                                   'read_only':read_only})
+            except LaneBusy:
+                continue
         result.update({'id':response['id'], 'state':response['state']})
         print(json.dumps(result)); return
     raise RuntimeError('available lanes changed or rejected the task')

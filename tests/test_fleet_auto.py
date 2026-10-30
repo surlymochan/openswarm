@@ -88,4 +88,29 @@ class FleetAutoTests(unittest.TestCase):
             MOD['main']()
         self.assertEqual(run.call_count, 1)
 
+    def test_explicit_remote_busy_falls_back_to_local_lane(self):
+        def remote(req):
+            if req['op'] == 'lanes':
+                return [{'name': 'A1', 'state': 'idle', 'backend': 'agy', 'model': 'gemini'}]
+            raise G['LaneBusy']('remote lane is busy')
+        local = [{'name': 'K1', 'state': 'idle', 'backend': 'cursor', 'model': 'composer'}]
+        args = ['openswarm-auto', '--type', 'migration', '--difficulty', '3', '--base', 'abcdef0', '--prompt', 'task']
+        reply = mock.Mock(stdout=json.dumps({'ok': True, 'id': 'fallback-1', 'state': 'queued'}), returncode=0)
+        with mock.patch.object(sys, 'argv', args), mock.patch.dict(G, {'local_lanes': lambda: local, 'remote': remote}), \
+                mock.patch.object(G['subprocess'], 'run', return_value=reply) as run, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            MOD['main']()
+        self.assertEqual(json.loads(output.getvalue())['lane'], 'K1')
+        self.assertEqual(run.call_count, 1)
+
+    def test_gateway_distinguishes_busy_from_unknown_failure(self):
+        busy = {'ok': False, 'result': {'ok': False, 'error': 'lane A1 is busy (busy)'}}
+        with mock.patch.object(G['subprocess'], 'run', return_value=mock.Mock(returncode=1, stdout=json.dumps(busy))):
+            with self.assertRaises(G['LaneBusy']):
+                G['remote']({'op': 'assign', 'lane': 'A1'})
+        unknown = {'ok': False, 'error': 'gateway timeout'}
+        with mock.patch.object(G['subprocess'], 'run', return_value=mock.Mock(returncode=1, stdout=json.dumps(unknown))):
+            with self.assertRaisesRegex(RuntimeError, 'gateway rejected'):
+                G['remote']({'op': 'assign', 'lane': 'A1'})
+
 if __name__ == '__main__': unittest.main()
