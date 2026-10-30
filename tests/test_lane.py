@@ -352,11 +352,12 @@ class LaneTests(unittest.TestCase):
         base = self.git("rev-parse", "HEAD")
         self.start_lane()
         for prompt in ("review with accidental edit", "review LANE_TEST_AGENT_COMMIT"):
-            run_id = self.assign(prompt, "--read-only")
+            run_id = self.assign(prompt, "--read-only", "--verify", "test ! -f lane_result.txt")
             self.assertEqual(self.wait_run(run_id)["status"], "done")
             result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
             wt = self.data / "lanes" / self.lane_name / "wt"
             self.assertIsNone(result["commit"])
+            self.assertEqual(result["verify"]["rc"], 0)
             self.assertTrue(result["review_changes_discarded"])
             self.assertFalse((wt / "lane_result.txt").exists())
             ledger = [json.loads(line) for line in (self.data / "ledger.jsonl").read_text().splitlines()]

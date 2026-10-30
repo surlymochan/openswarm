@@ -22,12 +22,14 @@ class ReviewOneShotTests(unittest.TestCase):
             git("config", "user.name", "Test")
             git("config", "user.email", "test@example.invalid")
             (repo / "README.md").write_text("base\n")
-            git("add", "README.md")
+            (repo / "verify.sh").write_text("exit 0\n")
+            git("add", "README.md", "verify.sh")
             git("commit", "-qm", "base")
             base = git("rev-parse", "HEAD")
             fake = root / "copilot"
             fake.write_text("#!/usr/bin/env python3\nimport json,pathlib\n"
                             "pathlib.Path('accidental.txt').write_text('test')\n"
+                            "pathlib.Path('verify.sh').write_text('exit 1\\n')\n"
                             "report={'status':'done','summary':'reviewed','files_changed':['accidental.txt'],"
                             "'tests':'none','followups':[]}\n"
                             "print(json.dumps({'type':'assistant.message','data':{'content':json.dumps(report)}}))\n"
@@ -38,13 +40,14 @@ class ReviewOneShotTests(unittest.TestCase):
                        OPENSWARM_FLEET_GUARD_CONFIG=str(root / "no-guard"))
             run = subprocess.run([sys.executable, str(ROOT / "bin/openswarm"), "run", "--backend", "copilot",
                                   "--difficulty", "3", "--cwd", str(repo), "--read-only", "--no-worktree",
-                                  "--keep-worktree", "--prompt", "review"], env=env, capture_output=True,
+                                  "--keep-worktree", "--verify", "sh verify.sh", "--prompt", "review"], env=env, capture_output=True,
                                  text=True, timeout=45)
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
             result = json.loads(run.stdout)
             wt = pathlib.Path(result["worktree"])
             self.assertEqual(result["status"], "done")
             self.assertIsNone(result["commit"])
+            self.assertEqual(result["verify"]["rc"], 0)
             self.assertNotEqual(wt, repo)
             self.assertFalse((wt / "accidental.txt").exists())
             self.assertFalse((repo / "accidental.txt").exists())

@@ -4960,6 +4960,13 @@ def cmd_run(args, policy):
     changed = changed_paths(ws.get("repo") or ws.get("path"), ws.get("base"), fin.get("commit"),
                             (result or {}).get("files_changed"))
     read_only_output = read_only and read_only_output_exists(ws.get("path"), (result or {}).get("files_changed"))
+    if read_only:
+        for command in (["checkout", "--detach", "-f", ws["base"]], ["clean", "-fdx"], ["branch", "-D", ws["branch"]]):
+            cleanup_rc, _, cleanup_err = git(command, ws["root"])
+            if cleanup_rc:
+                raise RuntimeError(f"review worktree cleanup failed: {cleanup_err[:250]}")
+        ws["linked"] = link_dependency_dirs(ws["repo"], ws["root"])
+        exclude_dependency_links(ws["root"], ws["linked"])
     verify = None
     prepare_error = None
     if args.verify and not budget_denial and attempts[-1]["error_class"] not in ("risk_blocked", "rate_limit") \
@@ -4986,8 +4993,8 @@ def cmd_run(args, policy):
             verify["baseline"] = {"error": base.get("error")}
     has_changes = bool(fin.get("commit") or workspace_changed or (changed and not read_only))
     pass_fields = exec_pass_fields(has_changes, read_only_output, bool(args.verify), verify)
-    if read_only and args.keep_worktree:
-        for command in (["checkout", "--detach", "-f", ws["base"]], ["clean", "-fdx"], ["branch", "-D", ws["branch"]]):
+    if read_only and args.keep_worktree and verify:
+        for command in (["reset", "--hard", ws["base"]], ["clean", "-fdx"]):
             cleanup_rc, _, cleanup_err = git(command, ws["root"])
             if cleanup_rc:
                 raise RuntimeError(f"review worktree cleanup failed: {cleanup_err[:250]}")
@@ -7475,6 +7482,16 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
     fin = ({"branch": None, "commit": None, "diffstat": "", "excluded_files": [],
             "patch": None, "worktree": ws["root"], "merge_hint": None}
            if read_only else finalize_workspace(ws, title, lane["backend"], rdir, keep=True))
+    read_only_output = read_only and read_only_output_exists(ws.get("path"), (final or {}).get("files_changed"))
+    if read_only and ws.get("mode") == "worktree":
+        for command in (["checkout", "--detach", "-f", ws["base"]],
+                        ["clean", "-fdx", "-e", "/.openswarm-tmp/"],
+                        ["branch", "-D", ws["branch"]]):
+            cleanup_rc, _, cleanup_err = lane_git(command, ws["root"])
+            if cleanup_rc:
+                raise RuntimeError(f"review worktree cleanup failed: {cleanup_err[:250]}")
+        ws["linked"] = link_dependency_dirs(ws["repo"], ws["root"])
+        exclude_dependency_links(ws["root"], ws["linked"])
     verify = None
     prepare_error = None
     if spec.get("verify") and error_class not in ("risk_blocked", "rate_limit") and (final is not None or changed):
@@ -7526,18 +7543,14 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
     status, verify_note = adjust_status_for_change_evidence(
         status, verify_note, commit=fin.get("commit"), workspace_changed=changed, changed=changed,
         read_only=read_only, verify=verify)
-    read_only_output = read_only and read_only_output_exists(ws.get("path"), (final or {}).get("files_changed"))
-    if ws.get("mode") == "worktree":
+    if read_only and verify:
+        for command in (["reset", "--hard", ws["base"]], ["clean", "-fdx", "-e", "/.openswarm-tmp/"]):
+            cleanup_rc, _, cleanup_err = lane_git(command, ws["root"])
+            if cleanup_rc:
+                raise RuntimeError(f"review worktree cleanup failed: {cleanup_err[:250]}")
+    if ws.get("mode") == "worktree" and not read_only:
         detach_at = fin.get("commit") or ws["base"]
-        if read_only:
-            for command in (["checkout", "--detach", "-f", detach_at],
-                            ["clean", "-fdx", "-e", "/.openswarm-tmp/"],
-                            ["branch", "-D", ws["branch"]]):
-                cleanup_rc, _, cleanup_err = lane_git(command, ws["root"])
-                if cleanup_rc:
-                    raise RuntimeError(f"review worktree cleanup failed: {cleanup_err[:250]}")
-        else:
-            lane_git(["checkout", "--detach", detach_at], ws["root"])
+        lane_git(["checkout", "--detach", detach_at], ws["root"])
     out = {"id": rid, "status": status, "error_class": error_class, "title": title, "lane": lane["name"],
            "prepare": ws.get("prepare", []), "workspace_note": ws.get("workspace_note"), "verify": verify,
            "verify_note": verify_note, "backend": lane["backend"], "model": model, "effort": lane.get("effort"),
