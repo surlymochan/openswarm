@@ -72,9 +72,22 @@ def main():
                   'host': 'gores1' if lane in ('M1','K1') else 'gocc',
                   'profile': {'type': args.type, 'difficulty': args.difficulty}}
         if read_only: result['read_only'] = True
+        if lane == 'M1' and read_only:
+            result['lane'] = None
+            result['execution_mode'] = 'one-shot'
         if args.dry_run:
             print(json.dumps(result)); return
-        if lane in ('M1','K1'):
+        if lane == 'M1' and read_only:
+            command = [cli, 'run', '--type', 'review', '--backend', 'pi', '--read-only', '--no-fallback',
+                       '--cwd', str(repo), '--base', base, '--prompt', prompt, '--detach',
+                       '--budget-minutes', str(args.budget_minutes)]
+            if args.title: command += ['--title', args.title]
+            if args.verify: command += ['--verify', args.verify]
+            proc = subprocess.run(command, capture_output=True, text=True, timeout=30)
+            try: response = json.loads(proc.stdout)
+            except ValueError: continue
+            if proc.returncode or not response.get('id'): continue
+        elif lane in ('M1','K1'):
             command = [cli,'lane','assign',lane,'--prompt',prompt,'--base',base,
                        '--budget-minutes',str(args.budget_minutes)]
             if args.title: command += ['--title', args.title]

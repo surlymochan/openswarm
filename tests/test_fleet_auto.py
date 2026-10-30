@@ -50,4 +50,17 @@ class FleetAutoTests(unittest.TestCase):
         self.assertIn('--read-only', run.call_args.args[0])
         self.assertEqual(json.loads(out.getvalue())['host'], 'gores1')
 
+    def test_review_with_only_pi_uses_isolated_one_shot(self):
+        args = ['openswarm-auto','--type','review','--difficulty','2','--base','abcdef0','--prompt','review']
+        lanes = [{'name':'M1','state':'idle','backend':'pi','model':'MiniMax'}]
+        completed = mock.Mock(returncode=0, stdout=json.dumps({'id':'review-3','state':'started'}))
+        with mock.patch.object(sys, 'argv', args), mock.patch.dict(G, {'local_lanes':lambda: lanes, 'remote':lambda req: []}), \
+                mock.patch.object(G['subprocess'], 'run', return_value=completed) as run, \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            MOD['main']()
+        command = run.call_args.args[0]
+        self.assertEqual(command[1:3], ['run', '--type'])
+        self.assertIn('--read-only', command)
+        self.assertEqual(json.loads(out.getvalue())['execution_mode'], 'one-shot')
+
 if __name__ == '__main__': unittest.main()
