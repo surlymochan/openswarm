@@ -359,6 +359,10 @@ class LaneTests(unittest.TestCase):
             self.assertIsNone(result["commit"])
             self.assertTrue(result["review_changes_discarded"])
             self.assertFalse((wt / "lane_result.txt").exists())
+            ledger = [json.loads(line) for line in (self.data / "ledger.jsonl").read_text().splitlines()]
+            entry = next(row for row in ledger if row["id"] == run_id)
+            self.assertTrue(entry["read_only_output"])
+            self.assertTrue(entry["exec_pass"])
             self.assertEqual(subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=wt, text=True).strip(), base)
             self.assertEqual(self.git("rev-parse", "HEAD"), base)
 

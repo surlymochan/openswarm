@@ -7515,6 +7515,7 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
     status, verify_note = adjust_status_for_change_evidence(
         status, verify_note, commit=fin.get("commit"), workspace_changed=changed, changed=changed,
         read_only=read_only, verify=verify)
+    read_only_output = read_only and read_only_output_exists(ws.get("path"), (final or {}).get("files_changed"))
     if ws.get("mode") == "worktree":
         detach_at = fin.get("commit") or ws["base"]
         if read_only:
@@ -7538,7 +7539,6 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
     changed = changed_paths(ws.get("repo") or ws.get("root"), ws.get("base"), fin.get("commit"),
                             (final or {}).get("files_changed"))
     read_only = spec.get("read_only") or spec.get("card_type") in READ_ONLY_CARD_TYPES
-    read_only_output = read_only and read_only_output_exists(ws.get("path"), (final or {}).get("files_changed"))
     pass_fields = exec_pass_fields(bool(fin.get("commit") or (changed and not read_only)), read_only_output,
                                    bool(spec.get("verify")), verify)
     append_ledger({"id": rid, "ts": NOW(), "title": title, "status": status, "lane": lane["name"],
