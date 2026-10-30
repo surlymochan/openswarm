@@ -24,7 +24,7 @@ CONSULT_SCHEMA = {
         "risks": {"type": "array", "items": {"type": "string"}},
     },
 }
-READ_ONLY_PI_TOOLS = "read,grep,find,ls"
+PI_TOOLS = "read,bash,edit,write,grep,find,ls"
 SUPPORTED_BACKENDS = {"codex", "agy", "pi", "copilot"}
 
 
@@ -67,6 +67,8 @@ def _binary(core, state, backend, lane=None):
         return core.agy_bin()
     if backend == "pi":
         return core.pi_bin()
+    if backend == "copilot":
+        return core.copilot_bin()
     return None
 
 
@@ -186,7 +188,7 @@ def build_command(profile, prompt, run_dir):
             command += ["--provider", profile["provider"]]
         if model:
             command += ["--model", model]
-        command += ["--tools", READ_ONLY_PI_TOOLS, prompt]
+        command += ["--tools", PI_TOOLS, prompt]
         return command
     raise ValueError(f"unsupported consult backend: {backend}")
 
@@ -423,7 +425,7 @@ def _ask_one(core, profile, prompt, run_dir, deadline, policy, reservation_id):
             raw_attempts.append(f"--- attempt {attempt} ---\n{raw}"
                                 + (f"\n[stderr]\n{stderr}" if stderr else ""))
             row["raw"] = "\n\n".join(raw_attempts)
-            execution_error = (_agy_execution_error(raw, stderr) if profile["backend"] == "agy" else None)
+            execution_error = ((_agy_execution_error(stdout, stderr) or _agy_execution_error(raw, stderr)) if profile["backend"] == "agy" else None)
             if profile["backend"] == "copilot":
                 events = []
                 for line in stdout.splitlines():

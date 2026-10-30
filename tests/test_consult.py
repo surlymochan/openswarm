@@ -29,6 +29,10 @@ class ConsultComparisonTest(unittest.TestCase):
                    'response':json.dumps({'opinion':'partial', 'confidence':'high', 'evidence':[], 'risks':[]})}
         self.assertIn('print_timeout', consult._agy_execution_error(json.dumps(partial), ''))
 
+    def test_copilot_binary_discovery(self):
+        core = types.SimpleNamespace(copilot_bin=lambda: "/usr/bin/copilot")
+        self.assertEqual(consult._binary(core, {}, "copilot"), "/usr/bin/copilot")
+
     def test_different_wording_is_not_labeled_disagreement(self):
         answers = [
             {'valid':True, 'family':'OpenAI', 'answer':{'opinion':'Empty input raises ZeroDivisionError.'}},
@@ -79,7 +83,7 @@ elif backend == "copilot":
 elif backend == "agy":
     result = {"response": text, "model": "agy-test"}
     if os.environ.get("FAKE_CONSULT_AGY_EARLY"):
-        result.update({"status":"SUCCESS", "finished_reason":"print_timeout"})
+        result.update({"type":"result", "status":"SUCCESS", "finished_reason":"print_timeout"})
     print(json.dumps(result))
 else:
     print(json.dumps({"type": "message_end", "message": {"role": "assistant",
@@ -201,7 +205,7 @@ class ConsultTests(unittest.TestCase):
         self.assertIn('print_timeout', agy['error'])
         self.assertFalse([name for name in os.listdir(xs.RUNS) if name.startswith('consult-slot-')])
 
-    def test_each_backend_command_enforces_read_only_mode(self):
+    def test_consult_commands_and_disposable_worktrees(self):
         code, _ = self.run_consult(["codex", "agy", "pi"])
         self.assertEqual(code, 0)
         def argv(backend):
@@ -216,10 +220,7 @@ class ConsultTests(unittest.TestCase):
         self.assertIn("--json-schema", agy)
         self.assertTrue(os.path.isfile(agy[agy.index("--json-schema") + 1]))
         self.assertNotIn("--dangerously-skip-permissions", agy)
-        self.assertEqual(pi[pi.index("--tools") + 1], consult.READ_ONLY_PI_TOOLS)
-        self.assertNotIn("bash", pi[pi.index("--tools") + 1])
-        self.assertNotIn("edit", pi[pi.index("--tools") + 1])
-        self.assertNotIn("write", pi[pi.index("--tools") + 1])
+        self.assertEqual(pi[pi.index("--tools") + 1], consult.PI_TOOLS)
         self.assertEqual(os.listdir(self.repo), [".git"])
 
     def test_executors_run_in_parallel(self):
