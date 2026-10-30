@@ -15,6 +15,7 @@ class CodexAvailabilityTests(unittest.TestCase):
     def test_required_default_never_silently_falls_back(self):
         with open(_load.FIXTURE_STATE) as stream:
             state = json.load(stream)
+        state['codex']['models'] = [model for model in state['codex']['models'] if model['id'] != 'gpt-6-luna']
         decision, reason = xs.plan_codex({'difficulty': 3}, state, xs.load_policy(), True, [])
         self.assertIsNone(decision)
         self.assertIn('gpt-6-luna', reason)
