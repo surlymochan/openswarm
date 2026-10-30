@@ -28,7 +28,9 @@ argv = sys.argv[1:]
 backend = "codex" if argv[:1] == ["exec"] else ("agy" if "--output-format" in argv else "pi")
 log_dir = os.environ["FAKE_CONSULT_LOG_DIR"]
 with open(os.path.join(log_dir, backend + ".json"), "w") as stream:
-    json.dump({"argv": argv, "cwd": os.getcwd(), "started": time.monotonic()}, stream)
+    # These timestamps are compared across separate executor processes.
+    started = time.clock_gettime(time.CLOCK_MONOTONIC) if hasattr(time, "clock_gettime") else time.time()
+    json.dump({"argv": argv, "cwd": os.getcwd(), "started": started}, stream)
 if os.environ.get("FAKE_CONSULT_BARRIER"):
     deadline = time.monotonic() + 5
     while not all(os.path.isfile(os.path.join(log_dir, name + ".json")) for name in ("agy", "pi")):
