@@ -39,6 +39,35 @@ if mode == "auth":
 if mode == "sleep":
     time.sleep(30)
     sys.exit(0)
+if mode == "print-timeout":
+    partial = {"status":"done", "summary":"partial", "files_changed":[], "tests":"none", "followups":[]}
+    send({"event":"result", "result":{"status":"SUCCESS", "finished_reason":"print_timeout",
+                                        "response":json.dumps(partial)}})
+    time.sleep(30)  # An early result can arrive before the process actually exits.
+    sys.exit(0)
+if mode == "long-quota":
+    send({"type":"result", "status":"ERROR", "error":"Individual quota reached. Resets in 131h29m32s."})
+    sys.exit(1)
+if mode == "forbidden-once":
+    marker = os.environ["FAKE_AGY_ONCE_MARKER"]
+    if not os.path.exists(marker):
+        open(marker, "w").close()
+        mode = "forbidden-exit"
+if mode == "rate-then-forbidden":
+    marker = os.environ["FAKE_AGY_ONCE_MARKER"]
+    try:
+        with open(marker) as stream:
+            count = int(stream.read())
+    except FileNotFoundError:
+        count = 0
+    with open(marker, "w") as stream:
+        stream.write(str(count + 1))
+    mode = "rate" if count == 0 else "forbidden-exit" if count == 1 else "ok"
+if mode in ("forbidden", "forbidden-exit"):
+    send({"type": "result", "status": "ERROR", "error": 'request failed (code 403): HTML response "Error 403 (Forbidden)!!1"'})
+    if mode == "forbidden":
+        time.sleep(30)  # The result may arrive before the headless process exits.
+    sys.exit(1)
 
 prompt = argv[argv.index("-p") + 1] if "-p" in argv else ""
 conversation = argv[argv.index("--conversation") + 1] if "--conversation" in argv else "conv-1"
