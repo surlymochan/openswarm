@@ -360,19 +360,33 @@ def _ask_one(core, profile, prompt, run_dir, deadline, policy, reservation_id):
             row["error"] = "deadline exceeded while waiting for a concurrency slot"
             return row
         os.makedirs(run_dir, exist_ok=True)
-        if profile["backend"] == "copilot":
-            worktree_repo = profile["cwd"]
-            worktree_parent = tempfile.mkdtemp(prefix="consult-worktree-")
-            worktree = os.path.join(worktree_parent, "worktree")
-            prepared = subprocess.run(["git", "-C", worktree_repo, "worktree", "add", "--detach", worktree, "HEAD"],
-                                      capture_output=True, text=True, timeout=30)
-            if prepared.returncode:
-                raise RuntimeError("could not create independent consult worktree")
-            head = subprocess.run(["git", "-C", worktree, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=30)
-            if head.returncode:
-                raise RuntimeError("could not inspect consult worktree HEAD")
-            worktree_head = head.stdout.strip()
-            profile = dict(profile, cwd=worktree)
+        worktree_repo = profile["cwd"]
+        worktree_parent = tempfile.mkdtemp(prefix="consult-worktree-")
+        worktree = os.path.join(worktree_parent, "worktree")
+        source_head = subprocess.run(["git", "-C", worktree_repo, "rev-parse", "--verify", "HEAD"],
+                                     capture_output=True, text=True, timeout=30)
+        if source_head.returncode:
+            # Consult accepts a question and explicit context files even when the
+            # caller is outside a repository. Give that case an empty worktree.
+            worktree_repo = os.path.join(worktree_parent, "seed")
+            os.mkdir(worktree_repo)
+            init = subprocess.run(["git", "init", "-q", worktree_repo], capture_output=True, timeout=30)
+            if init.returncode:
+                raise RuntimeError("could not initialize consult workspace")
+            commit = subprocess.run(["git", "-C", worktree_repo, "-c", "user.name=OpenSwarm",
+                                     "-c", "user.email=openswarm@localhost", "commit", "--allow-empty", "-qm", "consult workspace"],
+                                    capture_output=True, timeout=30)
+            if commit.returncode:
+                raise RuntimeError("could not initialize consult workspace")
+        prepared = subprocess.run(["git", "-C", worktree_repo, "worktree", "add", "--detach", worktree, "HEAD"],
+                                  capture_output=True, text=True, timeout=30)
+        if prepared.returncode:
+            raise RuntimeError("could not create independent consult worktree")
+        head = subprocess.run(["git", "-C", worktree, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=30)
+        if head.returncode:
+            raise RuntimeError("could not inspect consult worktree HEAD")
+        worktree_head = head.stdout.strip()
+        profile = dict(profile, cwd=worktree)
         raw_attempts = []
         active_prompt = prompt
         for attempt in (1, 2):

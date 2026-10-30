@@ -96,6 +96,8 @@ class ConsultTests(unittest.TestCase):
         os.chmod(self.script, os.stat(self.script).st_mode | stat.S_IEXEC)
         self.repo = os.path.join(self.tmp, "repo")
         os.makedirs(self.repo)
+        subprocess.run(["git", "init", "-q", self.repo], check=True)
+        subprocess.run(["git", "-C", self.repo, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "initial"], check=True)
         self.data = os.path.join(self.tmp, "data")
         xs.DATA = self.data
         xs.RUNS = os.path.join(self.data, "runs")
@@ -146,8 +148,6 @@ class ConsultTests(unittest.TestCase):
             return [json.loads(line) for line in stream]
 
     def test_default_skips_exhausted_agy_and_discards_copilot_worktree_changes(self):
-        subprocess.run(["git", "init", "-q", self.repo], check=True)
-        subprocess.run(["git", "-C", self.repo, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "initial"], check=True)
         lanes = [{"name": "GH1", "backend": "copilot", "model": "haiku-test", "effort": "medium", "binary": self.script, "repo": self.repo}]
         rows = [{"backend": "agy", "model": consult._model(xs, self.state, self.policy, "agy", None, None), "state": "quota_exhausted"}]
         with mock.patch.object(xs, "lane_status_rows", return_value=rows), mock.patch.object(xs, "lane_config", return_value=lanes), mock.patch.object(consult.sys, "platform", "linux"):
@@ -161,6 +161,20 @@ class ConsultTests(unittest.TestCase):
         self.assertNotEqual(worktree, self.repo)
         self.assertFalse(os.path.exists(worktree))
         self.assertFalse(os.path.exists(os.path.join(self.repo, "consult-generated-file")))
+
+    def test_consult_outside_git_uses_temporary_worktrees(self):
+        outside = os.path.join(self.tmp, "outside")
+        os.mkdir(outside)
+        with mock.patch("openswarm_consult.os.getcwd", return_value=outside):
+            code, result = self.run_consult(["codex", "agy"])
+        self.assertEqual(code, 0)
+        self.assertTrue(all(row["valid"] for row in result["answers"]))
+        for backend in ("codex", "agy"):
+            with open(os.path.join(self.logs, backend + ".json"), encoding="utf-8") as stream:
+                worktree = json.load(stream)["cwd"]
+            self.assertNotEqual(worktree, outside)
+            self.assertFalse(os.path.exists(worktree))
+        self.assertEqual(os.listdir(outside), [])
 
     def test_schema_answers_are_parallel_persisted_and_ledgered(self):
         code, result = self.run_consult(["codex:codex-test", "agy:gemini-test", "pi:minimax-test"])
@@ -195,7 +209,8 @@ class ConsultTests(unittest.TestCase):
                 return json.load(stream)["argv"]
         codex, agy, pi = argv("codex"), argv("agy"), argv("pi")
         self.assertEqual(codex[codex.index("-s") + 1], "read-only")
-        self.assertEqual(codex[codex.index("-C") + 1], self.repo)
+        self.assertNotEqual(codex[codex.index("-C") + 1], self.repo)
+        self.assertFalse(os.path.exists(codex[codex.index("-C") + 1]))
         self.assertEqual(agy[agy.index("--mode") + 1], "plan")
         self.assertEqual(agy[agy.index("--output-format") + 1], "json")
         self.assertIn("--json-schema", agy)
@@ -205,7 +220,7 @@ class ConsultTests(unittest.TestCase):
         self.assertNotIn("bash", pi[pi.index("--tools") + 1])
         self.assertNotIn("edit", pi[pi.index("--tools") + 1])
         self.assertNotIn("write", pi[pi.index("--tools") + 1])
-        self.assertEqual(os.listdir(self.repo), [])
+        self.assertEqual(os.listdir(self.repo), [".git"])
 
     def test_executors_run_in_parallel(self):
         os.environ["FAKE_CONSULT_BARRIER"] = "1"
