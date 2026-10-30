@@ -46,6 +46,36 @@ class HubBridgeTests(unittest.TestCase):
             self.assertTrue(MOD['mapped']('run-1','info'))
             self.assertIn('Executor host: gores1',json.loads(output.getvalue())['result']['result']['summary'])
 
+    def test_finished_remote_commit_is_fetched_for_local_review(self):
+        remote = self.path / 'remote'
+        subprocess.run(['git', 'clone', '-q', str(self.repo), str(remote)], check=True)
+        base = subprocess.check_output(['git', '-C', str(remote), 'rev-parse', 'HEAD'], text=True).strip()
+        subprocess.run(['git', '-C', str(remote), 'checkout', '-qb', 'openswarm/run-1'], check=True)
+        (remote / 'a').write_text('remote result')
+        subprocess.run(['git', '-C', str(remote), '-c', 'user.name=test', '-c', 'user.email=test@test',
+                        'commit', '-qam', 'result'], check=True)
+        commit = subprocess.check_output(['git', '-C', str(remote), 'rev-parse', 'HEAD'], text=True).strip()
+        info = {'id': 'run-1', 'result': {'branch': 'openswarm/run-1', 'commit': commit,
+                                           'workspace': {'repo': str(remote), 'base': base},
+                                           'result': {'summary': 'done'}}}
+        def gateway(req):
+            if req['op'] == 'submit':
+                return {'id':'run-1','state':'queued','host':'gores1','backend':'pi','model':'MiniMax'}
+            if req['op'] == 'info':
+                return info
+            bundle = subprocess.run([sys.executable, str(ROOT / 'bin/fleet-result-bundle')],
+                                    input=json.dumps(info), text=True, capture_output=True, check=True)
+            return json.loads(bundle.stdout)
+        with mock.patch.dict(G, {'gateway': gateway}), contextlib.redirect_stdout(io.StringIO()) as output:
+            MOD['run_submit'](self.args)
+            output.seek(0); output.truncate()
+            self.assertTrue(MOD['mapped']('run-1', 'info'))
+            result = json.loads(output.getvalue())['result']
+        self.assertEqual(result['local_review_ref'], 'refs/openswarm/run-1')
+        actual = subprocess.check_output(['git', '-C', str(self.repo), 'show', 'refs/openswarm/run-1:a'], text=True)
+        self.assertEqual(actual, 'remote result')
+        self.assertEqual((self.repo / 'a').read_text(), 'x')
+
     def test_lost_ack_blocks_repeated_dispatch(self):
         with mock.patch.dict(G, {'gateway':mock.Mock(side_effect=RuntimeError('lost ack'))}):
             with self.assertRaisesRegex(RuntimeError,'unresolved'): MOD['run_submit'](self.args)

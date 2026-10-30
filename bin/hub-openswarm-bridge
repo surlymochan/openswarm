@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """OpenBot dispatch adapter with a durable, fail-closed remote handoff journal."""
 import argparse
+import base64
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -26,7 +28,8 @@ class NoAvailableLane(RuntimeError):
     pass
 
 def gateway(payload):
-    proc = subprocess.run(transport, input=json.dumps(payload), text=True, capture_output=True, timeout=100)
+    proc = subprocess.run(transport, input=json.dumps(payload), text=True, capture_output=True,
+                          timeout=150 if payload.get('op') == 'bundle' else 100)
     try: data = json.loads(proc.stdout)
     except ValueError: raise RuntimeError('fleet gateway response unavailable; handoff requires reconciliation')
     if proc.returncode or not data.get('ok'):
@@ -103,6 +106,28 @@ def run_submit(args):
     print(json.dumps({'id':run_id,'state':reply.get('state'),'host':'local','executor_host':host,
                       'backend':reply.get('backend'),'model':reply.get('model')}))
 
+def fetch_result(run_id, host, result):
+    branch, commit = result.get('branch'), result.get('commit')
+    if branch != 'openswarm/' + run_id or not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40,64}', commit):
+        return
+    repo = json.loads(config_path.read_text())['repo']
+    exists = subprocess.run(['git', '-C', repo, 'cat-file', '-e', commit + '^{commit}'], capture_output=True)
+    if exists.returncode:
+        payload = gateway({'op': 'bundle', 'id': run_id, 'host': host})
+        if payload.get('branch') != branch or payload.get('commit') != commit:
+            raise ValueError('result bundle does not match the completed task')
+        with tempfile.TemporaryDirectory(prefix='openswarm-result-') as directory:
+            bundle = Path(directory) / 'result.bundle'
+            bundle.write_bytes(base64.b64decode(payload['bundle'], validate=True))
+            subprocess.run(['git', '-C', repo, 'fetch', '--no-tags', str(bundle),
+                            'refs/heads/' + branch + ':refs/openswarm/' + run_id],
+                           capture_output=True, check=True, timeout=130)
+    else:
+        subprocess.run(['git', '-C', repo, 'update-ref', 'refs/openswarm/' + run_id, commit],
+                       capture_output=True, check=True, timeout=20)
+    result['local_review_ref'] = 'refs/openswarm/' + run_id
+
+
 def mapped(run_id, op):
     db=db_open(); row=db.execute("SELECT host FROM handoffs WHERE state='accepted' AND run_id=?",(run_id,)).fetchone(); db.close()
     if not row: return False
@@ -111,6 +136,10 @@ def mapped(run_id, op):
         # The local Hub host is a logical gateway. Preserve evidence of where
         # the executor ran in the result rather than claiming it ran locally.
         res=data['result']; final=res.get('result')
+        try:
+            fetch_result(run_id, row[0], res)
+        except (ValueError, KeyError, OSError, subprocess.SubprocessError, RuntimeError):
+            res['local_review_error'] = 'The completed result could not be fetched for local review.'
         if isinstance(final,dict) and isinstance(final.get('summary'),str):
             final['summary']='Executor host: '+row[0]+'. '+final['summary']
     print(json.dumps(data,ensure_ascii=False)); return True

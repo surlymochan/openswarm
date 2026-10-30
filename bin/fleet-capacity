@@ -18,18 +18,18 @@ host = sys.argv[1]
 try:
     request = json.load(sys.stdin)
     op = request.get('op')
-    if op in ('lanes', 'assign', 'run_info', 'stop'):
+    if op in ('lanes', 'assign', 'run_info', 'bundle', 'stop'):
         if host != 'gores1':
             raise ValueError('remote dispatcher host required')
         command = [str(Path.home() / '.local/bin/openswarm'), 'lane']
         if op == 'lanes':
             command += ['status']
-        elif op in ('run_info', 'stop'):
+        elif op in ('run_info', 'bundle', 'stop'):
             run_id = request.get('run_id')
             if not isinstance(run_id, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,99}', run_id):
                 raise ValueError('invalid run id')
             command = [str(Path.home() / '.local/bin/openswarm')]
-            command += ['fleet', '_run-info', run_id] if op == 'run_info' else ['stop', run_id]
+            command += ['fleet', '_run-info', run_id] if op in ('run_info', 'bundle') else ['stop', run_id]
         else:
             lane = request.get('lane')
             prompt = request.get('prompt')
@@ -59,6 +59,12 @@ try:
             result = json.loads(process.stdout)
         except ValueError:
             raise ValueError('remote lane command did not return JSON')
+        if op == 'bundle' and process.returncode == 0:
+            bundle = subprocess.run([sys.executable, str(Path(__file__).with_name('fleet-result-bundle'))],
+                                    input=json.dumps(result), capture_output=True, text=True, timeout=130)
+            if bundle.returncode:
+                raise ValueError('run bundle is unavailable')
+            result = json.loads(bundle.stdout)
         print(json.dumps({'ok': process.returncode == 0, 'result': result}, separators=(',', ':')))
         sys.exit(0 if process.returncode == 0 else 1)
     if op not in ('acquire', 'release', 'status', 'recover'):
