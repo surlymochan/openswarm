@@ -140,6 +140,8 @@ def mapped(run_id, op):
             fetch_result(run_id, row[0], res)
         except (ValueError, KeyError, OSError, subprocess.SubprocessError, RuntimeError):
             res['local_review_error'] = 'The completed result could not be fetched for local review.'
+            if isinstance(final, dict) and isinstance(final.get('summary'), str):
+                final['summary'] += ' Local review could not fetch the result.'
         if isinstance(final,dict) and isinstance(final.get('summary'),str):
             final['summary']='Executor host: '+row[0]+'. '+final['summary']
     print(json.dumps(data,ensure_ascii=False)); return True

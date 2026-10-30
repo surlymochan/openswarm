@@ -76,6 +76,23 @@ class HubBridgeTests(unittest.TestCase):
         self.assertEqual(actual, 'remote result')
         self.assertEqual((self.repo / 'a').read_text(), 'x')
 
+    def test_result_fetch_failure_keeps_completed_result_visible(self):
+        def gateway(req):
+            if req['op'] == 'submit':
+                return {'id':'run-1','state':'queued','host':'gores1','backend':'pi','model':'MiniMax'}
+            if req['op'] == 'bundle':
+                raise RuntimeError('transport unavailable')
+            return {'id':'run-1', 'result':{'branch':'openswarm/run-1', 'commit':'f' * 40,
+                                            'result':{'summary':'done'}}}
+        with mock.patch.dict(G, {'gateway':gateway}), contextlib.redirect_stdout(io.StringIO()) as output:
+            MOD['run_submit'](self.args)
+            output.seek(0); output.truncate()
+            self.assertTrue(MOD['mapped']('run-1', 'info'))
+            result = json.loads(output.getvalue())['result']
+        self.assertIn('could not be fetched', result['local_review_error'])
+        self.assertIn('done', result['result']['summary'])
+        self.assertIn('could not fetch', result['result']['summary'])
+
     def test_lost_ack_blocks_repeated_dispatch(self):
         with mock.patch.dict(G, {'gateway':mock.Mock(side_effect=RuntimeError('lost ack'))}):
             with self.assertRaisesRegex(RuntimeError,'unresolved'): MOD['run_submit'](self.args)
