@@ -15,6 +15,14 @@ GLOBALS = MODULE['main'].__globals__
 
 
 class AgyKeychainRuntimeTests(unittest.TestCase):
+    def test_keychain_command_is_terminated_by_newline(self):
+        result = mock.Mock(returncode=0)
+        with mock.patch.object(GLOBALS['subprocess'], 'run', return_value=result) as run:
+            MODULE['keychain_write'](b'credential')
+        command = run.call_args.kwargs['input']
+        self.assertTrue(command.endswith('\n'))
+        self.assertFalse(command.endswith('\\n'))
+
     def test_failed_rotated_token_save_is_retried_on_next_launch(self):
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / 'token'
