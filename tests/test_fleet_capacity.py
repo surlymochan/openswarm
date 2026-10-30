@@ -102,6 +102,33 @@ class FleetCapacityTests(unittest.TestCase):
         self.assertTrue(response['ok'])
         self.assertIn('--read-only', json.loads((root / 'args.json').read_text()))
 
+    def test_remote_completed_run_returns_git_bundle(self):
+        root = pathlib.Path(self.temp.name)
+        repo = root / 'repo'
+        repo.mkdir()
+        def git(*args):
+            return subprocess.check_output(['git', '-C', str(repo), *args], text=True).strip()
+        git('init', '-q')
+        (repo / 'file').write_text('before')
+        git('add', 'file')
+        git('-c', 'user.name=test', '-c', 'user.email=test@test', 'commit', '-qm', 'base')
+        base = git('rev-parse', 'HEAD')
+        git('checkout', '-qb', 'openswarm/run-1')
+        (repo / 'file').write_text('after')
+        git('-c', 'user.name=test', '-c', 'user.email=test@test', 'commit', '-qam', 'result')
+        commit = git('rev-parse', 'HEAD')
+        fake = root / '.local/bin/openswarm'
+        fake.parent.mkdir(parents=True)
+        info = {'id':'run-1', 'result':{'branch':'openswarm/run-1', 'commit':commit,
+                                       'workspace':{'repo':str(repo), 'base':base}}}
+        fake.write_text('#!' + sys.executable + '\nimport json\nprint(' + repr(json.dumps(info)) + ')\n')
+        fake.chmod(0o755)
+        self.env['HOME'] = str(root)
+        response = self.call('gores1', op='bundle', run_id='run-1')
+        self.assertTrue(response['ok'])
+        self.assertEqual(response['result']['commit'], commit)
+        self.assertTrue(response['result']['bundle'])
+
     def test_html_403_is_not_misclassified_as_login_failure(self):
         error = 'request failed (code 403): HTML response "Error 403 (Forbidden)!!1"'
         self.assertEqual(xs.executor_error_class(1, None, error, 'agy'), 'upstream_forbidden')
