@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""Atomic fleet admission. Reservations persist until explicitly released, even after a crash."""
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+
+ALLOWED = {'codex', 'pi', 'cursor', 'agy', 'copilot'}
+LIMITS = {'total': 8, 'host:gocc': 2, 'host:gores1': 2,
+          'codex': 1, 'pi': 1, 'cursor': 1, 'agy': 1, 'copilot': 1, 'minimax-cn': 1}
+if len(sys.argv) != 2 or sys.argv[1] not in ('gocc', 'gores1'):
+    sys.exit('invalid authenticated host')
+host = sys.argv[1]
+try:
+    request = json.load(sys.stdin)
+    op = request.get('op')
+    if op not in ('acquire', 'release', 'status'):
+        raise ValueError('invalid operation')
+    root = Path(os.environ.get('OPENSWARM_FLEET_CAPACITY_DIR') or
+                (Path.home() / '.claude/openswarm-fleet-capacity'))
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    db = sqlite3.connect(str(root / 'capacity.sqlite'), timeout=10, isolation_level=None)
+    os.chmod(root / 'capacity.sqlite', 0o600)
+    db.execute('PRAGMA busy_timeout=10000')
+    db.execute('CREATE TABLE IF NOT EXISTS reservations (token TEXT PRIMARY KEY, host TEXT NOT NULL, run_id TEXT NOT NULL, backend TEXT NOT NULL, provider TEXT, created REAL NOT NULL)')
+    db.execute('BEGIN IMMEDIATE')
+    if op == 'status':
+        rows = db.execute('SELECT host,run_id,backend,provider,created FROM reservations ORDER BY created').fetchall()
+        out = {'ok': True, 'reservations': [dict(zip(('host','run_id','backend','provider','created'), row)) for row in rows]}
+    else:
+        token, run_id = request.get('token'), request.get('run_id')
+        if not isinstance(token, str) or len(token) != 32 or any(c not in '0123456789abcdef' for c in token):
+            raise ValueError('invalid token')
+        if not isinstance(run_id, str) or not run_id or len(run_id) > 128:
+            raise ValueError('invalid run id')
+        old = db.execute('SELECT host,run_id,backend,provider FROM reservations WHERE token=?', (token,)).fetchone()
+        if op == 'release':
+            if old and (old[0] != host or old[1] != run_id):
+                raise ValueError('reservation owner mismatch')
+            db.execute('DELETE FROM reservations WHERE token=? AND host=? AND run_id=?', (token,host,run_id))
+            out = {'ok': True, 'released': bool(old)}
+        else:
+            backend, provider = request.get('backend'), request.get('provider')
+            if backend not in ALLOWED or provider not in (None, 'minimax-cn'):
+                raise ValueError('invalid backend/provider')
+            if old:
+                if old != (host,run_id,backend,provider):
+                    raise ValueError('reservation token conflict')
+                out = {'ok': True, 'admitted': True, 'existing': True}
+            else:
+                rows = db.execute('SELECT host,backend,provider FROM reservations').fetchall()
+                keys = {'total', 'host:' + host, backend} | ({provider} if provider else set())
+                counts = {key: 0 for key in keys}
+                for h,b,p in rows:
+                    active = {'total','host:' + h,b} | ({p} if p else set())
+                    for key in keys & active: counts[key] += 1
+                blocked = [key for key in sorted(keys) if key in LIMITS and counts[key] >= LIMITS[key]]
+                if blocked:
+                    out = {'ok': True, 'admitted': False, 'blocked': blocked}
+                else:
+                    db.execute('INSERT INTO reservations VALUES (?,?,?,?,?,?)', (token,host,run_id,backend,provider,time.time()))
+                    out = {'ok': True, 'admitted': True}
+    db.execute('COMMIT')
+    print(json.dumps(out, separators=(',',':')))
+except Exception as error:
+    try: db.execute('ROLLBACK')
+    except Exception: pass
+    print(json.dumps({'ok': False, 'error': str(error)[:300]}))
+    sys.exit(1)
