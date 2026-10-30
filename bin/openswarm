@@ -7675,6 +7675,9 @@ def lane_do_run(lane, spec, child, server, current):
                 lane_record_event(next_event if can_retry else evp, rate_event)
                 if not can_retry:
                     break
+                if lane_headless(lane):
+                    child.close()
+                    child.proc = None
                 set_status(os.path.join(RUNS, rid), state="queued", queue_reason="rate limited", events=next_event,
                            attempt=attempt_number + 1, concurrency_keys=concurrency_keys(attempt_lane["backend"], provider))
                 lane_write_state(lane["name"], turn_state="queued", concurrency_keys=[])
