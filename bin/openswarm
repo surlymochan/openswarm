@@ -6471,7 +6471,7 @@ def lane_rebuild_worktree(repo, wt, base):
         raise RuntimeError(f"lane worktree rebuild failed: {err[:250]}")
 
 
-def lane_prepare_workspace(lane, rid, base_rev=None):
+def lane_prepare_workspace(lane, rid, base_rev=None, readonly_workspace=False):
     repo = os.path.realpath(lane["repo"])
     rc, top, err = lane_git(["rev-parse", "--show-toplevel"], repo)
     if rc:
@@ -6480,7 +6480,7 @@ def lane_prepare_workspace(lane, rid, base_rev=None):
     rc, base, err = lane_git(["rev-parse", "--verify", "--end-of-options", f"{base_rev or 'HEAD'}^{{commit}}"], repo)
     if rc:
         raise RuntimeError(f"invalid base revision {base_rev!r}: {err}")
-    wt = os.path.join(lane_root(lane["name"]), "wt")
+    wt = os.path.join(lane_root(lane["name"]), "wt-readonly" if readonly_workspace else "wt")
     os.makedirs(os.path.dirname(wt), exist_ok=True)
     if not lane_worktree_matches(repo, wt):
         lane_rebuild_worktree(repo, wt, base)
@@ -7556,7 +7556,12 @@ def lane_do_run(lane, spec, child, server, current):
     readonly_child = None
     turn, pending = {}, []
     try:
-        ws = lane_prepare_workspace(lane, rid, spec.get("base"))
+        isolated_pi_readonly = (lane["backend"] == "pi"
+                                and (load_policy().get("pi") or {}).get("require_isolation", True)
+                                and (spec.get("read_only") or spec.get("card_type") in READ_ONLY_CARD_TYPES))
+        # The writable resident can retain background processes. Its sandbox must not
+        # share the worktree used by a later read-only assignment.
+        ws = lane_prepare_workspace(lane, rid, spec.get("base"), readonly_workspace=isolated_pi_readonly)
         if ws.get("workspace_note"):
             set_status(rdir, workspace_note=ws["workspace_note"])
         ws["prepare"] = []
@@ -7575,8 +7580,7 @@ def lane_do_run(lane, spec, child, server, current):
                            "meta": {"usage": {}}, "events": evp, "error_tail": None}
                 return lane_finalize_run(lane, spec, ws, None, {}, "prepare_failed", prepared["rc"], evp,
                                          attempts=[attempt])
-        if (lane["backend"] == "pi" and (load_policy().get("pi") or {}).get("require_isolation", True)
-                and (spec.get("read_only") or spec.get("card_type") in READ_ONLY_CARD_TYPES)):
+        if isolated_pi_readonly:
             readonly_child = LaneChild(lane, ws["path"], load_policy(), read_only=True)
             child = readonly_child
         if spec.get("verify"):

@@ -33,7 +33,10 @@ class PiLaneReadOnlyTests(unittest.TestCase):
             binary = runtime / 'node_modules/.bin/pi'
             binary.parent.mkdir(parents=True)
             binary.write_text('''#!/usr/bin/python3
-import json, sys
+import json, os, subprocess, sys, time
+if "read,grep,find,ls" not in sys.argv:
+ subprocess.Popen([sys.executable, "-c", "import time\\nwhile True:\\n open('resident-marker', 'w').write('background write')\\n time.sleep(.05)"],
+                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 def send(value):
  print(json.dumps(value), flush=True)
 for line in sys.stdin:
@@ -43,11 +46,13 @@ for line in sys.stdin:
   send({"id":request.get("id"),"type":"response","command":kind,"success":True})
  elif kind == "prompt":
   send({"id":request.get("id"),"type":"response","command":kind,"success":True})
+  time.sleep(.4)
   try:
    with open("unexpected-write", "w") as stream: stream.write("bad")
    blocked = False
   except OSError: blocked = True
-  result = {"status":"done", "summary":"write blocked" if blocked else "write succeeded",
+  summary = "contaminated" if os.path.exists("resident-marker") else ("write blocked" if blocked else "write succeeded")
+  result = {"status":"done", "summary":summary,
             "files_changed":[], "tests":[], "risks":[]}
   message = {"role":"assistant", "content":[{"type":"text", "text":json.dumps(result)}],
              "usage":{"input":1,"output":1}}
@@ -93,9 +98,12 @@ for line in sys.stdin:
                     time.sleep(.1)
                 else:
                     self.fail('read-only Pi run did not finish')
-                self.assertEqual(outcome['status'], 'done')
+                events = (run / 'events.1.pi.jsonl').read_text()
+                self.assertEqual(outcome['status'], 'done', (outcome, events))
                 self.assertEqual(outcome['result']['summary'], 'write blocked')
-                self.assertFalse((home / 'lanes/R1/wt/unexpected-write').exists())
+                self.assertTrue((home / 'lanes/R1/wt/resident-marker').exists())
+                self.assertFalse((home / 'lanes/R1/wt-readonly/resident-marker').exists())
+                self.assertFalse((home / 'lanes/R1/wt-readonly/unexpected-write').exists())
                 temporary = json.loads((run / 'status.json').read_text()).get('executor_pid')
                 self.assertNotEqual(temporary, resident)
                 deadline = time.monotonic() + 10
