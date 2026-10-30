@@ -58,7 +58,7 @@ def run_submit(args):
     if check.returncode or check.stdout.strip(): raise ValueError('mapped repository is not a clean checkout')
     base = subprocess.check_output(['git','-C',str(repo),'rev-parse','HEAD'],text=True,timeout=20).strip()
     card = Path(opts.task_file).read_text(encoding='utf-8')
-    if not card.strip() or len(card)>64000: raise ValueError('invalid task card')
+    if not card.strip() or len(card)>50000: raise ValueError('invalid task card')
     # Hub's own workspace is not a repository. Do not silently redirect work
     # for another project into this explicitly configured OpenBot checkout.
     if not re.search(r'(?im)^\s*repository\s*:\s*openbot\s*$', card):

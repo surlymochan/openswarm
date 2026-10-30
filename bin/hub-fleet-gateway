@@ -32,7 +32,7 @@ def main():
     if op == 'submit':
         prompt, title, base = req.get('prompt'), req.get('title'), req.get('base')
         kind, difficulty, budget, verify = req.get('type'), req.get('difficulty'), req.get('budget'), req.get('verify')
-        if not isinstance(prompt,str) or not 0 < len(prompt) <= 64000 or not isinstance(title,str) or not 0 < len(title) <= 160:
+        if not isinstance(prompt,str) or not 0 < len(prompt) <= 50000 or not isinstance(title,str) or not 0 < len(title) <= 160:
             raise ValueError('invalid task')
         if kind not in ('impl','mechanical','format','rename','docs','test','refactor','debug','migration','review','research','audit','second-opinion'):
             raise ValueError('invalid type')

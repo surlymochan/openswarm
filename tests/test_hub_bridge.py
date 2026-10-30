@@ -143,6 +143,16 @@ class HubBridgeTests(unittest.TestCase):
                 MOD['run_submit'](self.args)
             G['gateway'].assert_not_called()
 
+    def test_oversized_card_does_not_create_a_pending_handoff(self):
+        self.card.write_text('Repository: openbot\n' + 'x' * 50000)
+        with mock.patch.dict(G, {'gateway':mock.Mock()}):
+            with self.assertRaisesRegex(ValueError, 'invalid task card'):
+                MOD['run_submit'](self.args)
+            G['gateway'].assert_not_called()
+        db = MOD['db_open']()
+        self.assertEqual(db.execute('select count(*) from handoffs').fetchone()[0], 0)
+        db.close()
+
     def test_pending_reconciliation_requires_verified_terminal_run(self):
         with mock.patch.dict(G, {'gateway':mock.Mock(side_effect=RuntimeError('lost ack'))}):
             with self.assertRaisesRegex(RuntimeError,'unresolved'): MOD['run_submit'](self.args)
