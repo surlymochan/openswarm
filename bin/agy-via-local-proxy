@@ -57,25 +57,31 @@ def ensure_home(stored_credential):
         token_path.chmod(0o600)
     json.loads(token_path.read_text())
 
-try:
-    stored_credential = keychain_read()
-    stored_refresh = json.loads(stored_credential).get('token', {}).get('refresh_token')
-    ensure_home(stored_credential)
-    env = dict(os.environ, HOME=str(home), HTTPS_PROXY='http://127.0.0.1:7890',
-               https_proxy='http://127.0.0.1:7890')
-    child = subprocess.Popen([str(original_home / '.local/bin/agy'), *sys.argv[1:]], env=env)
-    def forward(signum, _frame):
-        if child.poll() is None:
-            child.send_signal(signum)
-    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        signal.signal(sig, forward)
-    rc = child.wait()
-    if token_path.exists():
-        updated = token_path.read_bytes()
-        current_refresh = json.loads(updated).get('token', {}).get('refresh_token')
-        if current_refresh != stored_refresh:
-            keychain_write(updated)
-    sys.exit(rc if rc >= 0 else 128 - rc)
-except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-    print('Antigravity startup failed: ' + str(error), file=sys.stderr)
-    sys.exit(1)
+
+def main():
+    try:
+        stored_credential = keychain_read()
+        stored_refresh = json.loads(stored_credential).get('token', {}).get('refresh_token')
+        ensure_home(stored_credential)
+        env = dict(os.environ, HOME=str(home), HTTPS_PROXY='http://127.0.0.1:7890',
+                   https_proxy='http://127.0.0.1:7890')
+        child = subprocess.Popen([str(original_home / '.local/bin/agy'), *sys.argv[1:]], env=env)
+        def forward(signum, _frame):
+            if child.poll() is None:
+                child.send_signal(signum)
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(sig, forward)
+        rc = child.wait()
+        if token_path.exists():
+            updated = token_path.read_bytes()
+            current_refresh = json.loads(updated).get('token', {}).get('refresh_token')
+            if current_refresh != stored_refresh:
+                keychain_write(updated)
+        return rc if rc >= 0 else 128 - rc
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        print('Antigravity startup failed: ' + str(error), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
