@@ -107,6 +107,25 @@ class FleetCapacityTests(unittest.TestCase):
         self.assertEqual(xs.executor_error_class(1, None, error, 'agy'), 'upstream_forbidden')
         self.assertEqual(xs.executor_error_class(1, None, error, 'codex'), 'exec_error')
 
+    def test_one_shot_agy_403_releases_slot_for_next_run(self):
+        guard = pathlib.Path(self.temp.name, 'guard.json')
+        guard.write_text(json.dumps({'command': [str(BIN), 'gocc']}))
+        fake = HERE / 'fixtures/fake_agy.py'
+        fake.chmod(0o755)
+        env = {'OPENSWARM_FLEET_GUARD_CONFIG': str(guard),
+               'OPENSWARM_FLEET_CAPACITY_DIR': self.temp.name,
+               'OPENSWARM_AGY_BIN': str(fake), 'FAKE_AGY_MODE': 'forbidden-exit'}
+        with mock.patch.dict(os.environ, env):
+            for number in range(2):
+                rdir = pathlib.Path(self.temp.name, 'runs', f'run-{number}')
+                rdir.mkdir(parents=True)
+                attempts, _, error = xs.run_executor_with_rate_limit(
+                    'agy', {'backend': 'agy', 'model': 'fake-model'}, {}, 'review', self.temp.name,
+                    str(rdir), xs.NOW() + 15, {'concurrency': {'total': 8}})
+                self.assertEqual(error, 'upstream_forbidden')
+                self.assertEqual(attempts[0]['rc'], 1)
+                self.assertEqual(self.call('gocc', op='status')['reservations'], [])
+
     def test_recovery_requires_local_explicit_confirmation(self):
         token = 'a' * 32
         self.assertTrue(self.call('gores1', op='acquire', token=token, run_id='orphan',
@@ -163,6 +182,21 @@ class FleetCapacityTests(unittest.TestCase):
                                                       keep_waiting=lambda: False))
             self.assertEqual([c.args[1]['op'] for c in call.call_args_list], ['acquire', 'release'])
             self.assertNotIn(os.path.realpath(rdir), xs._FLEET_RESERVATIONS)
+
+    def test_early_agy_result_releases_one_shot_reservation(self):
+        rdir = os.path.join(self.temp.name, 'runs', 'early-agy')
+        os.makedirs(rdir)
+        fake = mock.Mock(return_value=(1, None, {'usage':{}, 'finished_reason':'print_timeout'},
+                                      'agy turn ended early: print_timeout'))
+        with mock.patch.dict(os.environ, {'OPENSWARM_FLEET_CAPACITY_DIR': self.temp.name}), \
+             mock.patch.object(xs, 'fleet_guard_command', return_value=[str(BIN), 'gocc']), \
+             mock.patch.dict(xs.EXECUTORS, {'agy':fake}):
+            attempts, final, error = xs.run_executor_with_rate_limit(
+                'agy', {'backend':'agy', 'model':'gemini-3.8-flash-medium', 'effort':None}, {}, 'task', self.temp.name, rdir,
+                xs.NOW() + 30, xs.load_policy())
+        self.assertEqual(error, 'exec_error')
+        self.assertIsNone(final)
+        self.assertEqual(self.call('gocc', op='status')['reservations'], [])
 
 if __name__ == '__main__':
     unittest.main()

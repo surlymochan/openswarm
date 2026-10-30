@@ -498,6 +498,97 @@ class LaneTests(unittest.TestCase):
         self.assertEqual(calls[0][calls[0].index("--model") + 1], "gemini-3.8-flash-medium")
         self.assertEqual(calls[0][calls[0].index("--output-format") + 1], "stream-json")
 
+    def test_agy_running_status_records_live_executor_pid(self):
+        self.set_config("agy")
+        self.start_lane()
+        run_id = self.assign("LANE_TEST_WAIT inspect pid")
+        pid = self.wait_for(lambda: self.run_state(run_id).get("executor_pid"),
+                            description="headless executor pid")
+        self.assertTrue(process_alive(pid))
+        self.cli("lane", "abort", self.lane_name)
+        self.wait_run(run_id)
+
+    def test_agy_early_timeout_is_not_success_and_releases_capacity(self):
+        self.set_config("agy")
+        self.env["FAKE_AGY_MODE"] = "print-timeout"
+        self.env["OPENSWARM_FLEET_CAPACITY_DIR"] = str(self.root / "capacity")
+        guard = self.root / "guard.json"
+        guard.write_text(json.dumps({"command": [str(ROOT / "bin/fleet-capacity"), "gocc"]}))
+        self.env["OPENSWARM_FLEET_GUARD_CONFIG"] = str(guard)
+        self.start_lane()
+        run_id = self.assign("review the fixture")
+        self.wait_run(run_id)
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertNotEqual(result["status"], "done")
+        self.assertIn("print_timeout", result["attempts"][0]["error_tail"])
+        self.assertFalse(process_alive(self.run_state(run_id)['executor_pid']))
+        status = subprocess.run([str(ROOT / "bin/fleet-capacity"), "gocc"],
+                                input=json.dumps({"op": "status"}), text=True,
+                                capture_output=True, env=self.env, check=True)
+        self.assertEqual(json.loads(status.stdout)["reservations"], [])
+
+    def test_agy_quota_reset_beyond_budget_does_not_retry(self):
+        self.set_config("agy")
+        self.env["FAKE_AGY_MODE"] = "long-quota"
+        self.start_lane()
+        run_id = self.assign("review the fixture")
+        self.wait_run(run_id)
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual(len(result["attempts"]), 1)
+        self.assertEqual(result["attempts"][0]["error_class"], "rate_limit")
+        self.wait_for(lambda: self.lane_state().get("state") == "idle")
+        rows = json.loads(self.cli("lane", "status").stdout)
+        self.assertEqual(rows[0]["state"], "quota_exhausted")
+        self.assertGreater(rows[0]["quota_reset_at"], time.time())
+        state_path = self.data / "lanes" / self.lane_name / "state.json"
+        state = json.loads(state_path.read_text())
+        state["quota_until"] = 1
+        state_path.write_text(json.dumps(state))
+        rows = json.loads(self.cli("lane", "status").stdout)
+        self.assertEqual(rows[0]["state"], "idle")
+
+    def test_agy_403_stops_process_and_releases_fleet_slot(self):
+        self.set_config("agy")
+        self.env["FAKE_AGY_MODE"] = "forbidden"
+        self.env["OPENSWARM_FLEET_CAPACITY_DIR"] = str(self.root / "capacity")
+        guard = self.root / "guard.json"
+        guard.write_text(json.dumps({"command": [str(ROOT / "bin/fleet-capacity"), "gocc"]}))
+        self.env["OPENSWARM_FLEET_GUARD_CONFIG"] = str(guard)
+        self.start_lane()
+        for _ in range(2):
+            run_id = self.assign("review the fixture")
+            self.wait_run(run_id)
+            result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+            self.assertEqual(result["error_class"], "upstream_forbidden")
+            status = subprocess.run([str(ROOT / "bin/fleet-capacity"), "gocc"],
+                                    input=json.dumps({"op": "status"}), text=True,
+                                    capture_output=True, env=self.env, check=True)
+            self.assertEqual(json.loads(status.stdout)["reservations"], [])
+            self.wait_for(lambda: self.lane_state().get("state") == "idle")
+
+    def test_agy_retries_one_transient_403(self):
+        self.set_config("agy")
+        self.env["FAKE_AGY_MODE"] = "forbidden-once"
+        self.env["FAKE_AGY_ONCE_MARKER"] = str(self.root / "agy-failed-once")
+        self.start_lane()
+        run_id = self.assign("create a file")
+        self.assertEqual(self.wait_run(run_id)["status"], "done")
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual([item["error_class"] for item in result["attempts"]], ["upstream_forbidden", None])
+
+    def test_agy_retry_after_rate_limit_keeps_original_task(self):
+        self.set_config("agy")
+        self.env["FAKE_AGY_MODE"] = "rate-then-forbidden"
+        self.env["FAKE_AGY_ONCE_MARKER"] = str(self.root / "agy-sequence")
+        (self.data / "policy.local.json").write_text(json.dumps({"rate_limit": {"backoff_seconds": [0], "max_retries": 1}}))
+        self.start_lane()
+        run_id = self.assign("original review task")
+        self.assertEqual(self.wait_run(run_id)["status"], "done")
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual([item["error_class"] for item in result["attempts"]], ["rate_limit", "upstream_forbidden", None])
+        calls = [json.loads(line) for line in pathlib.Path(self.env["FAKE_AGY_LOG"]).read_text().splitlines()]
+        self.assertIn("original review task", calls[-1][calls[-1].index("-p") + 1])
+
     def test_agy_steer_aborts_the_process_and_resumes_the_conversation(self):
         self.set_config("agy")
         self.start_lane()
@@ -671,6 +762,28 @@ class LaneTests(unittest.TestCase):
         self.cli("stop", run_id)
         self.assertEqual(self.wait_run(run_id)["status"], "stopped")
         self.assertTrue(process_alive(supervisor_pid))
+
+    def test_pi_acknowledged_abort_releases_fleet_slot(self):
+        self.set_config("pi")
+        config_path = self.data / "lanes.json"
+        config = json.loads(config_path.read_text())
+        config["lanes"][0]["provider"] = "minimax-cn"
+        config_path.write_text(json.dumps(config))
+        guard = self.root / "fleet-guard.json"
+        guard.write_text(json.dumps({"command": [str(ROOT / "bin/fleet-capacity"), "gores1"]}))
+        self.env["OPENSWARM_FLEET_GUARD_CONFIG"] = str(guard)
+        self.env["OPENSWARM_FLEET_CAPACITY_DIR"] = str(self.root / "fleet")
+        self.start_lane()
+        run_id = self.assign("LANE_TEST_WAIT abort this")
+        self.wait_running(run_id)
+        self.cli("lane", "abort", self.lane_name)
+        self.assertEqual(self.wait_run(run_id)["status"], "stopped")
+        status = subprocess.run([str(ROOT / "bin/fleet-capacity"), "gores1"],
+                                input=json.dumps({"op": "status"}), env=self.env, text=True,
+                                capture_output=True, check=True)
+        self.assertEqual(json.loads(status.stdout)["reservations"], [])
+        next_id = self.assign("next task after abort")
+        self.assertEqual(self.wait_run(next_id)["status"], "done")
 
     def test_stop_of_old_run_does_not_abort_the_next_run(self):
         self.start_lane()
