@@ -6473,7 +6473,7 @@ def lane_rebuild_worktree(repo, wt, base):
         raise RuntimeError(f"lane worktree rebuild failed: {err[:250]}")
 
 
-def lane_prepare_workspace(lane, rid, base_rev=None):
+def lane_prepare_workspace(lane, rid, base_rev=None, isolated_readonly=False):
     repo = os.path.realpath(lane["repo"])
     rc, top, err = lane_git(["rev-parse", "--show-toplevel"], repo)
     if rc:
@@ -6482,7 +6482,7 @@ def lane_prepare_workspace(lane, rid, base_rev=None):
     rc, base, err = lane_git(["rev-parse", "--verify", "--end-of-options", f"{base_rev or 'HEAD'}^{{commit}}"], repo)
     if rc:
         raise RuntimeError(f"invalid base revision {base_rev!r}: {err}")
-    wt = os.path.join(lane_root(lane["name"]), "wt")
+    wt = os.path.join(lane_root(lane["name"]), "wt-readonly" if isolated_readonly else "wt")
     os.makedirs(os.path.dirname(wt), exist_ok=True)
     if not lane_worktree_matches(repo, wt):
         lane_rebuild_worktree(repo, wt, base)
@@ -6529,10 +6529,39 @@ def lane_prepare_workspace(lane, rid, base_rev=None):
             "workspace_note": workspace_note(repo)}
 
 
+@contextlib.contextmanager
+def copilot_readonly_image(source, rdir):
+    """Give a Copilot turn its own read-only filesystem, without nesting sandboxes."""
+    if sys.platform != "darwin" or not shutil.which("hdiutil"):
+        raise RuntimeError("Copilot read-only isolation requires macOS hdiutil")
+    directory = tempfile.mkdtemp(prefix="copilot-readonly-", dir=rdir)
+    image = os.path.join(directory, "workspace.dmg")
+    mount = os.path.join(directory, "workspace")
+    os.mkdir(mount)
+    mounted = False
+    try:
+        subprocess.run(["hdiutil", "create", "-quiet", "-srcfolder", source, "-format", "UDRW", image],
+                       check=True, capture_output=True, timeout=300)
+        subprocess.run(["hdiutil", "attach", "-quiet", "-nobrowse", "-readonly", "-mountpoint", mount, image],
+                       check=True, capture_output=True, timeout=60)
+        mounted = True
+        yield mount, directory
+    finally:
+        if mounted:
+            detached = subprocess.run(["hdiutil", "detach", "-quiet", mount], capture_output=True, timeout=60)
+            if detached.returncode:
+                raise RuntimeError(f"Could not detach Copilot read-only image at {mount}")
+        shutil.rmtree(directory, ignore_errors=True)
+
+
 class LaneChild:
-    def __init__(self, lane, cwd, policy):
+    def __init__(self, lane, cwd, policy, writable_tmp=None):
         self.lane, self.cwd = lane, cwd
-        _tmpdir, self.env = configure_executor_environment(cwd)
+        if writable_tmp:
+            os.makedirs(writable_tmp, exist_ok=True)
+            self.env = dict(os.environ, TMPDIR=writable_tmp, TMP=writable_tmp, TEMP=writable_tmp)
+        else:
+            _tmpdir, self.env = configure_executor_environment(cwd)
         self.events = queue.Queue()
         self.backlog = []
         self.write_lock = threading.Lock()
@@ -6882,7 +6911,8 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                 answer["state"] = jload(lane_state_path(lane["name"]), {})
             elif op == "assign":
                 state = jload(lane_state_path(lane["name"]), {}) or {}
-                if lane["backend"] == "copilot" and (req.get("read_only") or req.get("card_type") in READ_ONLY_CARD_TYPES):
+                if (lane["backend"] == "copilot" and (req.get("read_only") or req.get("card_type") in READ_ONLY_CARD_TYPES)
+                        and (sys.platform != "darwin" or not shutil.which("hdiutil"))):
                     answer = {"ok": False, "error": "Copilot lane read-only isolation is unavailable"}
                 elif (lane["backend"] == "pi" and (load_policy().get("pi") or {}).get("require_isolation", True)
                         and (req.get("read_only") or req.get("card_type") in READ_ONLY_CARD_TYPES)):
@@ -7462,7 +7492,9 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
         if head_rc == 0 and head.strip() != ws["base"]:
             ancestor_rc, _, _ = git(["merge-base", "--is-ancestor", ws["base"], head.strip()], ws["root"])
             changed = changed or ancestor_rc == 0
-    fin = finalize_workspace(ws, title, lane["backend"], rdir, keep=True)
+    fin = ({"branch": None, "commit": None, "diffstat": "", "excluded_files": [],
+            "patch": None, "worktree": ws["root"], "merge_hint": None}
+           if ws.get("readonly_snapshot") else finalize_workspace(ws, title, lane["backend"], rdir, keep=True))
     verify = None
     prepare_error = None
     if spec.get("verify") and error_class not in ("risk_blocked", "rate_limit") and (final is not None or changed):
@@ -7558,9 +7590,15 @@ def lane_do_run(lane, spec, child, server, current):
     if lane["backend"] in ("cursor", "copilot"):
         lane_write_state(lane["name"], model=lane["model"], resolved_model=None)
     ws = None
+    readonly_child = None
+    readonly_image = None
     turn, pending = {}, []
     try:
-        ws = lane_prepare_workspace(lane, rid, spec.get("base"))
+        copilot_readonly = lane["backend"] == "copilot" and (
+            spec.get("read_only") or spec.get("card_type") in READ_ONLY_CARD_TYPES)
+        ws = lane_prepare_workspace(lane, rid, spec.get("base"), isolated_readonly=copilot_readonly)
+        if copilot_readonly:
+            ws["readonly_snapshot"] = True
         if ws.get("workspace_note"):
             set_status(rdir, workspace_note=ws["workspace_note"])
         ws["prepare"] = []
@@ -7579,6 +7617,13 @@ def lane_do_run(lane, spec, child, server, current):
                            "meta": {"usage": {}}, "events": evp, "error_tail": None}
                 return lane_finalize_run(lane, spec, ws, None, {}, "prepare_failed", prepared["rc"], evp,
                                          attempts=[attempt])
+        if copilot_readonly:
+            image_context = copilot_readonly_image(ws["root"], rdir)
+            mount, temporary = image_context.__enter__()
+            readonly_image = image_context
+            ws["path"] = mount
+            readonly_child = LaneChild(lane, mount, load_policy(), writable_tmp=os.path.join(temporary, "tmp"))
+            child = readonly_child
         if spec.get("verify"):
             rewritten = rewrite_verify_paths(spec["verify"], ws["repo"], ws["root"])
             if rewritten != spec["verify"]:
@@ -7672,6 +7717,13 @@ def lane_do_run(lane, spec, child, server, current):
             trip_breaker(f"{attempt_lane['backend']}/{model}", load_policy(), error_tail or "model unavailable")
             if number == len(models) or spec.get("abort_requested"):
                 break
+        if readonly_child is not None:
+            readonly_child.close()
+            readonly_child = None
+        if readonly_image is not None:
+            image_context, readonly_image = readonly_image, None
+            image_context.__exit__(None, None, None)
+            ws["path"] = ws["root"]
         out = lane_finalize_run(attempt_lane, spec, ws, final, usage, error_class, rc, evp,
                                 attempts=attempts)
         return out
@@ -7698,6 +7750,11 @@ def lane_do_run(lane, spec, child, server, current):
                            **exec_pass_fields(False, False, bool(spec.get("verify")), None)})
             return status
         return lane_finalize_run(lane, spec, ws, None, {}, error_class, 1, evp)
+    finally:
+        if readonly_child is not None:
+            readonly_child.close()
+        if readonly_image is not None:
+            readonly_image.__exit__(None, None, None)
 
 
 def cmd_lane_serve(lane, policy):

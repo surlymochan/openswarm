@@ -26,7 +26,8 @@ class CopilotReadonlyTests(unittest.TestCase):
         try:
             client.sendall((json.dumps({'op': 'assign', 'read_only': True, 'run_id': 'test'}) + '\n').encode())
             lane = {'name': 'GH1', 'backend': 'copilot'}
-            with mock.patch.object(xs, 'jload', return_value={'state': 'idle'}):
+            with mock.patch.object(xs, 'jload', return_value={'state': 'idle'}), \
+                    mock.patch.object(xs.shutil, 'which', return_value=None):
                 xs.lane_control_messages(server, lane, {}, None, {}, [])
             answer = json.loads(client.recv(4096))
             self.assertFalse(answer['ok'])

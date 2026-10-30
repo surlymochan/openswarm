@@ -115,7 +115,15 @@ while True:
                 if message.get("id") == request.get("id"):
                     continue
             continue
-        if "LANE_TEST_NO_CHANGE" not in prompt:
+        readonly_probe = os.environ.get("FAKE_CURSOR_READONLY_PROBE") == "1"
+        blocked = False
+        if readonly_probe:
+            try:
+                with open(os.path.join(cwd, "unexpected-write"), "w") as stream:
+                    stream.write("bad")
+            except OSError:
+                blocked = True
+        elif "LANE_TEST_NO_CHANGE" not in prompt:
             with open(os.path.join(cwd, "lane_result.txt"), "w") as stream:
                 stream.write(prompt)
         if "LANE_TEST_AGENT_COMMIT" in prompt:
@@ -125,7 +133,7 @@ while True:
             # The live agent ends the turn without a JSON report when the prompt does not ask for one.
             response(request, {"stopReason": "end_turn"})
             continue
-        result = {"status": "done", "summary": "fake Cursor ACP completed", "files_changed": ["lane_result.txt"],
+        result = {"status": "done", "summary": ("write blocked" if blocked else "write succeeded") if readonly_probe else "fake Cursor ACP completed", "files_changed": [] if readonly_probe else ["lane_result.txt"],
                   "tests": "fake ACP executor", "followups": []}
         report = json.dumps(result)
         middle = max(1, len(report) // 2)
