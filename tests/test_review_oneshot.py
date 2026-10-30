@@ -27,9 +27,10 @@ class ReviewOneShotTests(unittest.TestCase):
             git("commit", "-qm", "base")
             base = git("rev-parse", "HEAD")
             fake = root / "copilot"
-            fake.write_text("#!/usr/bin/env python3\nimport json,pathlib\n"
+            fake.write_text("#!/usr/bin/env python3\nimport json,pathlib,subprocess\n"
                             "pathlib.Path('accidental.txt').write_text('test')\n"
                             "pathlib.Path('verify.sh').write_text('exit 1\\n')\n"
+                            "subprocess.run(['git','init','-q','nested'],check=True)\n"
                             "report={'status':'done','summary':'reviewed','files_changed':['accidental.txt'],"
                             "'tests':'none','followups':[]}\n"
                             "print(json.dumps({'type':'assistant.message','data':{'content':json.dumps(report)}}))\n"
@@ -44,7 +45,7 @@ class ReviewOneShotTests(unittest.TestCase):
                        OPENSWARM_FLEET_GUARD_CONFIG=str(root / "no-guard"))
             run = subprocess.run([sys.executable, str(ROOT / "bin/openswarm"), "run", "--backend", "copilot",
                                   "--difficulty", "3", "--cwd", str(repo), "--read-only", "--no-worktree",
-                                  "--keep-worktree", "--verify", "test -f node_modules/ready && sh verify.sh", "--prompt", "review"], env=env, capture_output=True,
+                                  "--keep-worktree", "--verify", "test -f node_modules/ready && test ! -d nested && sh verify.sh", "--prompt", "review"], env=env, capture_output=True,
                                  text=True, timeout=45)
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
             result = json.loads(run.stdout)
@@ -54,6 +55,7 @@ class ReviewOneShotTests(unittest.TestCase):
             self.assertEqual(result["verify"]["rc"], 0)
             self.assertNotEqual(wt, repo)
             self.assertFalse((wt / "accidental.txt").exists())
+            self.assertFalse((wt / "nested").exists())
             self.assertFalse((repo / "accidental.txt").exists())
             self.assertEqual(git("rev-parse", "HEAD"), base)
 

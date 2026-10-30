@@ -354,8 +354,8 @@ class LaneTests(unittest.TestCase):
             "prepare_replaces_links": ["node_modules"]}}))
         base = self.git("rev-parse", "HEAD")
         self.start_lane()
-        for prompt in ("review with accidental edit", "review LANE_TEST_AGENT_COMMIT"):
-            run_id = self.assign(prompt, "--read-only", "--verify", "test -f node_modules/ready && test ! -f lane_result.txt")
+        for prompt in ("review LANE_TEST_NESTED_REPO", "review LANE_TEST_AGENT_COMMIT"):
+            run_id = self.assign(prompt, "--read-only", "--verify", "test -f node_modules/ready && test ! -f lane_result.txt && test ! -d nested")
             self.assertEqual(self.wait_run(run_id)["status"], "done")
             result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
             wt = self.data / "lanes" / self.lane_name / "wt"
