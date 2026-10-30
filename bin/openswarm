@@ -7627,7 +7627,13 @@ def lane_do_run(lane, spec, child, server, current):
                 final, usage, error_class, rc, evp, error_tail = lane_run_turn(
                     attempt_lane, child, spec, retry_prompt, ws, rdir, server, turn, pending,
                     attempt=attempt_number, continuation=continuation)
-                if error_class in (None, "rate_limit"):
+                # An upstream 403 is a completed headless request, not evidence
+                # that capacity must remain reserved forever. Stop the turn's
+                # process before returning its slot to the fleet.
+                if error_class == "upstream_forbidden" and lane["backend"] == "agy":
+                    child.close()
+                if error_class in (None, "rate_limit") or (
+                        error_class == "upstream_forbidden" and lane["backend"] == "agy" and not child.alive()):
                     release_fleet_slot(rdir)
                 elif os.path.realpath(rdir) in _FLEET_RESERVATIONS:
                     set_status(rdir, fleet_reservation_error="retained after abnormal executor exit; inspect descendants")

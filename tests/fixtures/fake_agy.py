@@ -39,6 +39,10 @@ if mode == "auth":
 if mode == "sleep":
     time.sleep(30)
     sys.exit(0)
+if mode == "forbidden":
+    send({"type": "result", "status": "ERROR", "error": 'request failed (code 403): HTML response "Error 403 (Forbidden)!!1"'})
+    time.sleep(30)  # The result may arrive before the headless process exits.
+    sys.exit(1)
 
 prompt = argv[argv.index("-p") + 1] if "-p" in argv else ""
 conversation = argv[argv.index("--conversation") + 1] if "--conversation" in argv else "conv-1"

@@ -475,6 +475,25 @@ class LaneTests(unittest.TestCase):
         self.assertEqual(calls[0][calls[0].index("--model") + 1], "gemini-3.8-flash-medium")
         self.assertEqual(calls[0][calls[0].index("--output-format") + 1], "stream-json")
 
+    def test_agy_403_stops_process_and_releases_fleet_slot(self):
+        self.set_config("agy")
+        self.env["FAKE_AGY_MODE"] = "forbidden"
+        self.env["OPENSWARM_FLEET_CAPACITY_DIR"] = str(self.root / "capacity")
+        guard = self.root / "guard.json"
+        guard.write_text(json.dumps({"command": [str(ROOT / "bin/fleet-capacity"), "gocc"]}))
+        self.env["OPENSWARM_FLEET_GUARD_CONFIG"] = str(guard)
+        self.start_lane()
+        for _ in range(2):
+            run_id = self.assign("review the fixture")
+            self.wait_run(run_id)
+            result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+            self.assertEqual(result["error_class"], "upstream_forbidden")
+            status = subprocess.run([str(ROOT / "bin/fleet-capacity"), "gocc"],
+                                    input=json.dumps({"op": "status"}), text=True,
+                                    capture_output=True, env=self.env, check=True)
+            self.assertEqual(json.loads(status.stdout)["reservations"], [])
+            self.wait_for(lambda: self.lane_state().get("state") == "idle")
+
     def test_agy_steer_aborts_the_process_and_resumes_the_conversation(self):
         self.set_config("agy")
         self.start_lane()
