@@ -63,4 +63,29 @@ class FleetAutoTests(unittest.TestCase):
         self.assertIn('--read-only', command)
         self.assertEqual(json.loads(out.getvalue())['execution_mode'], 'one-shot')
 
+    def test_lost_remote_ack_does_not_dispatch_to_next_lane(self):
+        calls = []
+        def remote(req):
+            calls.append(req['op'])
+            if req['op'] == 'lanes':
+                return [{'name': 'A1', 'state': 'idle', 'backend': 'agy', 'model': 'gemini'}]
+            raise RuntimeError('gocc dispatch gateway unavailable')
+        local = [{'name': 'K1', 'state': 'idle', 'backend': 'cursor', 'model': 'composer'}]
+        args = ['openswarm-auto', '--type', 'migration', '--difficulty', '3', '--base', 'abcdef0', '--prompt', 'task']
+        with mock.patch.object(sys, 'argv', args), mock.patch.dict(G, {'local_lanes': lambda: local, 'remote': remote}), \
+                mock.patch.object(G['subprocess'], 'run') as run, self.assertRaisesRegex(RuntimeError, 'unavailable'):
+            MOD['main']()
+        self.assertEqual(calls, ['lanes', 'assign'])
+        run.assert_not_called()
+
+    def test_lost_local_ack_does_not_try_another_lane(self):
+        lanes = [{'name': 'K1', 'state': 'idle', 'backend': 'cursor', 'model': 'composer'},
+                 {'name': 'M1', 'state': 'idle', 'backend': 'pi', 'model': 'minimax'}]
+        args = ['openswarm-auto', '--type', 'test', '--difficulty', '2', '--base', 'abcdef0', '--prompt', 'task']
+        with mock.patch.object(sys, 'argv', args), mock.patch.dict(G, {'local_lanes': lambda: lanes, 'remote': lambda req: []}), \
+                mock.patch.object(G['subprocess'], 'run', return_value=mock.Mock(stdout='', returncode=0)) as run, \
+                self.assertRaisesRegex(RuntimeError, 'acknowledgement unavailable'):
+            MOD['main']()
+        self.assertEqual(run.call_count, 1)
+
 if __name__ == '__main__': unittest.main()

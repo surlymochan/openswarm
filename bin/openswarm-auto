@@ -85,8 +85,9 @@ def main():
             if args.verify: command += ['--verify', args.verify]
             proc = subprocess.run(command, capture_output=True, text=True, timeout=30)
             try: response = json.loads(proc.stdout)
-            except ValueError: continue
-            if proc.returncode or not response.get('id'): continue
+            except ValueError: raise RuntimeError('local dispatch acknowledgement unavailable')
+            if proc.returncode or not response.get('id'):
+                raise RuntimeError('local dispatch acknowledgement unavailable')
         elif lane in ('M1','K1'):
             command = [cli,'lane','assign',lane,'--prompt',prompt,'--base',base,
                        '--budget-minutes',str(args.budget_minutes)]
@@ -95,15 +96,14 @@ def main():
             if read_only: command.append('--read-only')
             proc = subprocess.run(command, capture_output=True, text=True, timeout=30)
             try: response = json.loads(proc.stdout)
-            except ValueError: continue
-            if proc.returncode or not response.get('ok'): continue
+            except ValueError: raise RuntimeError('local dispatch acknowledgement unavailable')
+            if response.get('ok') is False: continue
+            if proc.returncode or not response.get('id'):
+                raise RuntimeError('local dispatch acknowledgement unavailable')
         else:
-            try:
-                response = remote({'op':'assign','lane':lane,'prompt':prompt,'base':base,
-                                   'title':args.title,'verify':args.verify,'budget_minutes':args.budget_minutes,
-                                   'read_only':read_only})
-            except RuntimeError:
-                continue
+            response = remote({'op':'assign','lane':lane,'prompt':prompt,'base':base,
+                               'title':args.title,'verify':args.verify,'budget_minutes':args.budget_minutes,
+                               'read_only':read_only})
         result.update({'id':response['id'], 'state':response['state']})
         print(json.dumps(result)); return
     raise RuntimeError('available lanes changed or rejected the task')
