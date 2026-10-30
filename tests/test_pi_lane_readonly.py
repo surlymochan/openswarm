@@ -69,7 +69,7 @@ for line in sys.stdin:
                 r = subprocess.run([sys.executable, str(CLI), *args], env=env, capture_output=True,
                                    text=True, timeout=30)
                 if check and r.returncode:
-                    self.fail('CLI failed: ' + r.stderr[-500:])
+                    self.fail('CLI failed: ' + r.stdout[-500:] + r.stderr[-500:])
                 return r
             try:
                 cli('lane', 'up', 'R1')
