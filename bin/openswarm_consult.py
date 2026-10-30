@@ -579,12 +579,13 @@ def consult(args, core, policy):
                                   f"{run_id}-{index + 1}")
 
     for index, profile in enumerate(profiles):
-        thread = threading.Thread(target=worker, args=(index, profile), daemon=True)
+        thread = threading.Thread(target=worker, args=(index, profile))
         threads.append(thread)
         thread.start()
-    join_deadline = deadline + 1
+    # The execution deadline bounds the model turn; wait for reservation and
+    # worktree cleanup before publishing the final result.
     for thread in threads:
-        thread.join(max(0, join_deadline - core.NOW()))
+        thread.join()
     for index, row in enumerate(answers):
         if row is None:
             profile = profiles[index]

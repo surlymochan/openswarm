@@ -195,6 +195,17 @@ class ConsultTests(unittest.TestCase):
         self.assertEqual(len(record["backends_asked"]), 3)
         self.assertFalse([name for name in os.listdir(xs.RUNS) if name.startswith("consult-slot-")])
 
+    def test_delayed_release_does_not_discard_completed_answers(self):
+        release = xs.release_fleet_slot
+        def delayed_release(path):
+            time.sleep(2)
+            return release(path)
+        with mock.patch.object(xs, "release_fleet_slot", side_effect=delayed_release):
+            code, result = self.run_consult(["codex", "agy"], deadline=0.02)
+        self.assertEqual(code, 0)
+        self.assertTrue(all(row["valid"] for row in result["answers"]))
+        self.assertFalse([name for name in os.listdir(xs.RUNS) if name.startswith("consult-slot-")])
+
     def test_early_agy_result_produces_partial_consult(self):
         os.environ['FAKE_CONSULT_AGY_EARLY'] = '1'
         code, result = self.run_consult(['codex', 'agy'])
