@@ -69,7 +69,7 @@ def main():
     read_only = args.type in ('review', 'research', 'audit', 'second-opinion')
     lanes = local_lanes()
     try: lanes += remote({'op':'lanes'})
-    except RuntimeError: pass
+    except (RuntimeError, OSError, subprocess.SubprocessError): pass
     available = {row['name']: row for row in lanes if row.get('state') == 'idle'}
     ordered = [x for x in preference(args.type,args.difficulty) if x in available]
     if not ordered:

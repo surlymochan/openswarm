@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -16,6 +17,16 @@ preference = MOD['preference']
 G = MOD['main'].__globals__
 
 class FleetAutoTests(unittest.TestCase):
+    def test_remote_discovery_timeout_keeps_local_lane_available(self):
+        args = ['openswarm-auto', '--type', 'test', '--difficulty', '2', '--base', 'abcdef0', '--prompt', 'task', '--dry-run']
+        lanes = [{'name': 'K1', 'state': 'idle', 'backend': 'cursor', 'model': 'composer'}]
+        def remote(_request):
+            raise subprocess.TimeoutExpired('ssh', 35)
+        with mock.patch.object(sys, 'argv', args), mock.patch.dict(G, {'local_lanes': lambda: lanes, 'remote': remote}), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            MOD['main']()
+        self.assertEqual(json.loads(out.getvalue())['lane'], 'K1')
+
     def test_task_profiles_cover_all_five_backends(self):
         expected = [('mechanical', 1, 'M1'), ('test', 2, 'K1'), ('impl', 2, 'GH1'),
                     ('impl', 3, 'C1'), ('impl', 4, 'GH2'), ('migration', 3, 'A1')]

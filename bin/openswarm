@@ -3544,7 +3544,7 @@ def run_executor_with_rate_limit(backend, decision, state, prompt, wd, rdir, bud
         seconds = round(NOW() - started, 3)
         error_class = executor_error_class(rc, final, err_text, backend)
         # run_proc has reaped a normal 403 or reported early-result exit.
-        if error_class in (None, "rate_limit") or (
+        if error_class in (None, "rate_limit", "risk_blocked") or (
                 backend == "agy" and rc == 1 and (error_class == "upstream_forbidden"
                                                    or (meta or {}).get("finished_reason"))):
             release_fleet_slot(rdir)
@@ -5348,6 +5348,8 @@ def invoke_reviewer(reviewer, prompt, repo, rdir, policy):
     raw_attempts = []
     slot_dir = os.path.join(RUNS, "review-slot-" + uuid.uuid4().hex)
     acquired, safe_release = False, True
+    original_repo = repo
+    review_worktree = None
 
     def output_text(value):
         if isinstance(value, bytes):
@@ -5361,6 +5363,12 @@ def invoke_reviewer(reviewer, prompt, repo, rdir, policy):
 
     try:
         with tempfile.TemporaryDirectory(prefix=".peer-review-", dir=rdir) as scratch_dir:
+            if reviewer.get("backend") == "pi":
+                review_worktree = tempfile.mkdtemp(prefix=".peer-worktree-", dir=rdir)
+                rc, _, err = git(["worktree", "add", "-q", "--detach", review_worktree, "HEAD"], repo, timeout=300)
+                if rc:
+                    raise RuntimeError(f"review worktree creation failed: {err[:250]}")
+                repo = review_worktree
             timeout = review_settings(policy).get("timeout_seconds", 900)
             if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
                 raise ValueError("review.timeout_seconds must be positive")
@@ -5417,6 +5425,9 @@ def invoke_reviewer(reviewer, prompt, repo, rdir, policy):
                     suffix = " after repair retry" if retries else ""
                     raise RuntimeError(f"reviewer returned no findings JSON{suffix}")
     finally:
+        if review_worktree:
+            git(["worktree", "remove", "--force", review_worktree], original_repo, timeout=60)
+            shutil.rmtree(review_worktree, ignore_errors=True)
         save_raw()
         if acquired and safe_release and release_fleet_slot(slot_dir):
             set_status(slot_dir, state="finished", finished=NOW())

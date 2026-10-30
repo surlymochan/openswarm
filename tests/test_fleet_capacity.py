@@ -107,6 +107,19 @@ class FleetCapacityTests(unittest.TestCase):
         self.assertEqual(xs.executor_error_class(1, None, error, 'agy'), 'upstream_forbidden')
         self.assertEqual(xs.executor_error_class(1, None, error, 'codex'), 'exec_error')
 
+    def test_reaped_stopped_runner_releases_slot(self):
+        guard = pathlib.Path(self.temp.name, 'guard.json')
+        guard.write_text(json.dumps({'command': [str(BIN), 'gocc']}))
+        env = {'OPENSWARM_FLEET_GUARD_CONFIG': str(guard), 'OPENSWARM_FLEET_CAPACITY_DIR': self.temp.name}
+        with mock.patch.dict(os.environ, env), mock.patch.dict(xs.EXECUTORS, {'pi': lambda *args: (133, None, {}, 'stopped')}):
+            rdir = pathlib.Path(self.temp.name, 'runs', 'reaped')
+            rdir.mkdir(parents=True)
+            _, _, error = xs.run_executor_with_rate_limit('pi', {'backend': 'pi', 'model': 'fake'}, {}, 'review',
+                                                          self.temp.name, str(rdir), xs.NOW() + 15,
+                                                          {'concurrency': {'total': 8}})
+            self.assertEqual(error, 'risk_blocked')
+            self.assertEqual(self.call('gocc', op='status')['reservations'], [])
+
     def test_one_shot_agy_403_releases_slot_for_next_run(self):
         guard = pathlib.Path(self.temp.name, 'guard.json')
         guard.write_text(json.dumps({'command': [str(BIN), 'gocc']}))

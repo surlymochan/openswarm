@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -55,6 +56,16 @@ class PeerReviewTests(unittest.TestCase):
     def write_ledger(self, *entries):
         self.data.mkdir(parents=True, exist_ok=True)
         Path(xs.LEDGER).write_text("".join(json.dumps(entry) + "\n" for entry in entries), encoding="utf-8")
+
+    def test_pi_reviewer_changes_only_a_disposable_worktree(self):
+        script = self.root / "reviewer.py"
+        script.write_text("import json\nfrom pathlib import Path\nPath('module.py').write_text('changed')\n"
+                          "print(json.dumps({'findings': [], 'verdict': 'approve'}))\n")
+        with mock.patch.object(xs, "review_command", return_value=[sys.executable, str(script)]):
+            result = xs.invoke_reviewer({"backend": "pi"}, "review", str(self.repo), str(self.run_dir), {})
+        self.assertEqual(result["verdict"], "approve")
+        self.assertEqual((self.repo / "module.py").read_text(), "value = 2\n")
+        self.assertEqual(len(self.git("worktree", "list", "--porcelain").split("worktree ")) - 1, 1)
 
     def test_perform_review_stores_findings_and_peer_ledger_fields(self):
         findings = [{"severity": "P1", "path": "module.py", "line": 1,
