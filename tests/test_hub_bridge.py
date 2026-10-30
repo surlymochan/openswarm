@@ -153,6 +153,14 @@ class HubBridgeTests(unittest.TestCase):
         self.assertEqual(db.execute('select count(*) from handoffs').fetchone()[0], 0)
         db.close()
 
+    def test_oversized_title_and_verify_do_not_create_a_pending_handoff(self):
+        for args in (self.args + ['--title', 'x' * 161], self.args + ['--verify', 'x' * 4097]):
+            with self.assertRaisesRegex(ValueError, 'invalid task title or verify'):
+                MOD['run_submit'](args)
+        db = MOD['db_open']()
+        self.assertEqual(db.execute('select count(*) from handoffs').fetchone()[0], 0)
+        db.close()
+
     def test_pending_reconciliation_requires_verified_terminal_run(self):
         with mock.patch.dict(G, {'gateway':mock.Mock(side_effect=RuntimeError('lost ack'))}):
             with self.assertRaisesRegex(RuntimeError,'unresolved'): MOD['run_submit'](self.args)

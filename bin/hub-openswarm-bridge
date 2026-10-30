@@ -51,6 +51,8 @@ def run_submit(args):
     parser.add_argument('--budget-minutes', type=float, required=True); parser.add_argument('--verify')
     opts = parser.parse_args(args)
     if not opts.detach: raise ValueError('Hub automatic dispatch requires detached execution')
+    if not 0 < len(opts.title) <= 160 or (opts.verify is not None and len(opts.verify) > 4096):
+        raise ValueError('invalid task title or verify command')
     cfg = json.loads(config_path.read_text())
     allowed, repo = Path(cfg['workspace']).resolve(), Path(cfg['repo']).resolve()
     if Path(opts.cwd).resolve() != allowed: raise ValueError('Hub workspace has no approved repository mapping')
