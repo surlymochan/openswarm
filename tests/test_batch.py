@@ -27,6 +27,8 @@ class FakeFleetFixture:
         self.repo = self.root / "local"
         self.repo.mkdir()
         self.git(self.repo, "init", "-q")
+        self.git(self.repo, "config", "maintenance.auto", "false")
+        self.git(self.repo, "config", "gc.auto", "0")
         (self.repo / "base").write_text("base")
         self.git(self.repo, "add", "base")
         self.git(self.repo, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "base")
@@ -36,6 +38,8 @@ class FakeFleetFixture:
             repo = self.root / name / "repo"
             repo.mkdir(parents=True)
             self.git(repo, "init", "-q")
+            self.git(repo, "config", "maintenance.auto", "false")
+            self.git(repo, "config", "gc.auto", "0")
             bundle = self.root / "initial.bundle"
             bundle.write_bytes(subprocess.check_output(["git", "-C", str(self.repo), "bundle", "create", "-", "HEAD"]))
             self.git(repo, "fetch", str(bundle), "HEAD")
