@@ -4,7 +4,10 @@ import runpy
 import contextlib
 import io
 import json
+import socket
 import sys
+import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -120,6 +123,37 @@ class FleetAutoTests(unittest.TestCase):
         reply = mock.Mock(returncode=1, stdout=json.dumps({'ok':False, 'error':'lane closed control socket'}))
         with mock.patch.object(sys, 'argv', args), mock.patch.dict(G, {'local_lanes':lambda: local, 'remote':lambda req: []}), \
              mock.patch.object(G['subprocess'], 'run', return_value=reply) as run, \
+             self.assertRaisesRegex(RuntimeError, 'acknowledgement unavailable'):
+            MOD['main']()
+        self.assertEqual(run.call_count, 1)
+
+    def test_real_lane_socket_close_keeps_dispatch_uncertain(self):
+        lane = runpy.run_path(str(pathlib.Path(__file__).resolve().parents[1] / 'bin' / 'openswarm'))
+        with tempfile.TemporaryDirectory(prefix='ack-', dir='/tmp') as directory:
+            sockpath = str(pathlib.Path(directory) / 'lane.sock')
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(sockpath)
+            listener.listen(1)
+            received = []
+            def accept_without_reply():
+                connection, _ = listener.accept()
+                with connection:
+                    received.append(json.loads(connection.recv(65536)))
+                listener.close()
+            thread = threading.Thread(target=accept_without_reply)
+            thread.start()
+            with mock.patch.dict(lane['lane_call'].__globals__, {'lane_socket_path':lambda _: sockpath}):
+                reply = lane['lane_call']('K1', {'op':'assign', 'run_id':'real-socket-test'})
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(received[0]['run_id'], 'real-socket-test')
+        self.assertEqual(reply, {'ok':False, 'error':'lane closed control socket'})
+        local = [{'name':'K1','state':'idle','backend':'cursor','model':'composer'},
+                 {'name':'M1','state':'idle','backend':'pi','model':'minimax'}]
+        args = ['openswarm-auto','--type','test','--difficulty','2','--base','abcdef0','--prompt','task']
+        result = mock.Mock(returncode=1, stdout=json.dumps(reply))
+        with mock.patch.object(sys, 'argv', args), mock.patch.dict(G, {'local_lanes':lambda: local, 'remote':lambda req: []}), \
+             mock.patch.object(G['subprocess'], 'run', return_value=result) as run, \
              self.assertRaisesRegex(RuntimeError, 'acknowledgement unavailable'):
             MOD['main']()
         self.assertEqual(run.call_count, 1)
