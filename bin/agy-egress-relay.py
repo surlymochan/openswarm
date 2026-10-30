@@ -6,10 +6,16 @@ import hmac
 import select
 import socket
 import socketserver
+import ssl
 import threading
 
 
 class Relay(socketserver.BaseRequestHandler):
+    def setup(self):
+        if self.server.tls_context:
+            self.request.settimeout(10)
+            self.request = self.server.tls_context.wrap_socket(self.request, server_side=True)
+
     def handle(self):
         self.request.settimeout(10)
         data = b""
@@ -59,9 +65,10 @@ class Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, address, handler, token, limit=24, idle_timeout=900):
+    def __init__(self, address, handler, token, limit=24, idle_timeout=900, tls_context=None):
         self.token = token
         self.idle_timeout = idle_timeout
+        self.tls_context = tls_context
         self.capacity = threading.BoundedSemaphore(limit)
         super().__init__(address, handler)
 
@@ -86,6 +93,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=18743)
     parser.add_argument("--token-file", required=True)
+    parser.add_argument("--cert-file", required=True)
+    parser.add_argument("--key-file", required=True)
     parser.add_argument("--idle-timeout", type=int, default=900,
                         help="maximum idle tunnel seconds (default: 900)")
     args = parser.parse_args()
@@ -95,6 +104,9 @@ if __name__ == "__main__":
         token = token_file.read().strip()
     if not token:
         parser.error("token file is empty")
-    with Server(("127.0.0.1", args.port), Relay, token, idle_timeout=args.idle_timeout) as server:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(args.cert_file, args.key_file)
+    with Server(("127.0.0.1", args.port), Relay, token, idle_timeout=args.idle_timeout,
+                tls_context=context) as server:
         print("Antigravity relay listening on loopback port %d" % server.server_address[1], flush=True)
         server.serve_forever()

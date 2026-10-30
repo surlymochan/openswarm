@@ -3,6 +3,7 @@ import importlib.util
 import os
 import pathlib
 import socket
+import ssl
 import subprocess
 import tempfile
 import threading
@@ -16,6 +17,56 @@ RELAY = WRAPPER.with_name("agy-egress-relay.py")
 
 
 class AgyRelayTests(unittest.TestCase):
+    def test_untrusted_proxy_cannot_receive_credentials(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = pathlib.Path(root)
+            config = directory / "openssl.cnf"
+            config.write_text("[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n"
+                              "[dn]\nCN=127.0.0.1\n[ext]\nsubjectAltName=IP:127.0.0.1\n")
+            for name in ("trusted", "attacker"):
+                subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                                "-keyout", str(directory / (name + ".key")), "-out",
+                                str(directory / (name + ".crt")), "-days", "1", "-config", str(config)],
+                               check=True, capture_output=True)
+            token = directory / "token"
+            token.write_text("synthetic-secret")
+            agent = directory / "agent"
+            agent.write_text('#!/bin/sh\n[ "$HTTPS_PROXY" = "http://inherited:9999" ]\n')
+            agent.chmod(0o700)
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(str(directory / "attacker.crt"), str(directory / "attacker.key"))
+            listener = socket.socket()
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            listener.settimeout(5)
+            received = []
+            def fake_proxy():
+                try:
+                    client, _ = listener.accept()
+                    client.settimeout(5)
+                    try:
+                        with context.wrap_socket(client, server_side=True) as tls:
+                            received.append(tls.recv(4096))
+                    except ssl.SSLError:
+                        received.append(b"")
+                except OSError:
+                    pass
+            worker = threading.Thread(target=fake_proxy, daemon=True)
+            worker.start()
+            try:
+                env = dict(os.environ, HTTPS_PROXY="http://inherited:9999",
+                           OPENSWARM_AGY_REAL_BIN=str(agent), OPENSWARM_AGY_RELAY_TOKEN_FILE=str(token),
+                           OPENSWARM_AGY_RELAY_CERT_FILE=str(directory / "trusted.crt"),
+                           OPENSWARM_AGY_RELAY_CA_BUNDLE=str(directory / "trusted.crt"),
+                           OPENSWARM_AGY_RELAY_PORT=str(listener.getsockname()[1]))
+                result = subprocess.run([str(WRAPPER)], env=env, capture_output=True, text=True, timeout=10)
+                worker.join(timeout=6)
+                self.assertEqual(result.returncode, 0)
+                self.assertIn("relay unavailable", result.stderr)
+                self.assertEqual(received, [b""])
+            finally:
+                listener.close()
+
     def test_delayed_response_survives_idle_period(self):
         spec = importlib.util.spec_from_file_location("agy_egress_delay", RELAY)
         relay = importlib.util.module_from_spec(spec)
@@ -87,11 +138,15 @@ class AgyRelayTests(unittest.TestCase):
             agent = directory / "agent"
             token_file = directory / "token"
             token_file.write_text("synthetic-token")
+            cert_file = directory / "cert.pem"
+            cert_file.write_text("synthetic-certificate")
             agent.write_text('#!/bin/sh\nprintf "{\\"proxy\\":\\"%s\\"}\\n" "$HTTPS_PROXY"\n')
             agent.chmod(0o755)
             env = dict(os.environ, PATH=root, OPENSWARM_AGY_REAL_BIN=str(agent),
-                       OPENSWARM_AGY_RELAY_TOKEN_FILE=str(token_file), HTTPS_PROXY="http://inherited:9999")
-            for available, expected in ((True, "http://openbot:synthetic-token@127.0.0.1:18744"),
+                       OPENSWARM_AGY_RELAY_TOKEN_FILE=str(token_file),
+                       OPENSWARM_AGY_RELAY_CERT_FILE=str(cert_file),
+                       OPENSWARM_AGY_RELAY_CA_BUNDLE=str(cert_file), HTTPS_PROXY="http://inherited:9999")
+            for available, expected in ((True, "https://openbot:synthetic-token@127.0.0.1:18744"),
                                         (False, "http://inherited:9999")):
                 probe.write_text("#!/bin/sh\nexit %d\n" % (0 if available else 1))
                 probe.chmod(0o755)
