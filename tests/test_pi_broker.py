@@ -90,12 +90,15 @@ https.request = (_options, callback) => {
             path = os.path.join(root, 'broker.sock')
             env = dict(os.environ, NODE_OPTIONS='--require=' + str(preload))
             proc = subprocess.Popen(['node', str(BROKER), path, str(module), 'allowed-model'],
-                                    env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                    env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             try:
                 deadline = time.monotonic() + 5
                 while not os.path.exists(path) and proc.poll() is None and time.monotonic() < deadline:
                     time.sleep(0.02)
-                self.assertTrue(os.path.exists(path))
+                if not os.path.exists(path):
+                    status = proc.poll()
+                    detail = proc.stderr.read().decode(errors='replace') if status is not None else 'still running after 5 seconds'
+                    self.fail('broker did not create its socket (exit=%s): %s' % (status, detail))
                 client = UnixHTTP(path)
                 client.request('POST', '/v1/messages?beta=true', json.dumps({'model': 'allowed-model', 'messages': []}))
                 response = client.getresponse()
@@ -116,6 +119,7 @@ https.request = (_options, callback) => {
             finally:
                 proc.terminate()
                 proc.wait(timeout=5)
+                proc.stderr.close()
 
     def test_rejects_other_paths_and_models(self):
         with tempfile.TemporaryDirectory() as root:
