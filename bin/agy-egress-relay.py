@@ -43,7 +43,7 @@ class Relay(socketserver.BaseRequestHandler):
                 self.request.settimeout(None)
                 upstream.settimeout(None)
                 while True:
-                    ready, _, _ = select.select([self.request, upstream], [], [], 60)
+                    ready, _, _ = select.select([self.request, upstream], [], [], self.server.idle_timeout)
                     if not ready:
                         return
                     for source in ready:
@@ -59,8 +59,9 @@ class Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, address, handler, token, limit=24):
+    def __init__(self, address, handler, token, limit=24, idle_timeout=900):
         self.token = token
+        self.idle_timeout = idle_timeout
         self.capacity = threading.BoundedSemaphore(limit)
         super().__init__(address, handler)
 
@@ -85,11 +86,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=18743)
     parser.add_argument("--token-file", required=True)
+    parser.add_argument("--idle-timeout", type=int, default=900,
+                        help="maximum idle tunnel seconds (default: 900)")
     args = parser.parse_args()
+    if args.idle_timeout <= 0:
+        parser.error("idle timeout must be positive")
     with open(args.token_file, "rb") as token_file:
         token = token_file.read().strip()
     if not token:
         parser.error("token file is empty")
-    with Server(("127.0.0.1", args.port), Relay, token) as server:
+    with Server(("127.0.0.1", args.port), Relay, token, idle_timeout=args.idle_timeout) as server:
         print("Antigravity relay listening on loopback port %d" % server.server_address[1], flush=True)
         server.serve_forever()

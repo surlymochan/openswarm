@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 
 WRAPPER = pathlib.Path(__file__).resolve().parents[1] / "bin" / "agy-via-relay"
@@ -15,6 +16,33 @@ RELAY = WRAPPER.with_name("agy-egress-relay.py")
 
 
 class AgyRelayTests(unittest.TestCase):
+    def test_delayed_response_survives_idle_period(self):
+        spec = importlib.util.spec_from_file_location("agy_egress_delay", RELAY)
+        relay = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(relay)
+        with relay.Server(("127.0.0.1", 0), relay.Relay, b"synthetic-token") as defaults:
+            self.assertGreaterEqual(defaults.idle_timeout, 900)
+        upstream, peer = socket.socketpair()
+        server = relay.Server(("127.0.0.1", 0), relay.Relay, b"synthetic-token", idle_timeout=1)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            with mock.patch.object(relay.socket, "create_connection", return_value=upstream):
+                with socket.socket() as client:
+                    client.settimeout(2)
+                    client.connect(server.server_address)
+                    client.sendall(b"CONNECT www.googleapis.com:443 HTTP/1.1\r\n"
+                                   b"Proxy-Authorization: Basic b3BlbmJvdDpzeW50aGV0aWMtdG9rZW4=\r\n\r\n")
+                    self.assertIn(b"200", client.recv(1024))
+                    time.sleep(0.2)
+                    peer.sendall(b"delayed response")
+                    self.assertEqual(client.recv(1024), b"delayed response")
+        finally:
+            peer.close()
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=3)
+
     def test_authentication_and_connection_bound(self):
         spec = importlib.util.spec_from_file_location("agy_egress_relay", RELAY)
         relay = importlib.util.module_from_spec(spec)
