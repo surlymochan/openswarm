@@ -105,7 +105,10 @@ def main():
             proc = subprocess.run(command, capture_output=True, text=True, timeout=30)
             try: response = json.loads(proc.stdout)
             except ValueError: raise RuntimeError('local dispatch acknowledgement unavailable')
-            if response.get('ok') is False: continue
+            if response.get('ok') is False:
+                if response.get('error') == f'lane {lane} is busy (busy)':
+                    continue
+                raise RuntimeError('local dispatch acknowledgement unavailable')
             if proc.returncode or not response.get('id'):
                 raise RuntimeError('local dispatch acknowledgement unavailable')
         else:
