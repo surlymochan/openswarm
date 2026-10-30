@@ -242,7 +242,7 @@ class LaneTests(unittest.TestCase):
         (self.data / "policy.local.json").write_text(json.dumps({"concurrency": {"fake-provider": 1}}))
         self.cli("lane", "up", "L1")
         self.cli("lane", "up", "L2")
-        first = self.assign("LANE_TEST_WAIT_SHORT first provider task")
+        first = self.assign("LANE_TEST_WAIT first provider task")
         self.wait_running(first)
         second = json.loads(self.cli("lane", "assign", "L2", "--prompt", "second provider task").stdout)["id"]
         queued = self.wait_for(lambda: (state if (state := self.run_state(second)).get("queue_reason") else None),
@@ -250,6 +250,7 @@ class LaneTests(unittest.TestCase):
         self.assertEqual(queued["queue_reason"], "provider concurrency limit")
         lanes = {row["name"]: row for row in json.loads(self.cli("lane", "status").stdout)}
         self.assertEqual(lanes["L2"]["run_state"], "queued")
+        self.cli("lane", "steer", "L1", "--text", "finish first provider task")
         self.assertEqual(self.wait_run(first)["status"], "done")
         self.assertEqual(self.wait_run(second)["status"], "done")
 
@@ -265,12 +266,13 @@ class LaneTests(unittest.TestCase):
         (self.data / "policy.local.json").write_text(json.dumps({"concurrency": {"total": 1}}))
         self.cli("lane", "up", "L1")
         self.cli("lane", "up", "L2")
-        first = self.assign("LANE_TEST_WAIT_SHORT first total-cap task")
+        first = self.assign("LANE_TEST_WAIT first total-cap task")
         self.wait_running(first)
         second = json.loads(self.cli("lane", "assign", "L2", "--prompt", "second backend task").stdout)["id"]
         queued = self.wait_for(lambda: (state if (state := self.run_state(second)).get("queue_reason") else None),
                                description="second backend turn to queue on total cap")
         self.assertEqual(queued["queue_reason"], "provider concurrency limit")
+        self.cli("lane", "steer", "L1", "--text", "finish first total-cap task")
         self.assertEqual(self.wait_run(first)["status"], "done")
         self.assertEqual(self.wait_run(second)["status"], "done")
 
