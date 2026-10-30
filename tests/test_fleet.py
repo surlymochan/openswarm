@@ -87,6 +87,15 @@ class FleetTests(unittest.TestCase):
         self.assertIn("invalid lane config", snapshot["lane_config_error"])
         self.assertIn("lanes.json", snapshot["lane_config_error"])
 
+    def test_capacity_snapshot_skips_model_probe_but_keeps_capacity_fields(self):
+        with mock.patch.dict(os.environ, {"OPENSWARM_FLEET_CAPACITY_ONLY": "1"}), \
+                mock.patch.object(xs, "agy_status") as status:
+            snapshot = xs.fleet_snapshot()
+        status.assert_not_called()
+        self.assertIn("active_runs", snapshot)
+        self.assertIn("providers", snapshot)
+        self.assertEqual(snapshot["backends"], {})
+
     def test_text_status_shows_config_invalid_with_reason(self):
         self.config([{"name": "host", "kind": "local"}])
         output = io.StringIO()

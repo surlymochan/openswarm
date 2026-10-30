@@ -8680,8 +8680,11 @@ def host_openswarm(host, args):
     return shell_path(binary) + " " + shlex.join([str(arg) for arg in args])
 
 
-def host_json(host, args, timeout=60):
-    rc, out, _ = host_run(host, host_openswarm(host, args), timeout=timeout)
+def host_json(host, args, timeout=60, capacity_only=False):
+    command = host_openswarm(host, args)
+    if capacity_only:
+        command = "OPENSWARM_FLEET_CAPACITY_ONLY=1 " + command
+    rc, out, _ = host_run(host, command, timeout=timeout)
     if rc:
         raise RuntimeError(f"{host['name']}: openswarm command failed (rc={rc})")
     try:
@@ -8789,8 +8792,9 @@ def fleet_snapshot():
     policy = load_policy()
     providers = {backend: execution_provider(backend, policy=policy)
                  for backend in ("codex", "cursor", "agy", "pi", "ocgo", "deepseek")}
+    backends = {} if os.environ.get("OPENSWARM_FLEET_CAPACITY_ONLY") == "1" else {"agy": agy_status(policy)}
     return {"lanes": lanes, "active_runs": runs, "providers": providers,
-            "backends": {"agy": agy_status(policy)}, "lane_config_valid": config_error is None,
+            "backends": backends, "lane_config_valid": config_error is None,
             "lane_config_error": config_error}
 
 
@@ -8944,7 +8948,7 @@ def batch_provider_slot_available(spec, row):
             "running", "ready", "active"):
         return False
     try:
-        target_snapshot = host_json(target_host, ["fleet", "_snapshot"], timeout=20)
+        target_snapshot = host_json(target_host, ["fleet", "_snapshot"], timeout=20, capacity_only=True)
     except RuntimeError:
         return False
     provider = ((target_snapshot.get("providers") or {}).get(spec["backend"])) or spec.get("provider")
@@ -8960,7 +8964,7 @@ def batch_provider_slot_available(spec, row):
                 "running", "ready", "active"):
             continue
         try:
-            snapshots[name] = host_json(host, ["fleet", "_snapshot"], timeout=20)
+            snapshots[name] = host_json(host, ["fleet", "_snapshot"], timeout=20, capacity_only=True)
         except RuntimeError:
             # An unreachable host may still hold a slot; fail closed for configured fleet-wide caps.
             return False
