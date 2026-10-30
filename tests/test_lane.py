@@ -475,6 +475,16 @@ class LaneTests(unittest.TestCase):
         self.assertEqual(calls[0][calls[0].index("--model") + 1], "gemini-3.8-flash-medium")
         self.assertEqual(calls[0][calls[0].index("--output-format") + 1], "stream-json")
 
+    def test_agy_running_status_records_live_executor_pid(self):
+        self.set_config("agy")
+        self.start_lane()
+        run_id = self.assign("LANE_TEST_WAIT inspect pid")
+        pid = self.wait_for(lambda: self.run_state(run_id).get("executor_pid"),
+                            description="headless executor pid")
+        self.assertTrue(process_alive(pid))
+        self.cli("lane", "abort", self.lane_name)
+        self.wait_run(run_id)
+
     def test_agy_403_stops_process_and_releases_fleet_slot(self):
         self.set_config("agy")
         self.env["FAKE_AGY_MODE"] = "forbidden"

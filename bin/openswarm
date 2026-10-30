@@ -7196,6 +7196,8 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
         lane_continue_turn(lane, child, prompt, event_file, turn)
     else:
         lane_begin_turn(lane, child, prompt, ws["path"], event_file, turn)
+    if lane_headless(lane):
+        set_status(rdir, executor_pid=child.pid)
     while pending:
         kind, value = pending.pop(0)
         if kind == "steer":
@@ -7230,6 +7232,7 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
                     "Correction to the interrupted task: apply this update while continuing the task.\n\n"
                     + correction + "\n\n" + REPORT_INSTRUCTION,
                     model=lane["model"], effort=lane.get("effort"), conversation=turn.get("conversation_id"))
+        set_status(rdir, executor_pid=child.pid)
         turn["id"] = "agy-" + uuid.uuid4().hex
         return True
 
