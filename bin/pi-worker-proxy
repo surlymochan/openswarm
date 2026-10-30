@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Relay a private Unix socket to the forced-command SSH broker."""
+import os
+import pathlib
+import selectors
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import threading
+
+path = pathlib.Path(os.environ.get('OPENSWARM_PI_WORKER_SOCKET', '/run/openswarm-pi/broker.sock'))
+config = pathlib.Path.home() / '.ssh' / 'openswarm-pi' / 'config'
+if not path.parent.is_dir() or not config.is_file():
+    sys.exit('worker proxy configuration unavailable')
+if path.exists() or path.is_symlink():
+    info = path.lstat()
+    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+        sys.exit('invalid worker socket')
+    probe = socket.socket(socket.AF_UNIX)
+    try:
+        probe.settimeout(1)
+        probe.connect(str(path))
+    except ConnectionRefusedError:
+        path.unlink()
+    else:
+        sys.exit('worker proxy already running')
+    finally:
+        probe.close()
+server = socket.socket(socket.AF_UNIX)
+server.bind(str(path))
+os.chmod(path, 0o600)
+server.listen(16)
+server.settimeout(1)
+stopping = threading.Event()
+children = set()
+lock = threading.Lock()
+
+
+def serve(client):
+    proc = None
+    try:
+        proc = subprocess.Popen(['ssh', '-F', str(config), '-T', 'openswarm-pi-broker'],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                start_new_session=True, bufsize=0)
+        with lock:
+            children.add(proc)
+        selector = selectors.DefaultSelector()
+        selector.register(client, selectors.EVENT_READ, 'client')
+        selector.register(proc.stdout, selectors.EVENT_READ, 'ssh')
+        while not stopping.is_set():
+            events = selector.select(timeout=1)
+            if not events and proc.poll() is not None:
+                break
+            for key, _ in events:
+                if key.data == 'client':
+                    data = client.recv(65536)
+                    if not data:
+                        selector.unregister(client)
+                        proc.stdin.close()
+                    else:
+                        pos = 0
+                        while pos < len(data):
+                            pos += os.write(proc.stdin.fileno(), data[pos:])
+                else:
+                    data = os.read(proc.stdout.fileno(), 65536)
+                    if not data:
+                        return
+                    client.sendall(data)
+    except (OSError, ValueError):
+        pass
+    finally:
+        client.close()
+        if proc:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            with lock:
+                children.discard(proc)
+
+
+def stop(_sig, _frame):
+    stopping.set()
+
+
+for sig in (signal.SIGTERM, signal.SIGINT):
+    signal.signal(sig, stop)
+try:
+    while not stopping.is_set():
+        try:
+            client, _ = server.accept()
+        except socket.timeout:
+            continue
+        threading.Thread(target=serve, args=(client,), daemon=True).start()
+finally:
+    server.close()
+    with lock:
+        for child in children:
+            if child.poll() is None:
+                child.terminate()
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass

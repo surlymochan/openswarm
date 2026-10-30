@@ -84,11 +84,16 @@ fi
             if os.path.isdir(path) and os.path.commonpath([deps_root, os.path.realpath(path)]) == deps_root:
                 cmd += ['--ro-bind', path, path]
     node = shutil.which('node')
-    node_path = '/usr/bin:/bin'
+    path = '/usr/bin:/bin'
     if node:
         cmd += ['--ro-bind', os.path.realpath(node), '/node/bin/node']
-        node_path = '/node/bin:' + node_path
-    cmd += ['--bind', worktree, worktree, '--chdir', cwd, '--clearenv', '--setenv', 'HOME', '/home/pi',
-           '--setenv', 'PATH', node_path, '--setenv', 'GIT_OPTIONAL_LOCKS', '0', '--setenv', 'PI_CODING_AGENT_DIR', '/tmp/agent',
-           '/usr/bin/sh', '-c', script, 'pi-isolated', args.mode, model, args.tools, args.prompt or '']
+        path = '/node/bin:' + path
+    bun = os.environ.get('OPENSWARM_PI_BUN_RUNTIME')
+    if bun and os.path.isfile(os.path.join(bun, 'node_modules/.bin/bun')):
+        cmd += ['--ro-bind', os.path.realpath(bun), '/bun']
+        path = '/bun/node_modules/.bin:' + path
+    cmd += ['--bind', worktree, worktree, '--chdir', cwd,
+            '--clearenv', '--setenv', 'HOME', '/home/pi', '--setenv', 'PATH', path,
+            '--setenv', 'GIT_OPTIONAL_LOCKS', '0', '--setenv', 'PI_CODING_AGENT_DIR', '/tmp/agent',
+            '/usr/bin/sh', '-c', script, 'pi-isolated', args.mode, model, args.tools, args.prompt or '']
     sys.exit(subprocess.call(cmd))
