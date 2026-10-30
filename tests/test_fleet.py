@@ -96,6 +96,19 @@ class FleetTests(unittest.TestCase):
         self.assertIn("providers", snapshot)
         self.assertEqual(snapshot["backends"], {})
 
+    def test_capacity_snapshot_skips_completed_run_logs(self):
+        runs = self.root / "runs"
+        for name, state in (("done", "finished"), ("active", "running")):
+            directory = runs / name
+            directory.mkdir(parents=True)
+            (directory / "status.json").write_text(json.dumps({"state": state}))
+        with mock.patch.dict(os.environ, {"OPENSWARM_FLEET_CAPACITY_ONLY": "1"}), \
+                mock.patch.object(xs, "RUNS", str(runs)), \
+                mock.patch.object(xs, "run_digest", side_effect=lambda rid: {"id": rid, "state": "running"}) as digest:
+            snapshot = xs.fleet_snapshot()
+        digest.assert_called_once_with("active")
+        self.assertEqual([row["id"] for row in snapshot["active_runs"]], ["active"])
+
     def test_text_status_shows_config_invalid_with_reason(self):
         self.config([{"name": "host", "kind": "local"}])
         output = io.StringIO()

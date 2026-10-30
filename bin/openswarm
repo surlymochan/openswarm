@@ -8779,6 +8779,7 @@ def instabox_states(hosts):
 
 
 def fleet_snapshot():
+    capacity_only = os.environ.get("OPENSWARM_FLEET_CAPACITY_ONLY") == "1"
     config_error = None
     try:
         lanes = lane_status_rows() if os.path.exists(envvar("LANES_FILE", os.path.join(DATA, "lanes.json"))) else []
@@ -8786,13 +8787,15 @@ def fleet_snapshot():
         lanes, config_error = [], str(error)
     runs = []
     for path in sorted(glob.glob(os.path.join(RUNS, "*", "status.json"))):
+        if capacity_only and (jload(path, {}) or {}).get("state") in ("finished", "unroutable", "dry-run"):
+            continue
         row = run_digest(os.path.basename(os.path.dirname(path)))
         if row["state"] not in ("finished", "unroutable", "dry-run", "dead"):
             runs.append(row)
     policy = load_policy()
     providers = {backend: execution_provider(backend, policy=policy)
                  for backend in ("codex", "cursor", "agy", "pi", "ocgo", "deepseek")}
-    backends = {} if os.environ.get("OPENSWARM_FLEET_CAPACITY_ONLY") == "1" else {"agy": agy_status(policy)}
+    backends = {} if capacity_only else {"agy": agy_status(policy)}
     return {"lanes": lanes, "active_runs": runs, "providers": providers,
             "backends": backends, "lane_config_valid": config_error is None,
             "lane_config_error": config_error}
