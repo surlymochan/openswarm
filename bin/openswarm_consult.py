@@ -8,6 +8,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -24,7 +25,7 @@ CONSULT_SCHEMA = {
     },
 }
 READ_ONLY_PI_TOOLS = "read,grep,find,ls"
-SUPPORTED_BACKENDS = {"codex", "agy", "pi"}
+SUPPORTED_BACKENDS = {"codex", "agy", "pi", "copilot"}
 
 
 def backend_family(backend, model=None, provider=None):
@@ -49,7 +50,7 @@ def parse_ask(value):
     backend, sep, model = value.partition(":")
     backend = backend.strip().lower()
     if backend not in SUPPORTED_BACKENDS:
-        raise ValueError(f"unsupported consult backend {backend!r}; choose codex, agy, or pi")
+        raise ValueError(f"unsupported consult backend {backend!r}; choose codex, agy, pi, or copilot")
     model = model.strip() if sep else None
     if sep and not model:
         raise ValueError(f"empty model in --ask {value!r}")
@@ -88,6 +89,9 @@ def _profile(core, state, policy, backend, requested_model=None, lane=None):
     provider = (lane or {}).get("provider") or (policy.get(backend) or {}).get("provider")
     model = _model(core, state, policy, backend, requested_model, lane)
     binary = _binary(core, state, backend, lane)
+    if backend == "copilot" and sys.platform == "darwin":
+        gui = os.path.join(os.path.dirname(os.path.realpath(core.__file__)), "copilot-gui-run")
+        binary = gui if os.access(gui, os.X_OK) else None
     if backend == "pi" and (policy.get("pi") or {}).get("require_isolation", True):
         binary = core.pi_bin()
         expected = os.path.join(os.path.dirname(os.path.realpath(core.__file__)), "pi-isolated")
@@ -101,9 +105,20 @@ def _profile(core, state, policy, backend, requested_model=None, lane=None):
 
 def default_profiles(core, state, policy):
     candidates = []
-    for backend in ("codex", "agy", "pi"):
-        profile = _profile(core, state, policy, backend)
+    try:
+        rows = core.lane_status_rows()
+        lanes = core.lane_config()
+    except (OSError, ValueError):
+        rows, lanes = [], []
+    unavailable = {(row.get("backend"), row.get("model")) for row in rows if row.get("state") == "quota_exhausted"}
+    copilot_lane = next((lane for lane in lanes if lane.get("name") == "GH1" and lane.get("backend") == "copilot"), None)
+    for backend in ("codex", "agy", "copilot", "pi"):
+        if backend == "copilot" and not copilot_lane:
+            continue
+        profile = _profile(core, state, policy, backend, lane=copilot_lane if backend == "copilot" else None)
         if not profile["binary"]:
+            continue
+        if (backend, profile["model"]) in unavailable:
             continue
         if backend == "agy" and (state.get("agy") or {}).get("login") == "not logged in":
             continue
@@ -157,6 +172,12 @@ def build_command(profile, prompt, run_dir):
             command += ["--model", model]
         command += ["--mode", "plan", "--output-format", "json", "--json-schema", schema_path]
         return command
+    if backend == "copilot":
+        command = [binary, "-p", prompt, "--model", model, "--output-format", "json", "--sandbox",
+                   "--assisted-approval", "--no-ask-user", "--disable-builtin-mcps", "--available-tools=view"]
+        if profile.get("effort"):
+            command += ["--reasoning-effort", profile["effort"]]
+        return command
     if backend == "pi":
         session_dir = os.path.join(run_dir, "pi-session")
         os.makedirs(session_dir, exist_ok=True)
@@ -198,6 +219,18 @@ def _response_text(backend, stdout, output_path=None):
                 responses.append(response if isinstance(response, str) else json.dumps(response, ensure_ascii=False))
         if responses:
             return responses[-1]
+    elif backend == "copilot":
+        messages = []
+        for line in stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            data = event.get("data") if isinstance(event, dict) else None
+            if isinstance(event, dict) and event.get("type") == "assistant.message" and isinstance(data, dict) and isinstance(data.get("content"), str):
+                messages.append(data["content"])
+        if messages:
+            return messages[-1]
     elif backend == "pi":
         responses = []
         for line in stdout.splitlines():
@@ -316,6 +349,9 @@ def _ask_one(core, profile, prompt, run_dir, deadline, policy, reservation_id):
     provider = profile.get("provider") or core.execution_provider(profile["backend"], policy=policy)
     acquired = False
     process = None
+    worktree = None
+    worktree_parent = None
+    worktree_repo = None
     try:
         acquired = core.reserve_provider_slot(slot_dir, profile["backend"], provider, policy,
                                               keep_waiting=lambda: core.NOW() < deadline)
@@ -323,6 +359,15 @@ def _ask_one(core, profile, prompt, run_dir, deadline, policy, reservation_id):
             row["error"] = "deadline exceeded while waiting for a concurrency slot"
             return row
         os.makedirs(run_dir, exist_ok=True)
+        if profile["backend"] == "copilot":
+            worktree_repo = profile["cwd"]
+            worktree_parent = tempfile.mkdtemp(prefix="consult-worktree-")
+            worktree = os.path.join(worktree_parent, "worktree")
+            prepared = subprocess.run(["git", "-C", worktree_repo, "worktree", "add", "--detach", worktree, "HEAD"],
+                                      capture_output=True, text=True, timeout=30)
+            if prepared.returncode:
+                raise RuntimeError("could not create independent consult worktree")
+            profile = dict(profile, cwd=worktree)
         raw_attempts = []
         active_prompt = prompt
         for attempt in (1, 2):
@@ -360,6 +405,18 @@ def _ask_one(core, profile, prompt, run_dir, deadline, policy, reservation_id):
                                 + (f"\n[stderr]\n{stderr}" if stderr else ""))
             row["raw"] = "\n\n".join(raw_attempts)
             execution_error = (_agy_execution_error(raw, stderr) if profile["backend"] == "agy" else None)
+            if profile["backend"] == "copilot":
+                events = []
+                for line in stdout.splitlines():
+                    try:
+                        event = json.loads(line)
+                        if isinstance(event, dict):
+                            events.append(event)
+                    except ValueError:
+                        pass
+                results = [event for event in events if event.get("type") == "result"]
+                if process.returncode or not results or results[-1].get("exitCode") != 0 or any(event.get("type") == "session.error" for event in events):
+                    execution_error = "Copilot execution did not complete successfully"
             if execution_error:
                 row["error"] = execution_error
                 if stderr.strip():
@@ -396,6 +453,19 @@ def _ask_one(core, profile, prompt, run_dir, deadline, policy, reservation_id):
             except Exception:
                 pass
         import shutil
+        stopped = process is None or process.poll() is not None
+        if worktree and worktree_repo and stopped and os.path.isdir(worktree):
+            status = subprocess.run(["git", "-C", worktree, "status", "--porcelain"],
+                                    capture_output=True, text=True, timeout=30)
+            row["worktree_changes_detected"] = bool(status.stdout) if status.returncode == 0 else None
+            removed = subprocess.run(["git", "-C", worktree_repo, "worktree", "remove", "--force", worktree],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+            if removed.returncode:
+                row.update(valid=False, error="could not remove consult worktree; manual cleanup required")
+            elif worktree_parent:
+                shutil.rmtree(worktree_parent, ignore_errors=True)
+        elif worktree_parent and stopped and not os.path.exists(worktree or ""):
+            shutil.rmtree(worktree_parent, ignore_errors=True)
         if not acquired or (process is None or process.poll() is not None) and os.path.realpath(slot_dir) not in core._FLEET_RESERVATIONS:
             shutil.rmtree(slot_dir, ignore_errors=True)
 
@@ -437,7 +507,14 @@ def _profiles(args, core, policy, state):
         profiles = []
         for value in args.ask:
             requested = parse_ask(value)
-            profiles.append(_profile(core, state, policy, requested["backend"], requested["model"]))
+            lane = None
+            if requested["backend"] == "copilot":
+                lanes = [item for item in core.lane_config() if item.get("backend") == "copilot"]
+                lane = next((item for item in lanes if requested["model"] and item.get("model") == requested["model"]), None)
+                lane = lane or next((item for item in lanes if item.get("name") == "GH1"), None)
+                if not lane:
+                    raise ValueError("no Copilot consult lane is configured")
+            profiles.append(_profile(core, state, policy, requested["backend"], requested["model"], lane=lane))
         if len(profiles) < 2:
             raise ValueError("consult requires at least two --ask executors")
         return profiles

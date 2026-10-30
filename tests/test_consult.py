@@ -42,7 +42,7 @@ class ConsultComparisonTest(unittest.TestCase):
 FAKE = r"""#!/usr/bin/env python3
 import json, os, sys, time
 argv = sys.argv[1:]
-backend = "codex" if argv[:1] == ["exec"] else ("agy" if "--output-format" in argv else "pi")
+backend = "copilot" if "--available-tools=view" in argv else ("codex" if argv[:1] == ["exec"] else ("agy" if "--output-format" in argv else "pi"))
 log_dir = os.environ["FAKE_CONSULT_LOG_DIR"]
 with open(os.path.join(log_dir, backend + ".json"), "w") as stream:
     # On macOS Python 3.9, monotonic() has a process-local origin; these
@@ -71,6 +71,11 @@ if backend == "codex":
     output = argv[argv.index("-o") + 1]
     with open(output, "w") as stream:
         stream.write(text)
+elif backend == "copilot":
+    with open("consult-generated-file", "w") as stream:
+        stream.write("discard me")
+    print(json.dumps({"type": "assistant.message", "data": {"content": text}}))
+    print(json.dumps({"type": "result", "exitCode": 0}))
 elif backend == "agy":
     result = {"response": text, "model": "agy-test"}
     if os.environ.get("FAKE_CONSULT_AGY_EARLY"):
@@ -139,6 +144,23 @@ class ConsultTests(unittest.TestCase):
     def ledger(self):
         with open(xs.LEDGER, encoding="utf-8") as stream:
             return [json.loads(line) for line in stream]
+
+    def test_default_skips_exhausted_agy_and_discards_copilot_worktree_changes(self):
+        subprocess.run(["git", "init", "-q", self.repo], check=True)
+        subprocess.run(["git", "-C", self.repo, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "initial"], check=True)
+        lanes = [{"name": "GH1", "backend": "copilot", "model": "haiku-test", "effort": "medium", "binary": self.script, "repo": self.repo}]
+        rows = [{"backend": "agy", "model": consult._model(xs, self.state, self.policy, "agy", None, None), "state": "quota_exhausted"}]
+        with mock.patch.object(xs, "lane_status_rows", return_value=rows), mock.patch.object(xs, "lane_config", return_value=lanes), mock.patch.object(consult.sys, "platform", "linux"):
+            code, result = self.run_consult([])
+        self.assertEqual(code, 0)
+        copilot = next(row for row in result["answers"] if row["backend"] == "copilot")
+        self.assertTrue(copilot["valid"])
+        self.assertTrue(copilot["worktree_changes_detected"])
+        with open(os.path.join(self.logs, "copilot.json"), encoding="utf-8") as stream:
+            worktree = json.load(stream)["cwd"]
+        self.assertNotEqual(worktree, self.repo)
+        self.assertFalse(os.path.exists(worktree))
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "consult-generated-file")))
 
     def test_schema_answers_are_parallel_persisted_and_ledgered(self):
         code, result = self.run_consult(["codex:codex-test", "agy:gemini-test", "pi:minimax-test"])
