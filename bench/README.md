@@ -4,6 +4,8 @@ openswarm and [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent)
 
 This benchmark compares that routing slice only. OmO is a multi-agent harness; most of what it does is outside this comparison. The benchmark was written by the openswarm maintainer, so the task mix and the tier labels can favor the tool that defined them. The trace, the catalogue, both decision files, and the score tables are published under `bench/` so the result can be recomputed.
 
+The catalogue now includes the configured `gpt-6-luna` default for offline routing. Its benchmark parameters are illustrative, and the checked-in result files predate this catalogue and policy change; regenerate both sides before making a new comparison.
+
 ## Fairness rules
 
 - Both tools see the same tasks, the same token estimates, and the same quota scenario.

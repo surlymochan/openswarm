@@ -1,5 +1,5 @@
 {
-  "description": "Shared model universe for the openswarm vs oh-my-openagent routing benchmark. Every id appears in both pinned trees: OpenCode Go and DeepSeek ids are keys of openswarm policy.json (ocgo.monthly_limits.go or deepseek.tiers) and strings in oh-my-openagent packages/model-core (category fallback chains or supplemental capability entries). Codex slugs are not pinned by openswarm (it classifies live `codex debug models` output); the slugs below are the ones model-core's category chains and supplemental-entries.ts actually name, placed in the openswarm state with descriptions that policy.json tier_keywords classify.",
+  "description": "Shared model universe for the openswarm vs oh-my-openagent routing benchmark. Every id appears in both pinned trees: OpenCode Go and DeepSeek ids are keys of openswarm policy.json (ocgo.monthly_limits.go or deepseek.tiers) and strings in oh-my-openagent packages/model-core (category fallback chains or supplemental capability entries). Codex slugs are not pinned by openswarm (it classifies live `codex debug models` output); most slugs below are named by model-core; the configured OpenSwarm default gpt-6-luna is also included as an illustrative available model. Descriptions are classified by policy.json tier_keywords.",
   "connected_providers": ["chatgpt-subscription", "opencode-go", "deepseek"],
   "provider_notes": [
     "chatgpt-subscription stands in for the Codex/ChatGPT plan. The openai API provider is not connected: this comparison is one Codex subscription, not a second metered OpenAI key.",
@@ -49,6 +49,20 @@
       "context_window": 1050000,
       "efforts": ["low", "medium", "high", "xhigh"],
       "where": "OmO ultrabrain and deep-low chains; supplemental-entries.ts"
+    },
+    {
+      "id": "gpt-6-luna",
+      "family": "gpt",
+      "tier": "fast",
+      "quota_pool": "codex",
+      "billing": "subscription",
+      "backends": ["codex"],
+      "omo_providers": ["chatgpt-subscription"],
+      "description": "Fast and affordable for easier tasks",
+      "priority": 4,
+      "context_window": 1050000,
+      "efforts": ["minimal", "low", "medium", "high"],
+      "where": "Configured OpenSwarm Codex default; included in the shared simulated account catalogue"
     },
     {
       "id": "gpt-6-luna-fast",

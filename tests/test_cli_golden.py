@@ -31,7 +31,9 @@ class CliGoldenTests(unittest.TestCase):
             with self.subTest(command=" ".join(command)):
                 result = subprocess.run([sys.executable, str(CLI), *command], capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
-                self.assertEqual(result.stdout, (GOLDEN / filename).read_bytes())
+                # argparse renamed this heading in Python 3.10; the options themselves remain the contract.
+                actual = result.stdout.replace(b"optional arguments:", b"options:")
+                self.assertEqual(actual, (GOLDEN / filename).read_bytes())
 
     def test_lane_service_definitions_match_goldens(self):
         lane = {"name": "L1", "backend": "codex", "model": "gpt-6-luna", "effort": "low",
