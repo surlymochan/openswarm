@@ -3529,7 +3529,9 @@ def run_executor_with_rate_limit(backend, decision, state, prompt, wd, rdir, bud
                                                        rdir, timeout, event_file)
         seconds = round(NOW() - started, 3)
         error_class = executor_error_class(rc, final, err_text, backend)
-        if error_class in (None, "rate_limit"):
+        # run_proc has reaped a normal 403 exit; it must not strand capacity.
+        if error_class in (None, "rate_limit") or (
+                backend == "agy" and error_class == "upstream_forbidden" and rc == 1):
             release_fleet_slot(rdir)
         elif os.path.realpath(rdir) in _FLEET_RESERVATIONS:
             set_status(rdir, fleet_reservation_error="retained after abnormal executor exit; inspect descendants")

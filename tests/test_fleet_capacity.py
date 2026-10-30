@@ -72,6 +72,25 @@ class FleetCapacityTests(unittest.TestCase):
         self.assertEqual(xs.executor_error_class(1, None, error, 'agy'), 'upstream_forbidden')
         self.assertEqual(xs.executor_error_class(1, None, error, 'codex'), 'exec_error')
 
+    def test_one_shot_agy_403_releases_slot_for_next_run(self):
+        guard = pathlib.Path(self.temp.name, 'guard.json')
+        guard.write_text(json.dumps({'command': [str(BIN), 'gocc']}))
+        fake = HERE / 'fixtures/fake_agy.py'
+        fake.chmod(0o755)
+        env = {'OPENSWARM_FLEET_GUARD_CONFIG': str(guard),
+               'OPENSWARM_FLEET_CAPACITY_DIR': self.temp.name,
+               'OPENSWARM_AGY_BIN': str(fake), 'FAKE_AGY_MODE': 'forbidden-exit'}
+        with mock.patch.dict(os.environ, env):
+            for number in range(2):
+                rdir = pathlib.Path(self.temp.name, 'runs', f'run-{number}')
+                rdir.mkdir(parents=True)
+                attempts, _, error = xs.run_executor_with_rate_limit(
+                    'agy', {'backend': 'agy', 'model': 'fake-model'}, {}, 'review', self.temp.name,
+                    str(rdir), xs.NOW() + 15, {'concurrency': {'total': 8}})
+                self.assertEqual(error, 'upstream_forbidden')
+                self.assertEqual(attempts[0]['rc'], 1)
+                self.assertEqual(self.call('gocc', op='status')['reservations'], [])
+
     def test_recovery_requires_local_explicit_confirmation(self):
         token = 'a' * 32
         self.assertTrue(self.call('gores1', op='acquire', token=token, run_id='orphan',
