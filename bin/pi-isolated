@@ -64,11 +64,14 @@ fi
            '--tmpfs', '/home', '--dir', '/run', '--ro-bind', runtime, '/runtime',
            '--ro-bind', config_dir, '/config', '--ro-bind', broker, '/run/broker.sock']
     deps_root = os.environ.get('OPENSWARM_PI_DEPS_ROOT')
-    if not deps_root:
-        git = subprocess.run(['git', '-C', worktree, 'rev-parse', '--path-format=absolute', '--git-common-dir'],
-                             capture_output=True, text=True, timeout=10)
-        if git.returncode == 0 and os.path.basename(git.stdout.strip()) == '.git':
-            deps_root = os.path.dirname(git.stdout.strip())
+    git = subprocess.run(['git', '-C', worktree, 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+                         capture_output=True, text=True, timeout=10)
+    if git.returncode == 0:
+        common_dir = os.path.realpath(git.stdout.strip())
+        if os.path.isdir(common_dir):
+            cmd += ['--ro-bind', common_dir, common_dir]
+            if not deps_root and os.path.basename(common_dir) == '.git':
+                deps_root = os.path.dirname(common_dir)
     if deps_root:
         deps_root = os.path.realpath(deps_root)
         candidates = [os.path.join(deps_root, name) for name in ('node_modules', '.venv', 'venv')]
@@ -78,13 +81,17 @@ fi
         for path in candidates:
             if os.path.isdir(path) and os.path.commonpath([deps_root, os.path.realpath(path)]) == deps_root:
                 cmd += ['--ro-bind', path, path]
-    bun = os.environ.get('OPENSWARM_PI_BUN_RUNTIME')
+    node = shutil.which('node')
     path = '/usr/bin:/bin'
+    if node:
+        cmd += ['--ro-bind', os.path.realpath(node), '/node/bin/node']
+        path = '/node/bin:' + path
+    bun = os.environ.get('OPENSWARM_PI_BUN_RUNTIME')
     if bun and os.path.isfile(os.path.join(bun, 'node_modules/.bin/bun')):
         cmd += ['--ro-bind', os.path.realpath(bun), '/bun']
         path = '/bun/node_modules/.bin:' + path
     cmd += ['--ro-bind' if read_only else '--bind', worktree, worktree, '--chdir', worktree,
             '--clearenv', '--setenv', 'HOME', '/home/pi', '--setenv', 'PATH', path,
-            '--setenv', 'PI_CODING_AGENT_DIR', '/tmp/agent',
+            '--setenv', 'GIT_OPTIONAL_LOCKS', '0', '--setenv', 'PI_CODING_AGENT_DIR', '/tmp/agent',
             '/usr/bin/sh', '-c', script, 'pi-isolated', args.mode, model, args.tools, args.prompt or '']
     sys.exit(subprocess.call(cmd))
