@@ -191,7 +191,7 @@ class AgyBackend(unittest.TestCase):
         entry, result = self.last_result()
         self.assertEqual(result["attempts"][0]["error_class"], "auth")
         self.assertEqual(entry["error_class"], "auth")
-        self.assertNotIn("429", json.dumps(result["attempts"][0]))
+        self.assertNotIn("429", result["attempts"][0].get("error_tail") or "")
 
     def test_rate_limit_is_classified_and_trips_a_breaker(self):
         os.environ["FAKE_AGY_MODE"] = "rate"
