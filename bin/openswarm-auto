@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Choose an available production lane from task type and difficulty."""
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+home = Path.home()
+cli = str(home / '.local/bin/openswarm')
+ssh = ['/usr/bin/ssh', '-T', '-F', str(home / '.ssh/openswarm-fleet/config'), 'openswarm-pi-broker']
+
+class LaneBusy(RuntimeError):
+    pass
+
+def remote(payload):
+    p = subprocess.run(ssh, input=json.dumps(payload), capture_output=True, text=True, timeout=35)
+    try: result = json.loads(p.stdout)
+    except ValueError: raise RuntimeError('gocc dispatch gateway unavailable')
+    if p.returncode or not result.get('ok'):
+        reply = result.get('result')
+        if (payload.get('op') == 'assign' and isinstance(reply, dict) and reply.get('ok') is False
+                and reply.get('error') == f"lane {payload.get('lane')} is busy (busy)"):
+            raise LaneBusy('remote lane is busy')
+        raise RuntimeError('gocc dispatch gateway rejected request')
+    return result['result']
+
+def local_lanes():
+    p = subprocess.run([cli, 'lane', 'status'], capture_output=True, text=True, timeout=15)
+    if p.returncode: raise RuntimeError('local lane status unavailable')
+    return json.loads(p.stdout)
+
+def preference(kind, difficulty):
+    if kind == 'migration':
+        return ['A1', 'C1', 'GH2', 'K1', 'M1'] if difficulty >= 4 else ['A1', 'C1', 'GH1', 'M1', 'K1']
+    if difficulty >= 5:
+        return ['C1', 'GH2', 'A1', 'K1', 'M1']
+    if difficulty >= 4:
+        return ['GH2', 'C1', 'A1', 'K1', 'M1']
+    if kind in ('test', 'refactor', 'debug'):
+        return ['K1', 'C1', 'GH1', 'M1', 'A1']
+    if kind in ('mechanical', 'format', 'rename', 'docs') and difficulty <= 2:
+        return ['M1', 'GH1', 'K1', 'C1', 'A1']
+    if difficulty <= 2:
+        return ['GH1', 'M1', 'K1', 'C1', 'A1']
+    return ['C1', 'K1', 'GH1', 'M1', 'A1']
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--type', default='impl', choices=['impl','mechanical','format','rename','docs','test','refactor','debug','migration','review','research','audit','second-opinion'])
+    p.add_argument('--difficulty', type=int, choices=range(1,6), default=3)
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument('--prompt')
+    g.add_argument('--task-file')
+    p.add_argument('--title')
+    p.add_argument('--verify')
+    p.add_argument('--base')
+    p.add_argument('--budget-minutes', type=float, default=15)
+    p.add_argument('--dry-run', action='store_true')
+    args = p.parse_args()
+    prompt = args.prompt if args.prompt is not None else Path(args.task_file).read_text()
+    if not prompt.strip() or len(prompt)>50000 or not 0 < args.budget_minutes <= 40:
+        raise ValueError('invalid prompt or budget')
+    repo = home / 'work/openbot-executor-base'
+    base = args.base or subprocess.check_output(['git','-C',str(repo),'rev-parse','HEAD'], text=True).strip()
+    if not base or len(base)>100 or any(c not in '0123456789abcdef' for c in base):
+        raise ValueError('base must be a hexadecimal commit')
+    read_only = args.type in ('review', 'research', 'audit', 'second-opinion')
+    lanes = local_lanes()
+    try: lanes += remote({'op':'lanes'})
+    except (RuntimeError, OSError, subprocess.SubprocessError): pass
+    available = {row['name']: row for row in lanes if row.get('state') == 'idle'}
+    ordered = [x for x in preference(args.type,args.difficulty) if x in available]
+    if not ordered:
+        raise RuntimeError('no available fleet lane')
+    for lane in ordered:
+        row = available[lane]
+        result = {'ok': True, 'lane': lane, 'backend': row['backend'], 'model': row['model'],
+                  'host': 'gores1' if lane in ('M1','K1') else 'gocc',
+                  'profile': {'type': args.type, 'difficulty': args.difficulty}}
+        if read_only: result['read_only'] = True
+        if lane == 'M1' and read_only:
+            result['lane'] = None
+            result['execution_mode'] = 'one-shot'
+        if args.dry_run:
+            print(json.dumps(result)); return
+        if lane == 'M1' and read_only:
+            command = [cli, 'run', '--type', 'review', '--backend', 'pi', '--read-only', '--no-fallback',
+                       '--cwd', str(repo), '--base', base, '--prompt', prompt, '--detach',
+                       '--budget-minutes', str(args.budget_minutes)]
+            if args.title: command += ['--title', args.title]
+            if args.verify: command += ['--verify', args.verify]
+            proc = subprocess.run(command, capture_output=True, text=True, timeout=30)
+            try: response = json.loads(proc.stdout)
+            except ValueError: raise RuntimeError('local dispatch acknowledgement unavailable')
+            if proc.returncode or not response.get('id'):
+                raise RuntimeError('local dispatch acknowledgement unavailable')
+        elif lane in ('M1','K1'):
+            command = [cli,'lane','assign',lane,'--prompt',prompt,'--base',base,
+                       '--budget-minutes',str(args.budget_minutes)]
+            if args.title: command += ['--title', args.title]
+            if args.verify: command += ['--verify',args.verify]
+            if read_only: command.append('--read-only')
+            proc = subprocess.run(command, capture_output=True, text=True, timeout=30)
+            try: response = json.loads(proc.stdout)
+            except ValueError: raise RuntimeError('local dispatch acknowledgement unavailable')
+            if response.get('ok') is False:
+                if response.get('error') == f'lane {lane} is busy (busy)':
+                    continue
+                raise RuntimeError('local dispatch acknowledgement unavailable')
+            if proc.returncode or not response.get('id'):
+                raise RuntimeError('local dispatch acknowledgement unavailable')
+        else:
+            try:
+                response = remote({'op':'assign','lane':lane,'prompt':prompt,'base':base,
+                                   'title':args.title,'verify':args.verify,'budget_minutes':args.budget_minutes,
+                                   'read_only':read_only})
+            except LaneBusy:
+                continue
+        result.update({'id':response['id'], 'state':response['state']})
+        print(json.dumps(result)); return
+    raise RuntimeError('available lanes changed or rejected the task')
+
+if __name__ == '__main__':
+    try: main()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as e:
+        print(json.dumps({'ok':False,'error':str(e)})); sys.exit(1)

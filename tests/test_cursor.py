@@ -155,7 +155,7 @@ class CursorBackend(unittest.TestCase):
         self.assertEqual(entry["backend"], "cursor")
         with open(self.log) as fh:
             argv = json.load(fh)
-        self.assertEqual(argv[argv.index("--model") + 1], "composer-2.5[fast=false]")
+        self.assertEqual(argv[argv.index("--model") + 1], "composer-2.5")
         self.assertEqual(argv[argv.index("--output-format") + 1], "stream-json")
         for flag in ("-p", "--trust", "--force", "--"):
             self.assertIn(flag, argv)
@@ -187,6 +187,22 @@ class CursorBackend(unittest.TestCase):
         with open(self.log) as fh:
             argv = json.load(fh)
         self.assertEqual(argv.count("--continue"), 1)
+
+    def test_headless_lane_keeps_standard_model_and_parses_result(self):
+        lane = {"name": "K1", "backend": "cursor", "mode": "headless",
+                "model": "composer-2.5[fast=false]"}
+        child = xs.CursorHeadlessChild(lane, self.cwd, POLICY)
+        child.start("test")
+        event = child.next_event(10)
+        self.assertEqual(event["status"], "SUCCESS")
+        self.assertEqual(xs.extract_json(event["response"])["status"], "done")
+        child.close()
+        with open(self.log) as stream:
+            argv = json.load(stream)
+        self.assertEqual(argv[argv.index("--model") + 1], "composer-2.5")
+        self.assertIn("--sandbox", argv)
+        with self.assertRaises(RuntimeError):
+            child.start("test", model="composer-2.5[fast=true]")
 
     def test_budget_kills_the_process(self):
         os.environ["FAKE_CURSOR_MODE"] = "sleep"

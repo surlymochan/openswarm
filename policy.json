@@ -75,7 +75,9 @@
     "weighted": false
   },
   "codex": {
-    "default_model": "gpt-5.6-terra",
+    "default_model": "gpt-6-luna",
+    "default_effort": "high",
+    "require_default_model": true,
     "binary_candidates": [
       "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
       "$PATH:codex",
@@ -205,8 +207,11 @@
     "default_model": "composer-2.5[fast=false]"
   },
   "copilot": {
-    "_doc": "Opt-in Copilot CLI executor. Auto selects an available model for the authenticated account.",
-    "default_model": "auto"
+    "_doc": "Use Haiku for routine tasks and Sonnet for difficulty 4-5; both use medium reasoning.",
+    "default_model": "claude-haiku-5.5",
+    "complex_model": "claude-sonnet-5.5",
+    "complex_difficulty": 4,
+    "default_effort": "medium"
   },
   "agy": {
     "_doc": "Opt-in executor: Antigravity CLI (agy -p --model <slug> --output-format stream-json --dangerously-skip-permissions). Not in routing.default_order. The default model is a Flash model; pick another slug with --model. print_timeout is passed to agy as --print-timeout when set (null keeps openswarm's own budget as the only deadline).",

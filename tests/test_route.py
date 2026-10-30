@@ -13,6 +13,7 @@ xs.breakers = lambda: {}  # isolate from any breakers on disk
 xs.load_policy = lambda: xs.jload(f"{xs.SKILL_DIR}/policy.json", {})  # ignore policy.local.json overrides
 
 POLICY = xs.load_policy()
+POLICY["codex"]["require_default_model"] = False
 OPT_IN_POLICY = copy.deepcopy(POLICY)
 OPT_IN_POLICY["routing"]["default_order"] = ["codex", "ocgo", "deepseek"]
 with open(_load.FIXTURE_STATE) as f:

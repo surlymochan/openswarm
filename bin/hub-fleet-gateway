@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Restricted SSH endpoint for OpenBot Hub fleet dispatch and result lookup."""
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+
+home = Path.home()
+cli = str(home / '.local/bin/openswarm')
+ssh = ['/usr/bin/ssh', '-T', '-F', str(home / '.ssh/openswarm-fleet/config'), 'openswarm-pi-broker']
+
+def result(cmd, payload=None, timeout=45):
+    p = subprocess.run(cmd, input=json.dumps(payload) if payload is not None else None,
+                       text=True, capture_output=True, timeout=timeout)
+    try: data = json.loads(p.stdout)
+    except ValueError: raise ValueError('fleet command returned invalid JSON')
+    if p.returncode or (isinstance(data, dict) and data.get('ok') is False):
+        if isinstance(data, dict) and data.get('error') in (
+                'no available fleet lane', 'available lanes changed or rejected the task',
+                'local lane status unavailable', 'local dispatch acknowledgement unavailable',
+                'gocc dispatch gateway unavailable', 'gocc dispatch gateway rejected request'):
+            raise ValueError(data['error'])
+        raise ValueError('fleet command rejected request')
+    return data
+
+def main():
+    req = json.load(sys.stdin)
+    op = req.get('op')
+    if op == 'submit':
+        prompt, title, base = req.get('prompt'), req.get('title'), req.get('base')
+        kind, difficulty, budget, verify = req.get('type'), req.get('difficulty'), req.get('budget'), req.get('verify')
+        if not isinstance(prompt,str) or not 0 < len(prompt) <= 50000 or not isinstance(title,str) or not 0 < len(title) <= 160:
+            raise ValueError('invalid task')
+        if kind not in ('impl','mechanical','format','rename','docs','test','refactor','debug','migration','review','research','audit','second-opinion'):
+            raise ValueError('invalid type')
+        if isinstance(difficulty,bool) or not isinstance(difficulty,int) or not 1 <= difficulty <= 5:
+            raise ValueError('invalid difficulty')
+        if isinstance(budget,bool) or not isinstance(budget,(int,float)) or not 0 < budget <= 40:
+            raise ValueError('invalid budget')
+        if not isinstance(base,str) or not re.fullmatch(r'[0-9a-f]{7,64}',base): raise ValueError('invalid base')
+        if verify is not None and (not isinstance(verify,str) or len(verify)>4096): raise ValueError('invalid verify')
+        with tempfile.TemporaryDirectory(prefix='openswarm-hub-card-') as directory:
+            os.chmod(directory,0o700)
+            card = Path(directory)/'task.md'; card.write_text(prompt); card.chmod(0o600)
+            cmd = [cli,'auto','--type',kind,'--difficulty',str(difficulty),'--task-file',str(card),
+                   '--title',title,'--base',base,'--budget-minutes',str(budget)]
+            if verify: cmd += ['--verify',verify]
+            return result(cmd,timeout=90)
+    if op in ('info','stop'):
+        run_id, host = req.get('id'), req.get('host')
+        if not isinstance(run_id,str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,99}',run_id): raise ValueError('invalid id')
+        if host not in ('gores1','gocc'): raise ValueError('invalid host')
+        if host == 'gocc':
+            data = result(ssh, {'op':'run_info' if op=='info' else 'stop','run_id':run_id})
+            return data['result']
+        return result([cli,'fleet','_run-info',run_id] if op=='info' else [cli,'stop',run_id])
+    raise ValueError('invalid operation')
+
+try:
+    output=main(); print(json.dumps({'ok':True,'result':output},separators=(',',':')))
+except (ValueError, KeyError, OSError, subprocess.SubprocessError) as e:
+    print(json.dumps({'ok':False,'error':str(e)[:300]})); sys.exit(1)
