@@ -69,6 +69,11 @@ class LaneTests(unittest.TestCase):
         return subprocess.run(["git", *args], cwd=self.repo, check=True, capture_output=True, text=True).stdout.strip()
 
     def cli(self, *args, check=True, timeout=15):
+        if self.backend == "pi":
+            policy_file = self.data / "policy.local.json"
+            policy = json.loads(policy_file.read_text()) if policy_file.exists() else {}
+            policy.setdefault("pi", {})["require_isolation"] = False
+            policy_file.write_text(json.dumps(policy))
         result = subprocess.run([sys.executable, str(CLI), *map(str, args)], env=self.env, text=True,
                                 capture_output=True, timeout=timeout)
         if check and result.returncode:
@@ -237,7 +242,7 @@ class LaneTests(unittest.TestCase):
         (self.data / "policy.local.json").write_text(json.dumps({"concurrency": {"fake-provider": 1}}))
         self.cli("lane", "up", "L1")
         self.cli("lane", "up", "L2")
-        first = self.assign("LANE_TEST_WAIT_SHORT first provider task")
+        first = self.assign("LANE_TEST_WAIT first provider task")
         self.wait_running(first)
         second = json.loads(self.cli("lane", "assign", "L2", "--prompt", "second provider task").stdout)["id"]
         queued = self.wait_for(lambda: (state if (state := self.run_state(second)).get("queue_reason") else None),
@@ -245,6 +250,7 @@ class LaneTests(unittest.TestCase):
         self.assertEqual(queued["queue_reason"], "provider concurrency limit")
         lanes = {row["name"]: row for row in json.loads(self.cli("lane", "status").stdout)}
         self.assertEqual(lanes["L2"]["run_state"], "queued")
+        self.cli("lane", "steer", "L1", "--text", "finish first provider task")
         self.assertEqual(self.wait_run(first)["status"], "done")
         self.assertEqual(self.wait_run(second)["status"], "done")
 
@@ -260,12 +266,13 @@ class LaneTests(unittest.TestCase):
         (self.data / "policy.local.json").write_text(json.dumps({"concurrency": {"total": 1}}))
         self.cli("lane", "up", "L1")
         self.cli("lane", "up", "L2")
-        first = self.assign("LANE_TEST_WAIT_SHORT first total-cap task")
+        first = self.assign("LANE_TEST_WAIT first total-cap task")
         self.wait_running(first)
         second = json.loads(self.cli("lane", "assign", "L2", "--prompt", "second backend task").stdout)["id"]
         queued = self.wait_for(lambda: (state if (state := self.run_state(second)).get("queue_reason") else None),
                                description="second backend turn to queue on total cap")
         self.assertEqual(queued["queue_reason"], "provider concurrency limit")
+        self.cli("lane", "steer", "L1", "--text", "finish first total-cap task")
         self.assertEqual(self.wait_run(first)["status"], "done")
         self.assertEqual(self.wait_run(second)["status"], "done")
 
@@ -361,7 +368,7 @@ class LaneTests(unittest.TestCase):
         self.assertIn("session/set_config_option", methods)
         self.assertIn("session/prompt", methods)
         argv = next(entry["argv"] for entry in self.cursor_log() if "argv" in entry)
-        self.assertEqual(argv[1:], ["acp"])
+        self.assertEqual(argv[1:], ["--sandbox", "enabled", "acp"])
         self.assertEqual(json.loads((self.data / "lanes" / "L1" / "state.json").read_text())["model"],
                          "composer-2.5")
         choice = next(entry for entry in self.cursor_log() if entry.get("method") == "session/set_config_option")
@@ -473,6 +480,9 @@ class LaneTests(unittest.TestCase):
         self.start_lane()
         run_id = self.assign("LANE_TEST_WAIT original task")
         self.wait_running(run_id)
+        event_file = self.data / "runs" / run_id / "events.1.agy.jsonl"
+        self.wait_for(lambda: event_file.exists() and '"conversation_id": "conv-1"' in event_file.read_text(),
+                      description="Antigravity conversation initialization")
         self.cli("lane", "steer", self.lane_name, "--text", "write steered instruction")
         self.assertEqual(self.wait_run(run_id)["status"], "done")
         calls = [json.loads(line) for line in pathlib.Path(self.env["FAKE_AGY_LOG"]).read_text().splitlines()]
@@ -638,6 +648,20 @@ class LaneTests(unittest.TestCase):
         self.cli("stop", run_id)
         self.assertEqual(self.wait_run(run_id)["status"], "stopped")
         self.assertTrue(process_alive(supervisor_pid))
+
+    def test_stop_of_old_run_does_not_abort_the_next_run(self):
+        self.start_lane()
+        old = self.assign("first completed task")
+        self.wait_run(old)
+        self.wait_for(lambda: self.lane_state().get("state") == "idle", description="idle lane")
+        current = self.assign("LANE_TEST_WAIT keep this run alive")
+        self.wait_running(current)
+        response = json.loads(self.cli("stop", old).stdout)
+        self.assertEqual(response["signalled"], [])
+        self.assertEqual(response["response"]["error"], "lane is running a different run")
+        self.assertEqual(self.run_state(current)["state"], "running")
+        self.cli("stop", current)
+        self.assertEqual(self.wait_run(current)["status"], "stopped")
 
     def test_budget_interrupt_is_recorded(self):
         self.start_lane()

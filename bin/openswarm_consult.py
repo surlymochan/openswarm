@@ -78,7 +78,7 @@ def _model(core, state, policy, backend, requested=None, lane=None):
     config = policy.get(backend) or {}
     if backend == "codex":
         models = known.get("models") or []
-        return (models[0].get("id") if models else None) or known.get("config_model")
+        return config.get("default_model") or (models[0].get("id") if models else None) or known.get("config_model")
     if backend == "agy":
         return config.get("default_model") or known.get("default_model") or core.AGY_DEFAULT_MODEL
     return config.get("default_model") or known.get("default_model")
@@ -87,8 +87,15 @@ def _model(core, state, policy, backend, requested=None, lane=None):
 def _profile(core, state, policy, backend, requested_model=None, lane=None):
     provider = (lane or {}).get("provider") or (policy.get(backend) or {}).get("provider")
     model = _model(core, state, policy, backend, requested_model, lane)
-    return {"backend": backend, "model": model, "family": backend_family(backend, model, provider),
-            "provider": provider, "binary": _binary(core, state, backend, lane),
+    binary = _binary(core, state, backend, lane)
+    if backend == "pi" and (policy.get("pi") or {}).get("require_isolation", True):
+        binary = core.pi_bin()
+        expected = os.path.join(os.path.dirname(os.path.realpath(core.__file__)), "pi-isolated")
+        if not binary or os.path.realpath(binary) != os.path.realpath(expected):
+            raise ValueError("read-only Pi consultation requires the isolated launcher")
+    effort = (lane or {}).get("effort") or ((policy.get("codex") or {}).get("default_effort") if backend == "codex" else None)
+    return {"backend": backend, "model": model, "effort": effort, "family": backend_family(backend, model, provider),
+            "provider": provider, "binary": binary,
             "lane": (lane or {}).get("name"), "cwd": (lane or {}).get("repo") or os.getcwd()}
 
 
@@ -135,6 +142,8 @@ def build_command(profile, prompt, run_dir):
         command = [binary, "exec"]
         if model:
             command += ["-m", model]
+        if profile.get("effort"):
+            command += ["-c", f'model_reasoning_effort="{profile["effort"]}"']
         command += ["-s", "read-only", "-C", profile["cwd"], "--json", "--skip-git-repo-check",
                     "--output-schema", schema_path, "-o", output_path, prompt]
         profile["output_path"] = output_path
@@ -304,6 +313,7 @@ def _ask_one(core, profile, prompt, run_dir, deadline, policy, reservation_id):
     slot_dir = os.path.join(core.RUNS, f"consult-slot-{reservation_id}")
     provider = profile.get("provider") or core.execution_provider(profile["backend"], policy=policy)
     acquired = False
+    process = None
     try:
         acquired = core.reserve_provider_slot(slot_dir, profile["backend"], provider, policy,
                                               keep_waiting=lambda: core.NOW() < deadline)
@@ -376,11 +386,16 @@ def _ask_one(core, profile, prompt, run_dir, deadline, policy, reservation_id):
     finally:
         if acquired:
             try:
-                core.set_status(slot_dir, state="finished", finished=core.NOW())
+                # An unexpectedly live child keeps its fleet reservation. Never
+                # free capacity merely because the consult wrapper failed.
+                if process is None or process.poll() is not None:
+                    if core.release_fleet_slot(slot_dir):
+                        core.set_status(slot_dir, state="finished", finished=core.NOW())
             except Exception:
                 pass
         import shutil
-        shutil.rmtree(slot_dir, ignore_errors=True)
+        if not acquired or (process is None or process.poll() is not None) and os.path.realpath(slot_dir) not in core._FLEET_RESERVATIONS:
+            shutil.rmtree(slot_dir, ignore_errors=True)
 
 
 def _agreement(answers):

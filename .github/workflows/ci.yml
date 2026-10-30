@@ -15,7 +15,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # Python 3.9 builds are not published for the Ubuntu 26.04 latest image.
+        os: [ubuntu-24.04, macos-latest]
         python: ["3.9", "3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4

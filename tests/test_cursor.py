@@ -101,7 +101,7 @@ class CursorBackend(unittest.TestCase):
         forced = self.route({"type": "impl", "difficulty": 3, "backend": "cursor"})
         self.assertTrue(forced["ok"])
         self.assertEqual(forced["backend"], "cursor")
-        self.assertEqual(forced["model"], "grok-4.7-high")
+        self.assertEqual(forced["model"], "composer-2.5[fast=false]")
         named = self.route({"type": "impl", "difficulty": 2, "backend": "cursor", "model": "grok-4.7-low"})
         self.assertEqual(named["model"], "grok-4.7-low")
         opted = json.loads(json.dumps(POLICY))
@@ -144,7 +144,7 @@ class CursorBackend(unittest.TestCase):
         entry, result = self.last_result()
         self.assertEqual(result["status"], "done")
         self.assertEqual(result["backend"], "cursor")
-        self.assertEqual(result["model"], "grok-4.7-high")
+        self.assertEqual(result["model"], "composer-2.5[fast=false]")
         usage = {"inputTokens": 120, "outputTokens": 45, "cacheReadTokens": 8, "cacheWriteTokens": 2}
         self.assertEqual(result["usage"], usage)
         self.assertEqual(result["result"]["summary"], "added add")
@@ -155,7 +155,7 @@ class CursorBackend(unittest.TestCase):
         self.assertEqual(entry["backend"], "cursor")
         with open(self.log) as fh:
             argv = json.load(fh)
-        self.assertEqual(argv[argv.index("--model") + 1], "grok-4.7-high")
+        self.assertEqual(argv[argv.index("--model") + 1], "composer-2.5[fast=false]")
         self.assertEqual(argv[argv.index("--output-format") + 1], "stream-json")
         for flag in ("-p", "--trust", "--force", "--"):
             self.assertIn(flag, argv)
@@ -171,7 +171,7 @@ class CursorBackend(unittest.TestCase):
         self.assertEqual(entry["error_class"], "rate_limit")
         self.assertEqual(xs.rate_limit_breaker_key("cursor", {"model": "grok-4.7-high"}, "429"),
                          "cursor/grok-4.7-high")
-        self.assertIn("cursor/grok-4.7-high", xs.breakers())
+        self.assertIn("cursor/composer-2.5[fast=false]", xs.breakers())
 
     def test_rate_limit_retries_with_cursor_continue(self):
         os.environ["FAKE_CURSOR_MODE"] = "rate-once"
@@ -187,6 +187,22 @@ class CursorBackend(unittest.TestCase):
         with open(self.log) as fh:
             argv = json.load(fh)
         self.assertEqual(argv.count("--continue"), 1)
+
+    def test_headless_lane_keeps_standard_model_and_parses_result(self):
+        lane = {"name": "K1", "backend": "cursor", "mode": "headless",
+                "model": "composer-2.5[fast=false]"}
+        child = xs.CursorHeadlessChild(lane, self.cwd, POLICY)
+        child.start("test")
+        event = child.next_event(10)
+        self.assertEqual(event["status"], "SUCCESS")
+        self.assertEqual(xs.extract_json(event["response"])["status"], "done")
+        child.close()
+        with open(self.log) as stream:
+            argv = json.load(stream)
+        self.assertEqual(argv[argv.index("--model") + 1], "composer-2.5[fast=false]")
+        self.assertIn("--sandbox", argv)
+        with self.assertRaises(RuntimeError):
+            child.start("test", model="composer-2.5[fast=true]")
 
     def test_budget_kills_the_process(self):
         os.environ["FAKE_CURSOR_MODE"] = "sleep"

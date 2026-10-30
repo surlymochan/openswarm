@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Atomic fleet admission. Reservations persist until explicitly released, even after a crash."""
+import json
+import os
+import re
+from pathlib import Path
+import sqlite3
+import subprocess
+import sys
+import time
+
+ALLOWED = {'codex', 'pi', 'cursor', 'agy', 'copilot'}
+LIMITS = {'total': 8, 'host:gocc': 2, 'host:gores1': 2, 'host:local': 2,
+          'codex': 1, 'pi': 1, 'cursor': 1, 'agy': 1, 'copilot': 1, 'minimax-cn': 1}
+if len(sys.argv) != 2 or sys.argv[1] not in ('gocc', 'gores1', 'local'):
+    sys.exit('invalid authenticated host')
+host = sys.argv[1]
+try:
+    request = json.load(sys.stdin)
+    op = request.get('op')
+    if op in ('lanes', 'assign', 'run_info', 'stop'):
+        if host != 'gores1':
+            raise ValueError('remote dispatcher host required')
+        command = [str(Path.home() / '.local/bin/openswarm'), 'lane']
+        if op == 'lanes':
+            command += ['status']
+        elif op in ('run_info', 'stop'):
+            run_id = request.get('run_id')
+            if not isinstance(run_id, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,99}', run_id):
+                raise ValueError('invalid run id')
+            command = [str(Path.home() / '.local/bin/openswarm')]
+            command += ['fleet', '_run-info', run_id] if op == 'run_info' else ['stop', run_id]
+        else:
+            lane = request.get('lane')
+            prompt = request.get('prompt')
+            base = request.get('base')
+            verify = request.get('verify')
+            title = request.get('title')
+            budget = request.get('budget_minutes')
+            if lane not in ('C1', 'A1', 'GH1', 'GH2') or not isinstance(prompt, str) or not 0 < len(prompt) <= 50000:
+                raise ValueError('invalid lane or prompt')
+            if not isinstance(base, str) or not base or len(base) > 100 or not all(c in '0123456789abcdef' for c in base):
+                raise ValueError('base must be a hexadecimal commit')
+            if not isinstance(budget, (int, float)) or isinstance(budget, bool) or not 0 < budget <= 40:
+                raise ValueError('invalid budget')
+            if verify is not None and (not isinstance(verify, str) or len(verify) > 5000):
+                raise ValueError('invalid verify command')
+            if title is not None and (not isinstance(title, str) or len(title) > 160):
+                raise ValueError('invalid title')
+            command += ['assign', lane, '--prompt', prompt, '--base', base, '--budget-minutes', str(budget)]
+            if title:
+                command += ['--title', title]
+            if verify:
+                command += ['--verify', verify]
+        process = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        try:
+            result = json.loads(process.stdout)
+        except ValueError:
+            raise ValueError('remote lane command did not return JSON')
+        print(json.dumps({'ok': process.returncode == 0, 'result': result}, separators=(',', ':')))
+        sys.exit(0 if process.returncode == 0 else 1)
+    if op not in ('acquire', 'release', 'status', 'recover'):
+        raise ValueError('invalid operation')
+    root = Path(os.environ.get('OPENSWARM_FLEET_CAPACITY_DIR') or
+                (Path.home() / '.claude/openswarm-fleet-capacity'))
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    db = sqlite3.connect(str(root / 'capacity.sqlite'), timeout=10, isolation_level=None)
+    os.chmod(root / 'capacity.sqlite', 0o600)
+    db.execute('PRAGMA busy_timeout=10000')
+    db.execute('CREATE TABLE IF NOT EXISTS reservations (token TEXT PRIMARY KEY, host TEXT NOT NULL, run_id TEXT NOT NULL, backend TEXT NOT NULL, provider TEXT, created REAL NOT NULL)')
+    db.execute('BEGIN IMMEDIATE')
+    if op == 'status':
+        rows = db.execute('SELECT host,run_id,backend,provider,created FROM reservations ORDER BY created').fetchall()
+        out = {'ok': True, 'reservations': [dict(zip(('host','run_id','backend','provider','created'), row)) for row in rows]}
+    elif op == 'recover':
+        # Local operator only, after independently confirming the runner and
+        # every executor descendant are stopped. Never automatically expire.
+        if host != 'gocc' or request.get('confirm') != 'all-executor-processes-stopped':
+            raise ValueError('local explicit recovery confirmation required')
+        owner, run_id = request.get('host'), request.get('run_id')
+        if owner not in ('gocc', 'gores1', 'local') or not isinstance(run_id, str) or not run_id:
+            raise ValueError('invalid reservation owner or run id')
+        count = db.execute('DELETE FROM reservations WHERE host=? AND run_id=?', (owner,run_id)).rowcount
+        out = {'ok': True, 'recovered': count}
+    else:
+        token, run_id = request.get('token'), request.get('run_id')
+        if not isinstance(token, str) or len(token) != 32 or any(c not in '0123456789abcdef' for c in token):
+            raise ValueError('invalid token')
+        if not isinstance(run_id, str) or not run_id or len(run_id) > 128:
+            raise ValueError('invalid run id')
+        old = db.execute('SELECT host,run_id,backend,provider FROM reservations WHERE token=?', (token,)).fetchone()
+        if op == 'release':
+            if old and (old[0] != host or old[1] != run_id):
+                raise ValueError('reservation owner mismatch')
+            db.execute('DELETE FROM reservations WHERE token=? AND host=? AND run_id=?', (token,host,run_id))
+            out = {'ok': True, 'released': bool(old)}
+        else:
+            backend, provider = request.get('backend'), request.get('provider')
+            if backend not in ALLOWED or provider not in (None, 'minimax-cn'):
+                raise ValueError('invalid backend/provider')
+            if old:
+                if old != (host,run_id,backend,provider):
+                    raise ValueError('reservation token conflict')
+                out = {'ok': True, 'admitted': True, 'existing': True}
+            else:
+                rows = db.execute('SELECT host,backend,provider FROM reservations').fetchall()
+                keys = {'total', 'host:' + host, backend} | ({provider} if provider else set())
+                counts = {key: 0 for key in keys}
+                for h,b,p in rows:
+                    active = {'total','host:' + h,b} | ({p} if p else set())
+                    for key in keys & active: counts[key] += 1
+                blocked = [key for key in sorted(keys) if key in LIMITS and counts[key] >= LIMITS[key]]
+                if blocked:
+                    out = {'ok': True, 'admitted': False, 'blocked': blocked}
+                else:
+                    db.execute('INSERT INTO reservations VALUES (?,?,?,?,?,?)', (token,host,run_id,backend,provider,time.time()))
+                    out = {'ok': True, 'admitted': True}
+    db.execute('COMMIT')
+    print(json.dumps(out, separators=(',',':')))
+except Exception as error:
+    try: db.execute('ROLLBACK')
+    except Exception: pass
+    print(json.dumps({'ok': False, 'error': str(error)[:300]}))
+    sys.exit(1)

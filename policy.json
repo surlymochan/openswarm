@@ -75,6 +75,9 @@
     "weighted": false
   },
   "codex": {
+    "default_model": "gpt-6-luna",
+    "default_effort": "high",
+    "require_default_model": true,
     "binary_candidates": [
       "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
       "$PATH:codex",
@@ -201,7 +204,14 @@
   },
   "cursor": {
     "_doc": "Opt-in executor. Not in routing.default_order, so route never picks it unless you add \"cursor\" there or pass --backend cursor. Quota is unknown; the CLI reports token usage after the run.",
-    "default_model": "grok-4.7-high"
+    "default_model": "composer-2.5[fast=false]"
+  },
+  "copilot": {
+    "_doc": "Use Haiku for routine tasks and Sonnet for difficulty 4-5; both use medium reasoning.",
+    "default_model": "claude-haiku-5.5",
+    "complex_model": "claude-sonnet-5.5",
+    "complex_difficulty": 4,
+    "default_effort": "medium"
   },
   "agy": {
     "_doc": "Opt-in executor: Antigravity CLI (agy -p --model <slug> --output-format stream-json --dangerously-skip-permissions). Not in routing.default_order. The default model is a Flash model; pick another slug with --model. print_timeout is passed to agy as --print-timeout when set (null keeps openswarm's own budget as the only deadline).",
@@ -210,8 +220,9 @@
   },
   "pi": {
     "_doc": "Opt-in executor: Pi coding agent (pi -p --mode json). Not in routing.default_order. provider/default_model null means Pi's own default. OPENSWARM_PI_BIN may point at a wrapper that takes the same flags. Quota is unknown; usage is summed from message_end events.",
-    "provider": null,
-    "default_model": null
+    "provider": "minimax-cn",
+    "default_model": "MiniMax-M3.1-Flash",
+    "require_isolation": true
   },
   "deepseek": {
     "_doc": "API key: DEEPSEEK_API_KEY env, or list macOS Keychain items you created for openswarm, e.g. [\"openswarm-deepseek-api-key\"].",

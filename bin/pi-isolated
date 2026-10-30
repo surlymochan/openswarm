@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""One-shot Pi wrapper: Linux namespaces, no host credentials and one broker socket."""
+import argparse
+import glob
+import json
+import os
+import pathlib
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+parser = argparse.ArgumentParser()
+parser.add_argument('-p', action='store_true')
+parser.add_argument('--mode', choices=['json', 'rpc'], required=True)
+parser.add_argument('--session-dir')
+parser.add_argument('--provider', required=True)
+parser.add_argument('--model', required=True)
+parser.add_argument('--tools', default='read,bash,edit,write,grep,find,ls')
+parser.add_argument('prompt', nargs='?')
+args = parser.parse_args()
+model = os.environ.get('OPENSWARM_PI_ISOLATED_MODEL', 'MiniMax-M3.1-Flash')
+runtime = os.path.realpath(os.environ.get('OPENSWARM_PI_RUNTIME', ''))
+broker = os.path.realpath(os.environ.get('OPENSWARM_PI_BROKER_SOCKET', ''))
+worktree = os.path.realpath(os.getcwd())
+read_only = args.tools == 'read,grep,find,ls'
+if args.provider != 'minimax-cn' or args.model != model or args.tools not in ('read,bash,edit,write,grep,find,ls', 'read,grep,find,ls'):
+    sys.exit('isolated Pi rejected provider, model or tool configuration')
+if (args.mode == 'json' and (not args.p or args.prompt is None)) or (args.mode == 'rpc' and (args.p or args.prompt is not None)):
+    sys.exit('isolated Pi rejected mode or prompt configuration')
+if not shutil.which('bwrap') or not shutil.which('socat') or not os.path.isfile(os.path.join(runtime, 'node_modules/.bin/pi')):
+    sys.exit('isolated Pi dependencies unavailable')
+try:
+    if not stat.S_ISSOCK(os.stat(broker).st_mode):
+        sys.exit('isolated Pi broker socket unavailable')
+except OSError:
+    sys.exit('isolated Pi broker socket unavailable')
+if worktree == '/' or not os.path.isdir(worktree):
+    sys.exit('isolated Pi requires a dedicated worktree')
+config = {'providers': {'minimax-sandbox': {'baseUrl': 'http://127.0.0.1:18765',
+          'api': 'anthropic-messages', 'apiKey': 'isolated-placeholder', 'models': [{
+              'id': model, 'name': model, 'reasoning': True, 'input': ['text'],
+              'contextWindow': 204800, 'maxTokens': 65536,
+              'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0}}]}}}
+with tempfile.TemporaryDirectory(prefix='openswarm-pi-config-') as config_dir:
+    pathlib.Path(config_dir, 'models.json').write_text(json.dumps(config))
+    script = '''set -eu
+mkdir -p /tmp/agent /home/pi
+cp /config/models.json /tmp/agent/models.json
+socat TCP-LISTEN:18765,bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:/run/broker.sock >/dev/null 2>&1 &
+if [ "$1" = rpc ]; then
+  mkdir -p /tmp/pi-sessions
+  exec /runtime/node_modules/.bin/pi --mode rpc --session-dir /tmp/pi-sessions --provider minimax-sandbox --model "$2" \\
+    --tools "$3" --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files
+else
+  exec /runtime/node_modules/.bin/pi -p --mode json --provider minimax-sandbox --model "$2" \\
+    --tools "$3" --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --no-session "$4"
+fi
+'''
+    cmd = ['bwrap', '--unshare-all', '--die-with-parent', '--new-session', '--cap-drop', 'ALL',
+           '--ro-bind', '/usr', '/usr', '--symlink', 'usr/bin', '/bin', '--symlink', 'usr/lib', '/lib',
+           '--symlink', 'usr/lib64', '/lib64', '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
+           '--tmpfs', '/home', '--dir', '/run', '--ro-bind', runtime, '/runtime',
+           '--ro-bind', config_dir, '/config', '--ro-bind', broker, '/run/broker.sock']
+    deps_root = os.environ.get('OPENSWARM_PI_DEPS_ROOT')
+    if deps_root:
+        deps_root = os.path.realpath(deps_root)
+        candidates = [os.path.join(deps_root, 'node_modules')]
+        for section in ('apps', 'packages', 'remote'):
+            candidates.extend(glob.glob(os.path.join(deps_root, section, '*', 'node_modules')))
+        for path in candidates:
+            if os.path.isdir(path):
+                if os.path.commonpath([deps_root, os.path.realpath(path)]) != deps_root:
+                    sys.exit('isolated Pi dependency path leaves the configured project')
+                cmd += ['--ro-bind', path, path]
+    bun = os.environ.get('OPENSWARM_PI_BUN_RUNTIME')
+    path = '/usr/bin:/bin'
+    if bun and os.path.isfile(os.path.join(bun, 'node_modules/.bin/bun')):
+        cmd += ['--ro-bind', os.path.realpath(bun), '/bun']
+        path = '/bun/node_modules/.bin:' + path
+    cmd += ['--ro-bind' if read_only else '--bind', worktree, worktree, '--chdir', worktree,
+            '--clearenv', '--setenv', 'HOME', '/home/pi', '--setenv', 'PATH', path,
+            '--setenv', 'PI_CODING_AGENT_DIR', '/tmp/agent',
+            '/usr/bin/sh', '-c', script, 'pi-isolated', args.mode, model, args.tools, args.prompt or '']
+    sys.exit(subprocess.call(cmd))

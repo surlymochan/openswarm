@@ -83,7 +83,7 @@ class PeerReviewTests(unittest.TestCase):
         self.assertFalse(xs.review_family_compatible("codex", "codex"))
 
     def test_reviewer_commands_are_read_only(self):
-        policy = {"pi": {"provider": "fixture"}}
+        policy = {"pi": {"provider": "fixture", "require_isolation": False}}
         cases = {
             "codex": ("codex", ["--sandbox", "read-only"]),
             "agy": ("agy", ["--mode", "plan", "--json-schema"]),

@@ -9,6 +9,7 @@ import _load  # noqa: E402
 
 xs = _load.load()
 POLICY = xs.load_policy()
+POLICY["pi"].update({"provider": None, "default_model": None, "require_isolation": False})
 FAKE = r"""#!/usr/bin/env python3
 import json, os, sys, time
 mode = os.environ.get("FAKE_PI_MODE", "ok")
