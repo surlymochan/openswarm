@@ -6880,7 +6880,9 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                 answer["state"] = jload(lane_state_path(lane["name"]), {})
             elif op == "assign":
                 state = jload(lane_state_path(lane["name"]), {}) or {}
-                if (lane["backend"] == "pi" and (load_policy().get("pi") or {}).get("require_isolation", True)
+                if lane["backend"] == "copilot" and (req.get("read_only") or req.get("card_type") in READ_ONLY_CARD_TYPES):
+                    answer = {"ok": False, "error": "Copilot lane read-only isolation is unavailable"}
+                elif (lane["backend"] == "pi" and (load_policy().get("pi") or {}).get("require_isolation", True)
                         and (req.get("read_only") or req.get("card_type") in READ_ONLY_CARD_TYPES)):
                     answer = {"ok": False, "error": "isolated Pi does not yet support read-only runs"}
                 elif state.get("state") != "idle" or current.get("run_id"):
