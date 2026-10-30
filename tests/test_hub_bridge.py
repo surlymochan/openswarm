@@ -68,6 +68,18 @@ class HubBridgeTests(unittest.TestCase):
                          [('rejected',), ('accepted',)])
         db.close()
 
+    def test_exhausted_busy_lanes_allow_later_dispatch(self):
+        response = subprocess.CompletedProcess([], 1, json.dumps({'ok':False, 'error':'available lanes changed or rejected the task'}), '')
+        with mock.patch.object(subprocess, 'run', return_value=response):
+            with self.assertRaises(MOD['NoAvailableLane']):
+                MOD['gateway']({'op':'submit'})
+        with mock.patch.dict(G, {'gateway':mock.Mock(side_effect=MOD['NoAvailableLane']('busy'))}):
+            with self.assertRaisesRegex(RuntimeError, 'retry'):
+                MOD['run_submit'](self.args)
+        db = MOD['db_open']()
+        self.assertEqual(db.execute('select state from handoffs').fetchone(), ('rejected',))
+        db.close()
+
     def test_unknown_gateway_error_is_not_exposed(self):
         response = subprocess.CompletedProcess([], 1, json.dumps({'ok':False, 'error':'arbitrary remote text'}), '')
         with mock.patch.object(subprocess, 'run', return_value=response):

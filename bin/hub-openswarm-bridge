@@ -31,7 +31,7 @@ def gateway(payload):
     except ValueError: raise RuntimeError('fleet gateway response unavailable; handoff requires reconciliation')
     if proc.returncode or not data.get('ok'):
         reason = data.get('error')
-        if payload.get('op') == 'submit' and reason == 'no available fleet lane':
+        if payload.get('op') == 'submit' and reason in ('no available fleet lane', 'available lanes changed or rejected the task'):
             raise NoAvailableLane(reason)
         raise RuntimeError(reason if reason in gateway_errors else 'fleet gateway rejected request')
     return data['result']
