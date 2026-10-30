@@ -6,7 +6,6 @@ if nc -z -w 1 127.0.0.1 18744 >/dev/null 2>&1; then
   export HTTPS_PROXY=http://127.0.0.1:18744
   export https_proxy="$HTTPS_PROXY"
 else
-  printf '%s\n' 'Antigravity relay unavailable; using the existing direct route.' >&2
-  unset HTTPS_PROXY https_proxy
+  printf '%s\n' 'Antigravity relay unavailable; using the existing network settings.' >&2
 fi
 exec "$agy_bin" "$@"
