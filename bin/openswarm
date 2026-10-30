@@ -3319,6 +3319,21 @@ def provider_concurrency_limits(policy, keys):
 _FLEET_RESERVATIONS = {}
 
 
+def host_boot_id():
+    try:
+        if sys.platform == "linux":
+            with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as stream:
+                value = stream.read().strip().lower()
+        elif sys.platform == "darwin":
+            value = subprocess.check_output(["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"],
+                                            text=True, timeout=3).strip().lower()
+        else:
+            return None
+        return value if re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", value) else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def fleet_guard_command():
     path = envvar("FLEET_GUARD_CONFIG", "/etc/openswarm-fleet-capacity.json")
     if not os.path.exists(path):
@@ -3375,6 +3390,9 @@ def reserve_provider_slot(rdir, backend, provider, policy, lane_name=None, keep_
     token = uuid.uuid4().hex
     payload = {"op": "acquire", "token": token, "run_id": os.path.basename(rdir),
                "backend": backend, "provider": provider}
+    boot_id = host_boot_id()
+    if boot_id:
+        payload["boot_id"] = boot_id
     while True:
         with open(lock_path, "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)

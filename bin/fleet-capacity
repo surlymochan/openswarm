@@ -69,6 +69,9 @@ try:
     db.execute('PRAGMA busy_timeout=10000')
     db.execute('CREATE TABLE IF NOT EXISTS reservations (token TEXT PRIMARY KEY, host TEXT NOT NULL, run_id TEXT NOT NULL, backend TEXT NOT NULL, provider TEXT, created REAL NOT NULL)')
     db.execute('BEGIN IMMEDIATE')
+    if 'boot_id' not in [row[1] for row in db.execute('PRAGMA table_info(reservations)')]:
+        db.execute('ALTER TABLE reservations ADD COLUMN boot_id TEXT')
+    db.execute('CREATE TABLE IF NOT EXISTS host_boots (host TEXT NOT NULL, boot_id TEXT NOT NULL, current INTEGER NOT NULL, PRIMARY KEY (host,boot_id))')
     if op == 'status':
         rows = db.execute('SELECT host,run_id,backend,provider,created FROM reservations ORDER BY created').fetchall()
         out = {'ok': True, 'reservations': [dict(zip(('host','run_id','backend','provider','created'), row)) for row in rows]}
@@ -98,6 +101,18 @@ try:
             backend, provider = request.get('backend'), request.get('provider')
             if backend not in ALLOWED or provider not in (None, 'minimax-cn'):
                 raise ValueError('invalid backend/provider')
+            boot_id = request.get('boot_id')
+            if boot_id is not None:
+                if not isinstance(boot_id, str) or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', boot_id):
+                    raise ValueError('invalid host boot id')
+                seen = db.execute('SELECT current FROM host_boots WHERE host=? AND boot_id=?', (host, boot_id)).fetchone()
+                if seen and not seen[0]:
+                    raise ValueError('stale host boot id')
+                if not seen:
+                    db.execute('UPDATE host_boots SET current=0 WHERE host=?', (host,))
+                    db.execute('INSERT INTO host_boots VALUES (?,?,1)', (host, boot_id))
+                    db.execute('DELETE FROM reservations WHERE host=? AND boot_id IS NOT NULL AND boot_id<>?', (host, boot_id))
+                    old = db.execute('SELECT host,run_id,backend,provider FROM reservations WHERE token=?', (token,)).fetchone()
             if old:
                 if old != (host,run_id,backend,provider):
                     raise ValueError('reservation token conflict')
@@ -113,7 +128,7 @@ try:
                 if blocked:
                     out = {'ok': True, 'admitted': False, 'blocked': blocked}
                 else:
-                    db.execute('INSERT INTO reservations VALUES (?,?,?,?,?,?)', (token,host,run_id,backend,provider,time.time()))
+                    db.execute('INSERT INTO reservations (token,host,run_id,backend,provider,created,boot_id) VALUES (?,?,?,?,?,?,?)', (token,host,run_id,backend,provider,time.time(),boot_id))
                     out = {'ok': True, 'admitted': True}
     db.execute('COMMIT')
     print(json.dumps(out, separators=(',',':')))

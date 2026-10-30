@@ -82,6 +82,27 @@ class FleetCapacityTests(unittest.TestCase):
         self.assertEqual(self.call('gocc', op='recover', host='gores1', run_id='orphan',
                                    confirm='all-executor-processes-stopped')['recovered'], 1)
 
+    def test_reboot_reclaims_only_identified_older_boot_of_same_host(self):
+        a = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+        b = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+        def acquire(host, number, backend, boot=None):
+            return self.call(host, op='acquire', token=f'{number:032x}', run_id=f'run-{number}',
+                             backend=backend, provider=None, boot_id=boot)
+        self.assertTrue(acquire('gores1', 1, 'cursor', a)['admitted'])
+        self.assertTrue(acquire('gocc', 2, 'codex', a)['admitted'])
+        self.assertEqual(acquire('gores1', 3, 'cursor', a)['blocked'], ['cursor'])
+        self.assertTrue(acquire('gores1', 4, 'cursor', b)['admitted'])
+        self.assertFalse(acquire('gores1', 5, 'agy', a)['ok'])
+        rows = self.call('gocc', op='status')['reservations']
+        self.assertEqual({row['run_id'] for row in rows}, {'run-2', 'run-4'})
+
+    def test_reboot_leaves_legacy_unidentified_reservation(self):
+        a = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+        self.assertTrue(self.call('gores1', op='acquire', token='1' * 32, run_id='legacy',
+                                  backend='cursor', provider=None)['admitted'])
+        self.assertEqual(self.call('gores1', op='acquire', token='2' * 32, run_id='new',
+                                   backend='cursor', provider=None, boot_id=a)['blocked'], ['cursor'])
+
     def test_host_limit_is_shared_across_backend_types(self):
         first = dict(op='acquire', token='1' * 32, run_id='one', backend='codex', provider=None)
         second = dict(op='acquire', token='2' * 32, run_id='two', backend='agy', provider=None)
