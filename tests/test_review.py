@@ -67,6 +67,21 @@ class PeerReviewTests(unittest.TestCase):
         self.assertEqual((self.repo / "module.py").read_text(), "value = 2\n")
         self.assertEqual(len(self.git("worktree", "list", "--porcelain").split("worktree ")) - 1, 1)
 
+    def test_timed_out_review_releases_the_fleet_reservation(self):
+        guard = self.root / 'guard.json'
+        coordinator = Path(_load.ROOT) / 'bin/fleet-capacity'
+        guard.write_text(json.dumps({'command': [str(coordinator), 'gocc']}))
+        script = self.root / 'slow-review.py'
+        script.write_text('import time\ntime.sleep(30)\n')
+        env = {'OPENSWARM_FLEET_GUARD_CONFIG': str(guard), 'OPENSWARM_FLEET_CAPACITY_DIR': str(self.root / 'capacity')}
+        with mock.patch.dict(os.environ, env), mock.patch.object(xs, 'review_command', return_value=[sys.executable, str(script)]):
+            with self.assertRaisesRegex(RuntimeError, 'reviewer timed out'):
+                xs.invoke_reviewer({'backend': 'agy'}, 'review', str(self.repo), str(self.run_dir),
+                                   {'review': {'timeout_seconds': 2}})
+            status = subprocess.run([str(coordinator), 'gocc'], input=json.dumps({'op': 'status'}),
+                                    text=True, capture_output=True, check=True)
+        self.assertEqual(json.loads(status.stdout)['reservations'], [])
+
     def test_perform_review_stores_findings_and_peer_ledger_fields(self):
         findings = [{"severity": "P1", "path": "module.py", "line": 1,
                      "title": "Value is not preserved", "body": "The changed value breaks the contract."}]
@@ -173,7 +188,7 @@ class PeerReviewTests(unittest.TestCase):
             subprocess.CompletedProcess([], 0, invalid, ""),
             subprocess.CompletedProcess([], 0, valid, ""),
         ]
-        with mock.patch.object(xs.subprocess, "run", side_effect=completed) as run:
+        with mock.patch.object(xs, "run_peer_reviewer", side_effect=completed) as run:
             payload = xs.invoke_reviewer({"backend": "agy", "binary": "/fake/agy", "model": "test"},
                                          "review the diff", str(self.repo), str(self.run_dir), {})
         self.assertEqual(payload, {"findings": [], "verdict": "approve"})
@@ -191,7 +206,7 @@ class PeerReviewTests(unittest.TestCase):
             subprocess.CompletedProcess([], 0, "not json", ""),
             subprocess.CompletedProcess([], 0, "still not json", ""),
         ]
-        with mock.patch.object(xs.subprocess, "run", side_effect=completed):
+        with mock.patch.object(xs, "run_peer_reviewer", side_effect=completed):
             with self.assertRaisesRegex(RuntimeError, "after repair retry"):
                 xs.invoke_reviewer({"backend": "agy", "binary": "/fake/agy"}, "review", str(self.repo),
                                    str(self.run_dir), {})
@@ -202,7 +217,7 @@ class PeerReviewTests(unittest.TestCase):
     def test_agy_permission_denial_is_reported_without_a_paid_format_retry(self):
         output = json.dumps({"response": "", "denied_actions": [{"action": "command"}]})
         completed = subprocess.CompletedProcess([], 0, output, "agy: no output produced; command permission denied")
-        with mock.patch.object(xs.subprocess, "run", return_value=completed) as run:
+        with mock.patch.object(xs, "run_peer_reviewer", return_value=completed) as run:
             with self.assertRaisesRegex(RuntimeError, "tool action was denied"):
                 xs.invoke_reviewer({"backend": "agy", "binary": "/fake/agy"}, "review", str(self.repo),
                                    str(self.run_dir), {})

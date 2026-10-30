@@ -5343,6 +5343,19 @@ def redact_review_raw(value):
                   r'[A-Za-z0-9._:-]+(["\']?)', r'\1[REDACTED]\2', text)
 
 
+def run_peer_reviewer(command, repo, timeout):
+    process = subprocess.Popen(command, cwd=repo, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        kill_tree(process.pid, grace=0.1)
+        stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(command, timeout, output=stdout or error.stdout,
+                                        stderr=stderr or error.stderr) from error
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
 def invoke_reviewer(reviewer, prompt, repo, rdir, policy):
     os.makedirs(rdir, exist_ok=True)
     raw_attempts = []
@@ -5396,10 +5409,10 @@ def invoke_reviewer(reviewer, prompt, repo, rdir, policy):
                 command = review_command(reviewer, active_prompt, repo, scratch_dir, policy)
                 try:
                     safe_release = False
-                    completed = subprocess.run(command, cwd=repo, stdin=subprocess.DEVNULL,
-                                               capture_output=True, text=True, timeout=timeout, check=False)
+                    completed = run_peer_reviewer(command, repo, timeout)
                     safe_release = True
                 except subprocess.TimeoutExpired as error:
+                    safe_release = True
                     raw = (open(output_path, encoding="utf-8").read() if os.path.isfile(output_path)
                            else output_text(error.stdout))
                     stderr = output_text(error.stderr)
