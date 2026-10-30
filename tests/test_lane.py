@@ -456,6 +456,36 @@ class LaneTests(unittest.TestCase):
             self.assertIn(value, events)
         self.assertNotIn("session/prompt", [entry.get("method") for entry in self.cursor_log()])
 
+    def test_agy_quota_reset_beyond_budget_does_not_retry(self):
+        self.set_config("agy")
+        self.env["FAKE_AGY_MODE"] = "long-quota"
+        quota_file = self.root / "quota.txt"
+        quota_file.write_text("0")
+        self.env["FAKE_AGY_QUOTA_FILE"] = str(quota_file)
+        self.start_lane()
+        run_id = self.assign("review the fixture")
+        self.wait_run(run_id)
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual(len(result["attempts"]), 1)
+        self.assertEqual(result["attempts"][0]["error_class"], "rate_limit")
+        self.wait_for(lambda: self.lane_state().get("state") == "idle")
+        rows = json.loads(self.cli("lane", "status").stdout)
+        self.assertEqual(rows[0]["state"], "quota_exhausted")
+        self.assertGreater(rows[0]["quota_reset_at"], time.time())
+        self.assertLessEqual(rows[0]["quota_reset_at"], time.time() + 3600)
+        state_path = self.data / "lanes" / self.lane_name / "state.json"
+        state = json.loads(state_path.read_text())
+        state["quota_until"] = 1
+        state_path.write_text(json.dumps(state))
+        self.wait_for(lambda: self.lane_state().get("quota_until", 0) > time.time())
+        self.assertEqual(json.loads(self.cli("lane", "status").stdout)[0]["state"], "quota_exhausted")
+        quota_file.write_text("0.5")
+        state = json.loads(state_path.read_text())
+        state["quota_until"] = 1
+        state_path.write_text(json.dumps(state))
+        self.wait_for(lambda: self.lane_state().get("quota_model") is None)
+        self.assertEqual(json.loads(self.cli("lane", "status").stdout)[0]["state"], "idle")
+
     def test_agy_assign_commits_and_writes_normal_result(self):
         self.set_config("agy")
         self.start_lane()

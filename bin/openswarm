@@ -7766,7 +7766,7 @@ def lane_do_run(lane, spec, child, server, current):
                              load_policy(), error_tail or "rate limited")
                 reset_seconds = agy_quota_reset_seconds(attempt_lane["backend"], error_tail)
                 if reset_seconds is not None and reset_seconds > 0:
-                    lane_write_state(lane["name"], quota_model=model, quota_until=NOW() + reset_seconds)
+                    lane_write_state(lane["name"], quota_model=model, quota_until=NOW() + min(reset_seconds, 3600))
                 can_retry = (retries < max_rate_retries and not spec.get("abort_requested")
                              and (reset_seconds is None or NOW() + reset_seconds < deadline))
                 wait_seconds = max(rate_limit_delay(load_policy(), retries), reset_seconds or 0) if can_retry else 0
@@ -7824,6 +7824,26 @@ def lane_do_run(lane, spec, child, server, current):
         return lane_finalize_run(lane, spec, ws, None, {}, error_class, 1, evp)
 
 
+def agy_quota_available(lane, child):
+    """Read the model group's quota without starting an inference turn."""
+    binary = envvar("AGY_BIN") or lane.get("binary") or agy_bin()
+    if not binary:
+        return False
+    try:
+        result = subprocess.run([binary, "-p", "/usage", "--output-format", "json"],
+                                cwd=child.cwd, env=child.env, stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, timeout=30)
+        data = json.loads(result.stdout)
+        group = "Gemini Models" if "gemini" in lane["model"].lower() else "Claude and GPT models"
+        groups = data.get("command", {}).get("data", {}).get("groups", [])
+        buckets = next((item.get("buckets", []) for item in groups if item.get("name") == group), [])
+        return (result.returncode == 0 and data.get("status") == "SUCCESS" and bool(buckets)
+                and all(isinstance(item.get("remaining_fraction"), (int, float))
+                        and item["remaining_fraction"] > 0 for item in buckets))
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        return False
+
+
 def cmd_lane_serve(lane, policy):
     name = lane["name"]
     server = lane_ctl_listener(name)
@@ -7832,6 +7852,11 @@ def cmd_lane_serve(lane, policy):
     lane_write_state(name, name=name, backend=lane["backend"], model=lane["model"], effort=lane.get("effort"),
                      state="starting", supervisor_pid=os.getpid(), child_pid=None, current_run=None,
                      started=started, last_error=None, resolved_model=None)
+    quota_state = jload(lane_state_path(name), {}) or {}
+    if lane["backend"] == "agy" and quota_state.get("quota_model") == lane["model"]:
+        due = quota_state.get("quota_until")
+        if isinstance(due, (int, float)) and due > NOW() + 3600:
+            lane_write_state(name, quota_until=NOW() + 3600)
     try:
         wt = os.path.join(lane_root(name), "wt")
         # Create the fixed worktree before launching a cwd-bound Pi child.
@@ -7918,6 +7943,13 @@ def cmd_lane_serve(lane, policy):
         if child:
                 lane_write_state(name, state="idle", child_pid=child.pid, current_run=None,
                                  turn_state=None, concurrency_keys=[])
+        if child and lane["backend"] == "agy":
+            quota_state = jload(lane_state_path(name), {}) or {}
+            if (quota_state.get("quota_model") == lane["model"] and
+                    isinstance(quota_state.get("quota_until"), (int, float)) and quota_state["quota_until"] <= NOW()):
+                lane_write_state(name, quota_until=NOW() + 3600)
+                if agy_quota_available(lane, child):
+                    lane_write_state(name, quota_model=None, quota_until=None)
         timeout = max(0, min(0.5, next_start - NOW())) if child is None else 0.5
         try:
             ready, _, _ = select.select([server], [], [], timeout)
@@ -8041,7 +8073,7 @@ def lane_status_rows():
         model = state.get("resolved_model") or lane["model"]
         quota_until = state.get("quota_until")
         if (lane_state == "idle" and lane["backend"] == "agy" and state.get("quota_model") == model
-                and isinstance(quota_until, (int, float)) and not isinstance(quota_until, bool) and quota_until > NOW()):
+                and isinstance(quota_until, (int, float)) and not isinstance(quota_until, bool)):
             lane_state = "quota_exhausted"
         rows.append({"name": lane["name"], "state": lane_state, "backend": lane["backend"],
                      "model": model, "pid": state.get("child_pid"), "supervisor_pid": pid,
