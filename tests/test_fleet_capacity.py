@@ -67,6 +67,26 @@ class FleetCapacityTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'required but missing'):
                 xs.fleet_guard_command()
 
+    def test_release_retries_transient_connection_failure(self):
+        rdir = os.path.realpath(os.path.join(self.temp.name, 'run'))
+        xs._FLEET_RESERVATIONS[rdir] = (['guard'], {'run_id': 'run', 'token': 'a' * 32})
+        self.addCleanup(xs._FLEET_RESERVATIONS.pop, rdir, None)
+        with mock.patch.object(xs, 'fleet_guard_call', side_effect=[RuntimeError('unavailable'), {'ok': True}]) as call, \
+                mock.patch.object(xs.time, 'sleep'):
+            self.assertTrue(xs.release_fleet_slot(rdir))
+        self.assertEqual(call.call_count, 2)
+        self.assertNotIn(rdir, xs._FLEET_RESERVATIONS)
+
+    def test_release_retains_reservation_after_repeated_failure(self):
+        rdir = os.path.realpath(os.path.join(self.temp.name, 'run'))
+        xs._FLEET_RESERVATIONS[rdir] = (['guard'], {'run_id': 'run', 'token': 'a' * 32})
+        self.addCleanup(xs._FLEET_RESERVATIONS.pop, rdir, None)
+        with mock.patch.object(xs, 'fleet_guard_call', side_effect=RuntimeError('unavailable')) as call, \
+                mock.patch.object(xs.time, 'sleep'), mock.patch.object(xs, 'set_status'):
+            self.assertFalse(xs.release_fleet_slot(rdir))
+        self.assertEqual(call.call_count, 3)
+        self.assertIn(rdir, xs._FLEET_RESERVATIONS)
+
     def test_remote_review_assignment_passes_read_only_to_lane(self):
         root = pathlib.Path(self.temp.name)
         binary = root / '.local/bin/openswarm'

@@ -3353,11 +3353,15 @@ def release_fleet_slot(rdir):
     if not item:
         return True
     command, payload = item
-    try:
-        fleet_guard_call(command, {"op": "release", "run_id": payload["run_id"], "token": payload["token"]})
-    except RuntimeError as error:
-        set_status(rdir, fleet_reservation_error=str(error))
-        return False
+    for attempt in range(3):
+        try:
+            fleet_guard_call(command, {"op": "release", "run_id": payload["run_id"], "token": payload["token"]})
+            break
+        except RuntimeError as error:
+            if attempt == 2:
+                set_status(rdir, fleet_reservation_error=str(error))
+                return False
+            time.sleep(0.2 * (attempt + 1))
     _FLEET_RESERVATIONS.pop(os.path.realpath(rdir), None)
     return True
 
