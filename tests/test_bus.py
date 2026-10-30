@@ -343,8 +343,9 @@ print(json.dumps({'type':'message_end','message':message}), flush=True)
         (knowledge / "lessons" / "L-0300.yaml").write_text(
             "id: L-0300\nrule: Validate worker edits with a focused test.\nguard_level: L2\n"
             "applies_to:\n  card_types: [fix]\n  paths: [src/*.py]\n  backends: [pi]\n")
-        self.policy = xs.deep_merge(self.policy, {"knowledge": {"repo": str(knowledge)}})
-        local_policy = {"knowledge": {"repo": str(knowledge)},
+        self.policy = xs.deep_merge(self.policy, {"knowledge": {"repo": str(knowledge)},
+                                                 "pi": {"require_isolation": False}})
+        local_policy = {"knowledge": {"repo": str(knowledge)}, "pi": {"require_isolation": False},
                         "bus": {"repo": "org/bus", "allowed_executors": ["executor"], "poll_seconds": 0.02}}
         (self.data / "policy.local.json").write_text(json.dumps(local_policy))
         run_id = "worker-e2e"
