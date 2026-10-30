@@ -85,6 +85,30 @@ class HubBridgeTests(unittest.TestCase):
                 runpy.run_path(str(ROOT / 'bin/hub-fleet-gateway'))
         self.assertEqual(json.loads(output.getvalue())['error'], 'no available fleet lane')
 
+    def test_no_lane_through_gateway_then_retry(self):
+        fake_home = self.path / 'gateway-home'
+        fake_cli = fake_home / '.local/bin/openswarm'
+        fake_cli.parent.mkdir(parents=True)
+        marker = self.path / 'called'
+        fake_cli.write_text('#!' + sys.executable + '\n' +
+            'import json,pathlib,sys\np=pathlib.Path(' + repr(str(marker)) + ')\n' +
+            'if not p.exists():\n p.touch(); print(json.dumps({"ok":False,"error":"no available fleet lane"})); sys.exit(1)\n' +
+            'print(json.dumps({"ok":True,"id":"run-after-busy","state":"queued","host":"gocc","backend":"agy","model":"x"}))\n')
+        fake_cli.chmod(0o755)
+        tunnel = self.path / 'gateway-tunnel.py'
+        tunnel.write_text('import os,sys\nos.environ["HOME"]=' + repr(str(fake_home)) + '\n' +
+                          'os.execv(sys.executable,[sys.executable,' + repr(str(ROOT / 'bin/hub-fleet-gateway')) + '])\n')
+        with mock.patch.dict(G, {'transport':[sys.executable, str(tunnel)]}):
+            with self.assertRaisesRegex(RuntimeError, 'no available fleet lane.*retry'):
+                MOD['run_submit'](self.args)
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                MOD['run_submit'](self.args)
+            self.assertEqual(json.loads(output.getvalue())['id'], 'run-after-busy')
+        db = MOD['db_open']()
+        self.assertEqual(db.execute('select state from handoffs order by created').fetchall(),
+                         [('rejected',), ('accepted',)])
+        db.close()
+
     def test_review_profile_reaches_gateway(self):
         self.card.write_text('Repository: openbot\nExecutor-Type: review\nDifficulty: 2\nReview the code.\n')
         gateway = mock.Mock(return_value={'id':'run-review','state':'queued','host':'gocc','backend':'copilot','model':'x'})
