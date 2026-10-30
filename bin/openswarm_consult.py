@@ -352,6 +352,7 @@ def _ask_one(core, profile, prompt, run_dir, deadline, policy, reservation_id):
     worktree = None
     worktree_parent = None
     worktree_repo = None
+    worktree_head = None
     try:
         acquired = core.reserve_provider_slot(slot_dir, profile["backend"], provider, policy,
                                               keep_waiting=lambda: core.NOW() < deadline)
@@ -367,6 +368,10 @@ def _ask_one(core, profile, prompt, run_dir, deadline, policy, reservation_id):
                                       capture_output=True, text=True, timeout=30)
             if prepared.returncode:
                 raise RuntimeError("could not create independent consult worktree")
+            head = subprocess.run(["git", "-C", worktree, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=30)
+            if head.returncode:
+                raise RuntimeError("could not inspect consult worktree HEAD")
+            worktree_head = head.stdout.strip()
             profile = dict(profile, cwd=worktree)
         raw_attempts = []
         active_prompt = prompt
@@ -457,7 +462,12 @@ def _ask_one(core, profile, prompt, run_dir, deadline, policy, reservation_id):
         if worktree and worktree_repo and stopped and os.path.isdir(worktree):
             status = subprocess.run(["git", "-C", worktree, "status", "--porcelain"],
                                     capture_output=True, text=True, timeout=30)
-            row["worktree_changes_detected"] = bool(status.stdout) if status.returncode == 0 else None
+            head = subprocess.run(["git", "-C", worktree, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=30)
+            if status.returncode or head.returncode or worktree_head is None:
+                row.update(valid=False, error="could not inspect consult worktree before cleanup")
+                row["worktree_changes_detected"] = None
+            else:
+                row["worktree_changes_detected"] = bool(status.stdout) or head.stdout.strip() != worktree_head
             removed = subprocess.run(["git", "-C", worktree_repo, "worktree", "remove", "--force", worktree],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
             if removed.returncode:
