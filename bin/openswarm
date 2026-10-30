@@ -6528,7 +6528,7 @@ def lane_prepare_workspace(lane, rid, base_rev=None):
 
 
 class LaneChild:
-    def __init__(self, lane, cwd, policy):
+    def __init__(self, lane, cwd, policy, read_only=False):
         self.lane, self.cwd = lane, cwd
         _tmpdir, self.env = configure_executor_environment(cwd)
         self.events = queue.Queue()
@@ -6554,6 +6554,8 @@ class LaneChild:
             if lane.get("provider"):
                 cmd += ["--provider", lane["provider"]]
             cmd += ["--model", lane["model"]]
+            if read_only:
+                cmd += ["--tools", "read,grep,find,ls"]
         elif backend == "hermes":
             binary = lane.get("binary") or hermes_bin(policy)
             if not binary:
@@ -6880,10 +6882,7 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                 answer["state"] = jload(lane_state_path(lane["name"]), {})
             elif op == "assign":
                 state = jload(lane_state_path(lane["name"]), {}) or {}
-                if (lane["backend"] == "pi" and (load_policy().get("pi") or {}).get("require_isolation", True)
-                        and (req.get("read_only") or req.get("card_type") in READ_ONLY_CARD_TYPES)):
-                    answer = {"ok": False, "error": "isolated Pi does not yet support read-only runs"}
-                elif state.get("state") != "idle" or current.get("run_id"):
+                if state.get("state") != "idle" or current.get("run_id"):
                     answer = {"ok": False, "error": f"lane {lane['name']} is busy ({state.get('state')})"}
                 else:
                     rid = req.get("run_id")
@@ -7554,6 +7553,7 @@ def lane_do_run(lane, spec, child, server, current):
     if lane["backend"] in ("cursor", "copilot"):
         lane_write_state(lane["name"], model=lane["model"], resolved_model=None)
     ws = None
+    readonly_child = None
     turn, pending = {}, []
     try:
         ws = lane_prepare_workspace(lane, rid, spec.get("base"))
@@ -7575,6 +7575,10 @@ def lane_do_run(lane, spec, child, server, current):
                            "meta": {"usage": {}}, "events": evp, "error_tail": None}
                 return lane_finalize_run(lane, spec, ws, None, {}, "prepare_failed", prepared["rc"], evp,
                                          attempts=[attempt])
+        if (lane["backend"] == "pi" and (load_policy().get("pi") or {}).get("require_isolation", True)
+                and (spec.get("read_only") or spec.get("card_type") in READ_ONLY_CARD_TYPES)):
+            readonly_child = LaneChild(lane, ws["path"], load_policy(), read_only=True)
+            child = readonly_child
         if spec.get("verify"):
             rewritten = rewrite_verify_paths(spec["verify"], ws["repo"], ws["root"])
             if rewritten != spec["verify"]:
@@ -7694,6 +7698,9 @@ def lane_do_run(lane, spec, child, server, current):
                            **exec_pass_fields(False, False, bool(spec.get("verify")), None)})
             return status
         return lane_finalize_run(lane, spec, ws, None, {}, error_class, 1, evp)
+    finally:
+        if readonly_child is not None:
+            readonly_child.close()
 
 
 def cmd_lane_serve(lane, policy):
