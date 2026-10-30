@@ -4,7 +4,10 @@ import runpy
 import contextlib
 import io
 import json
+import socket
 import sys
+import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -112,5 +115,59 @@ class FleetAutoTests(unittest.TestCase):
         with mock.patch.object(G['subprocess'], 'run', return_value=mock.Mock(returncode=1, stdout=json.dumps(unknown))):
             with self.assertRaisesRegex(RuntimeError, 'gateway rejected'):
                 G['remote']({'op': 'assign', 'lane': 'A1'})
+
+    def test_local_closed_socket_does_not_dispatch_next_lane(self):
+        local = [{'name':'K1','state':'idle','backend':'cursor','model':'composer'},
+                 {'name':'M1','state':'idle','backend':'pi','model':'minimax'}]
+        args = ['openswarm-auto','--type','test','--difficulty','2','--base','abcdef0','--prompt','task']
+        reply = mock.Mock(returncode=1, stdout=json.dumps({'ok':False, 'error':'lane closed control socket'}))
+        with mock.patch.object(sys, 'argv', args), mock.patch.dict(G, {'local_lanes':lambda: local, 'remote':lambda req: []}), \
+             mock.patch.object(G['subprocess'], 'run', return_value=reply) as run, \
+             self.assertRaisesRegex(RuntimeError, 'acknowledgement unavailable'):
+            MOD['main']()
+        self.assertEqual(run.call_count, 1)
+
+    def test_real_lane_socket_close_keeps_dispatch_uncertain(self):
+        lane = runpy.run_path(str(pathlib.Path(__file__).resolve().parents[1] / 'bin' / 'openswarm'))
+        with tempfile.TemporaryDirectory(prefix='ack-', dir='/tmp') as directory:
+            sockpath = str(pathlib.Path(directory) / 'lane.sock')
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(sockpath)
+            listener.listen(1)
+            received = []
+            def accept_without_reply():
+                connection, _ = listener.accept()
+                with connection:
+                    received.append(json.loads(connection.recv(65536)))
+                listener.close()
+            thread = threading.Thread(target=accept_without_reply)
+            thread.start()
+            with mock.patch.dict(lane['lane_call'].__globals__, {'lane_socket_path':lambda _: sockpath}):
+                reply = lane['lane_call']('K1', {'op':'assign', 'run_id':'real-socket-test'})
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(received[0]['run_id'], 'real-socket-test')
+        self.assertEqual(reply, {'ok':False, 'error':'lane closed control socket'})
+        local = [{'name':'K1','state':'idle','backend':'cursor','model':'composer'},
+                 {'name':'M1','state':'idle','backend':'pi','model':'minimax'}]
+        args = ['openswarm-auto','--type','test','--difficulty','2','--base','abcdef0','--prompt','task']
+        result = mock.Mock(returncode=1, stdout=json.dumps(reply))
+        with mock.patch.object(sys, 'argv', args), mock.patch.dict(G, {'local_lanes':lambda: local, 'remote':lambda req: []}), \
+             mock.patch.object(G['subprocess'], 'run', return_value=result) as run, \
+             self.assertRaisesRegex(RuntimeError, 'acknowledgement unavailable'):
+            MOD['main']()
+        self.assertEqual(run.call_count, 1)
+
+    def test_local_explicit_busy_falls_back(self):
+        local = [{'name':'K1','state':'idle','backend':'cursor','model':'composer'},
+                 {'name':'M1','state':'idle','backend':'pi','model':'minimax'}]
+        args = ['openswarm-auto','--type','test','--difficulty','2','--base','abcdef0','--prompt','task']
+        busy = mock.Mock(returncode=1, stdout=json.dumps({'ok':False, 'error':'lane K1 is busy (busy)'}))
+        accepted = mock.Mock(returncode=0, stdout=json.dumps({'ok':True, 'id':'next-run', 'state':'queued'}))
+        with mock.patch.object(sys, 'argv', args), mock.patch.dict(G, {'local_lanes':lambda: local, 'remote':lambda req: []}), \
+             mock.patch.object(G['subprocess'], 'run', side_effect=[busy, accepted]), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            MOD['main']()
+        self.assertEqual(json.loads(output.getvalue())['lane'], 'M1')
 
 if __name__ == '__main__': unittest.main()
