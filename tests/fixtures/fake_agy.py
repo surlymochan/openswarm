@@ -45,6 +45,9 @@ if mode == "print-timeout":
                                         "response":json.dumps(partial)}})
     time.sleep(30)  # An early result can arrive before the process actually exits.
     sys.exit(0)
+if mode == "long-quota":
+    send({"type":"result", "status":"ERROR", "error":"Individual quota reached. Resets in 131h29m32s."})
+    sys.exit(1)
 if mode == "forbidden-once":
     marker = os.environ["FAKE_AGY_ONCE_MARKER"]
     if not os.path.exists(marker):

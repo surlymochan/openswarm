@@ -504,6 +504,16 @@ class LaneTests(unittest.TestCase):
                                 capture_output=True, env=self.env, check=True)
         self.assertEqual(json.loads(status.stdout)["reservations"], [])
 
+    def test_agy_quota_reset_beyond_budget_does_not_retry(self):
+        self.set_config("agy")
+        self.env["FAKE_AGY_MODE"] = "long-quota"
+        self.start_lane()
+        run_id = self.assign("review the fixture")
+        self.wait_run(run_id)
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual(len(result["attempts"]), 1)
+        self.assertEqual(result["attempts"][0]["error_class"], "rate_limit")
+
     def test_agy_403_stops_process_and_releases_fleet_slot(self):
         self.set_config("agy")
         self.env["FAKE_AGY_MODE"] = "forbidden"

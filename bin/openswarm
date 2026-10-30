@@ -3462,6 +3462,16 @@ def agy_upstream_forbidden(backend, text):
     return backend == "agy" and bool(re.search(r"\b403\b", text or "")) and "html response" in (text or "").lower()
 
 
+def agy_quota_reset_seconds(backend, text):
+    if backend != "agy":
+        return None
+    match = re.search(r"\bresets in\s+(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?\b", text or "", re.I)
+    if not match or not any(match.groups()):
+        return None
+    hours, minutes, seconds = (int(x or 0) for x in match.groups())
+    return hours * 3600 + minutes * 60 + seconds
+
+
 def executor_error_class(rc, final, err_text, backend=None):
     if rc == 133:
         return "risk_blocked"
@@ -3549,8 +3559,10 @@ def run_executor_with_rate_limit(backend, decision, state, prompt, wd, rdir, bud
                      (err_text or "rate limited")[-200:])
         can_resume = (backend in ("pi", "cursor", "agy") or
                       (backend == "codex" and (meta or {}).get("thread_id"))) and (meta or {}).get("resume_supported") is not False
-        can_retry = retries < max_retries and can_resume
-        wait_seconds = rate_limit_delay(policy, retries) if can_retry else 0
+        reset_seconds = agy_quota_reset_seconds(backend, err_text)
+        can_retry = (retries < max_retries and can_resume
+                     and (reset_seconds is None or NOW() + reset_seconds < budget_deadline))
+        wait_seconds = max(rate_limit_delay(policy, retries), reset_seconds or 0) if can_retry else 0
         lane_record_event(event_file, {"type": "RATELIMIT", "retry": retries + 1 if can_retry else retries,
                                        "max_retries": max_retries, "wait_seconds": round(wait_seconds, 3),
                                        "backend": backend, "provider": provider})
@@ -7681,8 +7693,10 @@ def lane_do_run(lane, spec, child, server, current):
                 trip_breaker(rate_limit_breaker_key(attempt_lane["backend"], attempt_lane,
                                                      error_tail or "rate limited"),
                              load_policy(), error_tail or "rate limited")
-                can_retry = retries < max_rate_retries and not spec.get("abort_requested")
-                wait_seconds = rate_limit_delay(load_policy(), retries) if can_retry else 0
+                reset_seconds = agy_quota_reset_seconds(attempt_lane["backend"], error_tail)
+                can_retry = (retries < max_rate_retries and not spec.get("abort_requested")
+                             and (reset_seconds is None or NOW() + reset_seconds < deadline))
+                wait_seconds = max(rate_limit_delay(load_policy(), retries), reset_seconds or 0) if can_retry else 0
                 rate_event = {"type": "RATELIMIT", "retry": retries + 1 if can_retry else retries,
                               "max_retries": max_rate_retries, "wait_seconds": round(wait_seconds, 3),
                               "backend": attempt_lane["backend"], "provider": provider}

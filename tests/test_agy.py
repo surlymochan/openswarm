@@ -33,6 +33,9 @@ if mode == "sleep":
 if mode == "auth":
     sys.stderr.write("FatalAuthenticationError: authentication required\n")
     sys.exit(1)
+if mode == "long-quota":
+    print(json.dumps({"type":"result", "status":"ERROR", "error":"Individual quota reached. Resets in 131h29m32s."}))
+    sys.exit(1)
 if mode == "rate" or (mode == "rate-once" and not os.path.exists(log + ".retry")):
     if mode == "rate-once":
         open(log + ".retry", "w").close()
@@ -203,6 +206,16 @@ class AgyBackend(unittest.TestCase):
         _entry, result = self.last_result()
         self.assertNotEqual(result["status"], "done")
         self.assertIn("print_timeout", result["attempts"][0]["error_tail"])
+
+    def test_long_quota_reset_does_not_retry_past_budget(self):
+        os.environ["FAKE_AGY_MODE"] = "long-quota"
+        self.assertEqual(self.dispatch(), 1)
+        _entry, result = self.last_result()
+        self.assertEqual(len(result["attempts"]), 1)
+        self.assertEqual(result["attempts"][0]["error_class"], "rate_limit")
+        self.assertEqual(xs.agy_quota_reset_seconds("agy", "Resets in 131h29m32s."), 473372)
+        self.assertIsNone(xs.agy_quota_reset_seconds("codex", "Resets in 131h29m32s."))
+        self.assertIsNone(xs.agy_quota_reset_seconds("agy", "quota exceeded"))
 
     def test_rate_limit_is_classified_and_trips_a_breaker(self):
         os.environ["FAKE_AGY_MODE"] = "rate"
