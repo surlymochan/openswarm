@@ -27,6 +27,8 @@ class FakeFleetFixture:
         self.repo = self.root / "local"
         self.repo.mkdir()
         self.git(self.repo, "init", "-q")
+        # Git may detach automatic maintenance after a commit or fetch. These short-lived
+        # fixture repos are deleted immediately after the test and need no background work.
         self.git(self.repo, "config", "maintenance.auto", "false")
         self.git(self.repo, "config", "gc.auto", "0")
         (self.repo / "base").write_text("base")

@@ -2980,7 +2980,7 @@ def plan_copilot(prof, st, policy, forced, notes):
     if not copilot_bin():
         return None, "no working copilot binary"
     cfg = policy.get("copilot") or {}
-    model = prof.get("model") or (cfg.get("complex_model") if prof.get("difficulty", 3) >= cfg.get("complex_difficulty", 4) else cfg.get("default_model"))
+    model = prof.get("model") or (cfg.get("complex_model") if prof.get("difficulty", 3) >= cfg.get("complex_difficulty", 4) else None) or cfg.get("default_model")
     if not model:
         return None, "copilot requires a verified model selection"
     if f"copilot/{model}" in breakers() or "copilot/all" in breakers():
@@ -4360,8 +4360,7 @@ def exec_pi(d, st, prompt, wd, rdir, timeout, evp):
         cmd += ["--model", d["model"]]
     if d.get("_resume_session"):
         cmd.append("--continue")
-    read_only = (d.get("profile") or {}).get("read_only") is True
-    cmd += ["--tools", "read,grep,find,ls" if isolated and read_only else PI_TOOLS, prompt]
+    cmd += ["--tools", PI_TOOLS, prompt]
     rc = run_proc(cmd, wd, os.environ.copy(), timeout, evp)
     usage, text, errors = pi_usage(evp)
     final = extract_json(text) if isinstance(text, str) else None
@@ -5254,7 +5253,8 @@ def review_command(reviewer, prompt, repo, scratch_dir, policy):
             command += ["--provider", reviewer.get("provider") or cfg["provider"]]
         if model:
             command += ["--model", model]
-        command += ["--tools", "read,grep,find,ls", prompt]
+        isolated = os.path.realpath(binary) == os.path.realpath(os.path.join(os.path.dirname(__file__), "pi-isolated"))
+        command += ["--tools", PI_TOOLS if isolated else "read,grep,find,ls", prompt]
     else:
         command = [binary, "-p", "--mode=ask", "--output-format", "text"]
         if model:

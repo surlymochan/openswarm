@@ -43,6 +43,7 @@ class CopilotTests(unittest.TestCase):
                               "print(json.dumps({'type':'assistant.message','data':{'content':"
                               "json.dumps({'status':'done','summary':'ok','files_changed':[],"
                               "'tests':'none','followups':[]})}}))\n"
+                              "print(json.dumps({'type':'result','exitCode':0}))\n"
                               "if os.environ.get('FAKE_SESSION_ERROR'):"
                               " print(json.dumps({'type':'session.error','data':{'message':'failure'}}))\n")
             binary.chmod(0o755)
@@ -64,6 +65,22 @@ class CopilotTests(unittest.TestCase):
                 decision, reason = xs.plan_copilot({"difficulty": 3}, {}, policy, True, [])
             self.assertIsNone(decision)
             self.assertIn("verified model", reason)
+
+    def test_difficulty_selects_requested_model_and_effort(self):
+        with mock.patch.object(xs, "copilot_bin", return_value="/bin/true"):
+            policy = xs.load_policy()
+            routine, _ = xs.plan_copilot({"difficulty": 3}, {}, policy, True, [])
+            complex_task, _ = xs.plan_copilot({"difficulty": 4}, {}, policy, True, [])
+        self.assertEqual((routine["model"], routine["effort"]), ("claude-haiku-5.5", "medium"))
+        self.assertEqual((complex_task["model"], complex_task["effort"]), ("claude-sonnet-5.5", "medium"))
+
+    def test_complex_task_uses_default_when_override_is_missing(self):
+        policy = xs.load_policy()
+        policy["copilot"].pop("complex_model", None)
+        with mock.patch.object(xs, "copilot_bin", return_value="/bin/true"):
+            decision, reason = xs.plan_copilot({"difficulty": 4}, {}, policy, True, [])
+        self.assertIsNone(reason)
+        self.assertEqual(decision["model"], policy["copilot"]["default_model"])
 
 
 if __name__ == "__main__":

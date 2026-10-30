@@ -17,10 +17,10 @@ class PiDefaultSafetyTests(unittest.TestCase):
         self.assertIsNone(decision)
         self.assertIn('isolated launcher', reason)
 
-    def test_read_only_is_rejected_before_start(self):
+    def test_review_can_use_pi_worktree(self):
         decision, reason = xs.plan_pi({'difficulty': 3, 'read_only': True}, {}, xs.load_policy(), True, [])
-        self.assertIsNone(decision)
-        self.assertIn('read-only', reason)
+        self.assertIsNone(reason)
+        self.assertEqual(decision['backend'], 'pi')
 
 
 if __name__ == '__main__':
