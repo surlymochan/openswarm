@@ -2977,6 +2977,8 @@ def copilot_bin():
 
 
 def plan_copilot(prof, st, policy, forced, notes):
+    if prof.get("read_only"):
+        return None, "Copilot read-only isolation is unavailable"
     if not copilot_bin():
         return None, "no working copilot binary"
     cfg = policy.get("copilot") or {}

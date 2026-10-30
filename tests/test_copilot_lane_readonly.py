@@ -13,6 +13,11 @@ xs = _load.load()
 
 
 class CopilotReadonlyTests(unittest.TestCase):
+    def test_readonly_profile_is_not_routed_to_copilot(self):
+        decision, reason = xs.plan_copilot({'read_only': True, 'difficulty': 3}, {}, xs.load_policy(), True, [])
+        self.assertIsNone(decision)
+        self.assertIn('read-only isolation is unavailable', reason)
+
     def test_readonly_assignment_is_rejected(self):
         server = socket.socket()
         server.bind(('127.0.0.1', 0))
