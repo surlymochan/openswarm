@@ -4971,7 +4971,7 @@ def cmd_run(args, policy):
     prepare_error = None
     if args.verify and not budget_denial and attempts[-1]["error_class"] not in ("risk_blocked", "rate_limit") \
             and (result is not None or workspace_changed or changed):
-        if lockfiles_changed(ws):
+        if read_only or lockfiles_changed(ws):
             prepared = run_workspace_prepare(ws["repo"], ws["root"], "before_verify")
             if prepared:
                 prepare.append(prepared)
@@ -7495,7 +7495,7 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
     verify = None
     prepare_error = None
     if spec.get("verify") and error_class not in ("risk_blocked", "rate_limit") and (final is not None or changed):
-        if lockfiles_changed(ws):
+        if read_only or lockfiles_changed(ws):
             prepared = run_workspace_prepare(ws["repo"], ws["root"], "before_verify")
             if prepared:
                 ws.setdefault("prepare", []).append(prepared)
