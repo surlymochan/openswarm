@@ -22,12 +22,17 @@ gateway_errors = ('no available fleet lane', 'available lanes changed or rejecte
                   'gocc dispatch gateway unavailable', 'gocc dispatch gateway rejected request',
                   'fleet command returned invalid JSON', 'fleet command rejected request')
 
+class NoAvailableLane(RuntimeError):
+    pass
+
 def gateway(payload):
     proc = subprocess.run(transport, input=json.dumps(payload), text=True, capture_output=True, timeout=100)
     try: data = json.loads(proc.stdout)
     except ValueError: raise RuntimeError('fleet gateway response unavailable; handoff requires reconciliation')
     if proc.returncode or not data.get('ok'):
         reason = data.get('error')
+        if payload.get('op') == 'submit' and reason == 'no available fleet lane':
+            raise NoAvailableLane(reason)
         raise RuntimeError(reason if reason in gateway_errors else 'fleet gateway rejected request')
     return data['result']
 
@@ -79,6 +84,11 @@ def run_submit(args):
     try:
         reply = gateway({'op':'submit','prompt':card,'title':opts.title,'base':base,'type':kind,
                          'difficulty':difficulty,'budget':opts.budget_minutes,'verify':opts.verify})
+    except NoAvailableLane as error:
+        db = db_open()
+        db.execute("UPDATE handoffs SET state='rejected' WHERE request_id=? AND state='pending'", (request_id,))
+        db.close()
+        raise RuntimeError('no available fleet lane; retry when an executor is idle') from error
     except (RuntimeError, OSError, subprocess.SubprocessError) as error:
         reason = str(error) if str(error) in gateway_errors else 'gateway unavailable or response lost'
         raise RuntimeError(f'handoff {request_id} unresolved ({reason}); inspect the remote run before reconciliation') from error

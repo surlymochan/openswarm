@@ -51,16 +51,21 @@ class HubBridgeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'unresolved'): MOD['run_submit'](self.args)
             with self.assertRaisesRegex(RuntimeError,'unresolved'): MOD['run_submit'](self.args)
 
-    def test_known_gateway_error_is_shown_without_clearing_pending(self):
+    def test_no_lane_rejection_allows_later_dispatch(self):
         response = subprocess.CompletedProcess([], 1, json.dumps({'ok':False, 'error':'no available fleet lane'}), '')
         with mock.patch.object(subprocess, 'run', return_value=response):
             with self.assertRaisesRegex(RuntimeError, 'no available fleet lane'):
                 MOD['gateway']({'op':'submit'})
-        with mock.patch.dict(G, {'gateway':mock.Mock(side_effect=RuntimeError('no available fleet lane'))}):
-            with self.assertRaisesRegex(RuntimeError, 'unresolved.*no available fleet lane'):
+        with mock.patch.dict(G, {'gateway':mock.Mock(side_effect=MOD['NoAvailableLane']('no available fleet lane'))}):
+            with self.assertRaisesRegex(RuntimeError, 'no available fleet lane.*retry'):
                 MOD['run_submit'](self.args)
+        with mock.patch.dict(G, {'gateway':mock.Mock(return_value={'id':'run-after-busy','state':'queued',
+                                                                  'host':'gocc','backend':'agy','model':'x'})}), \
+             contextlib.redirect_stdout(io.StringIO()):
+            MOD['run_submit'](self.args)
         db = MOD['db_open']()
-        self.assertEqual(db.execute("select state from handoffs").fetchone()[0], 'pending')
+        self.assertEqual(db.execute("select state from handoffs order by created").fetchall(),
+                         [('rejected',), ('accepted',)])
         db.close()
 
     def test_unknown_gateway_error_is_not_exposed(self):
