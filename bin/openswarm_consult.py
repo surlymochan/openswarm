@@ -405,13 +405,12 @@ def _agreement(answers):
                 "summary": "Not enough schema-valid answers to compare recommendations.", "disagreement": []}
     normalized = [" ".join(row["answer"]["opinion"].split()).casefold() for row in valid]
     if len(set(normalized)) == 1:
-        summary = "The schema-valid answers give identical recommendations."
-        disagreement = []
-    else:
-        summary = "The schema-valid answers give different recommendations."
-        disagreement = [{"family": row["family"], "opinion": row["answer"]["opinion"]} for row in valid]
-    return {"identical_recommendations": len(set(normalized)) == 1, "summary": summary,
-            "disagreement": disagreement}
+        return {"identical_recommendations": True,
+                "summary": "The schema-valid answers have identical opinion wording.", "disagreement": []}
+    # Different wording alone is not evidence that the recommendations disagree.
+    return {"identical_recommendations": None,
+            "summary": "The opinion wording differs; compare the answers to assess agreement.",
+            "disagreement": []}
 
 
 def _read_question(args):

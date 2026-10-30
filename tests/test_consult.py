@@ -22,6 +22,18 @@ import openswarm_consult as consult  # noqa: E402
 
 xs = _load.load()
 POLICY = xs.load_policy()
+
+class ConsultComparisonTest(unittest.TestCase):
+    def test_different_wording_is_not_labeled_disagreement(self):
+        answers = [
+            {'valid':True, 'family':'OpenAI', 'answer':{'opinion':'Empty input raises ZeroDivisionError.'}},
+            {'valid':True, 'family':'Google', 'answer':{'opinion':'An empty list causes division by zero.'}},
+        ]
+        comparison = consult._agreement(answers)
+        self.assertIsNone(comparison['identical_recommendations'])
+        self.assertEqual(comparison['disagreement'], [])
+        self.assertIn('compare the answers', comparison['summary'])
+
 FAKE = r"""#!/usr/bin/env python3
 import json, os, sys, time
 argv = sys.argv[1:]
