@@ -62,6 +62,41 @@ class PiIsolationTests(unittest.TestCase):
             finally:
                 sock.close()
 
+    def test_linked_git_worktree_and_node_remain_available(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = root / 'repo'
+            repo.mkdir()
+            def git(*args):
+                subprocess.run(['git', '-C', str(repo), *args], check=True, capture_output=True)
+            git('init', '-q')
+            (repo / 'tracked').write_text('ok')
+            git('add', 'tracked')
+            git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'initial')
+            work = root / 'worktree'
+            git('worktree', 'add', '--detach', str(work), 'HEAD')
+            runtime = root / 'runtime'
+            binary = runtime / 'node_modules' / '.bin' / 'pi'
+            binary.parent.mkdir(parents=True)
+            binary.write_text('#!/usr/bin/python3\nimport json,subprocess,shutil\n'
+                              'g=subprocess.run(["git","status","--porcelain"],capture_output=True,text=True)\n'
+                              'n=subprocess.run(["node","--version"],capture_output=True,text=True)\n'
+                              'print(json.dumps({"git":g.returncode,"node":n.returncode,"node_path":shutil.which("node")}))\n')
+            binary.chmod(0o755)
+            sock = socket.socket(socket.AF_UNIX)
+            try:
+                path = str(root / 'broker.sock')
+                sock.bind(path)
+                sock.listen()
+                env = dict(os.environ, OPENSWARM_PI_RUNTIME=str(runtime), OPENSWARM_PI_BROKER_SOCKET=path)
+                command = [str(WRAPPER), '-p', '--mode', 'json', '--provider', 'minimax-cn', '--model',
+                           'MiniMax-M3.1-Flash', '--tools', 'read,bash,edit,write,grep,find,ls', 'synthetic']
+                result = subprocess.run(command, cwd=work, env=env, capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), {'git': 0, 'node': 0, 'node_path': '/node/bin/node'})
+            finally:
+                sock.close()
+
 
 if __name__ == '__main__':
     unittest.main()
