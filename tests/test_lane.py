@@ -668,6 +668,28 @@ class LaneTests(unittest.TestCase):
         self.assertEqual(self.wait_run(run_id)["status"], "stopped")
         self.assertTrue(process_alive(supervisor_pid))
 
+    def test_pi_acknowledged_abort_releases_fleet_slot(self):
+        self.set_config("pi")
+        config_path = self.data / "lanes.json"
+        config = json.loads(config_path.read_text())
+        config["lanes"][0]["provider"] = "minimax-cn"
+        config_path.write_text(json.dumps(config))
+        guard = self.root / "fleet-guard.json"
+        guard.write_text(json.dumps({"command": [str(ROOT / "bin/fleet-capacity"), "gores1"]}))
+        self.env["OPENSWARM_FLEET_GUARD_CONFIG"] = str(guard)
+        self.env["OPENSWARM_FLEET_CAPACITY_DIR"] = str(self.root / "fleet")
+        self.start_lane()
+        run_id = self.assign("LANE_TEST_WAIT abort this")
+        self.wait_running(run_id)
+        self.cli("lane", "abort", self.lane_name)
+        self.assertEqual(self.wait_run(run_id)["status"], "stopped")
+        status = subprocess.run([str(ROOT / "bin/fleet-capacity"), "gores1"],
+                                input=json.dumps({"op": "status"}), env=self.env, text=True,
+                                capture_output=True, check=True)
+        self.assertEqual(json.loads(status.stdout)["reservations"], [])
+        next_id = self.assign("next task after abort")
+        self.assertEqual(self.wait_run(next_id)["status"], "done")
+
     def test_stop_of_old_run_does_not_abort_the_next_run(self):
         self.start_lane()
         old = self.assign("first completed task")

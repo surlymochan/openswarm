@@ -7408,6 +7408,9 @@ def lane_run_turn(lane, child, spec, prompt, ws, rdir, server, turn, pending, at
                 # Drain buffered events and EOF before deciding whether to resume a steer.
                 continue
             return None, usage, "risk_blocked" if spec.get("risk_blocks") else "exec_error", 1, event_file, "resident executor process exited"
+    # An end-of-turn event is an acknowledgement that this turn has stopped,
+    # including cancelled and failed turns. Clear this marker before each retry.
+    spec["_turn_completed"] = True
     if spec.get("risk_blocks"):
         return final, usage, "risk_blocked", 133, event_file, None
     if spec.get("abort_requested"):
@@ -7626,6 +7629,7 @@ def lane_do_run(lane, spec, child, server, current):
                                      "events": evp, "error_tail": error_tail})
                     break
                 started = NOW()
+                spec.pop("_turn_completed", None)
                 final, usage, error_class, rc, evp, error_tail = lane_run_turn(
                     attempt_lane, child, spec, retry_prompt, ws, rdir, server, turn, pending,
                     attempt=attempt_number, continuation=continuation)
@@ -7634,7 +7638,7 @@ def lane_do_run(lane, spec, child, server, current):
                 # process before returning its slot to the fleet.
                 if error_class == "upstream_forbidden" and lane["backend"] == "agy":
                     child.close()
-                if error_class in (None, "rate_limit") or (
+                if error_class in (None, "rate_limit") or spec.get("_turn_completed") or (
                         error_class == "upstream_forbidden" and lane["backend"] == "agy" and not child.alive()):
                     release_fleet_slot(rdir)
                 elif os.path.realpath(rdir) in _FLEET_RESERVATIONS:
