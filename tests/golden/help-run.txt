@@ -1,6 +1,6 @@
 usage: openswarm run [-h] [--type TYPE] [--difficulty DIFFICULTY]
                      [--context-tokens CONTEXT_TOKENS]
-                     [--backend {codex,ocgo,deepseek,cursor,agy,gemini,pi,hermes,github-issue}]
+                     [--backend {codex,ocgo,deepseek,cursor,agy,gemini,pi,hermes,copilot,github-issue}]
                      [--model MODEL] [--effort EFFORT] [--card-type CARD_TYPE]
                      [--rework-of REWORK_OF] [--paths PATHS [PATHS ...]]
                      [--prompt PROMPT] [--task-file TASK_FILE] [--title TITLE]
@@ -18,7 +18,7 @@ options:
                         1 (trivial) .. 5 (hardest)
   --context-tokens CONTEXT_TOKENS
                         approx context the executor must read
-  --backend {codex,ocgo,deepseek,cursor,agy,gemini,pi,hermes,github-issue}
+  --backend {codex,ocgo,deepseek,cursor,agy,gemini,pi,hermes,copilot,github-issue}
                         force a backend. cursor, agy (alias gemini) and pi are
                         opt-in and are not chosen unless named here or listed
                         in routing
