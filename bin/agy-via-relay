@@ -2,9 +2,13 @@
 # Scope the relay to Antigravity. Other OpenSwarm executors keep their own network settings.
 set -eu
 agy_bin=${OPENSWARM_AGY_REAL_BIN:-"$HOME/.local/bin/agy"}
-if curl --silent --show-error --head --max-time 5 --noproxy '' \
+token_file=${OPENSWARM_AGY_RELAY_TOKEN_FILE:-"$HOME/Library/Application Support/openswarm-agy-relay/token"}
+relay_token=''
+if [ -r "$token_file" ]; then IFS= read -r relay_token < "$token_file" || :; fi
+if [ -n "$relay_token" ] && printf 'proxy-user = "openbot:%s"\n' "$relay_token" | \
+  curl --config - --silent --show-error --head --max-time 5 --noproxy '' \
   --proxy http://127.0.0.1:18744 https://www.googleapis.com/ >/dev/null 2>&1; then
-  export HTTPS_PROXY=http://127.0.0.1:18744
+  export HTTPS_PROXY="http://openbot:${relay_token}@127.0.0.1:18744"
   export https_proxy="$HTTPS_PROXY"
 else
   printf '%s\n' 'Antigravity relay unavailable; using the existing network settings.' >&2
