@@ -27,13 +27,20 @@ def record(message):
             stream.write(json.dumps(message) + "\n")
 
 
+input_buffer = b""
+
+
 def read_message(timeout=0.2):
-    ready, _, _ = select.select([sys.stdin], [], [], timeout)
-    if not ready:
-        return None
-    line = sys.stdin.readline()
-    if not line:
-        os._exit(0)
+    global input_buffer
+    while b"\n" not in input_buffer:
+        ready, _, _ = select.select([sys.stdin], [], [], timeout)
+        if not ready:
+            return None
+        chunk = os.read(sys.stdin.fileno(), 65536)
+        if not chunk:
+            os._exit(0)
+        input_buffer += chunk
+    line, input_buffer = input_buffer.split(b"\n", 1)
     try:
         message = json.loads(line)
         record(message)
@@ -52,14 +59,12 @@ config_options = [{"id": "model", "name": "Model", "category": "model", "type": 
 if os.environ.get("FAKE_CURSOR_ACP_MODELS"):
     config_options[0]["options"] = [{"value": value, "name": value}
                                     for value in json.loads(os.environ["FAKE_CURSOR_ACP_MODELS"])]
-for line in sys.stdin:
-    try:
-        request = json.loads(line)
-    except ValueError:
+while True:
+    request = read_message(None)
+    if not request:
         continue
     method = request.get("method")
     params = request.get("params") or {}
-    record(request)
     if method == "initialize":
         send({"jsonrpc": "2.0", "method": "fixture/unrelated", "params": {"before": method}})
         response(request, {"protocolVersion": 1, "agentCapabilities": {},
