@@ -280,6 +280,8 @@ def _agy_execution_error(raw, stderr):
         envelope = json.loads(raw)
     except (ValueError, TypeError):
         return None
+    if isinstance(envelope, dict) and isinstance(envelope.get("finished_reason"), str) and envelope["finished_reason"].strip():
+        return f"agy turn ended early: {envelope['finished_reason']}"
     if isinstance(envelope, dict) and envelope.get("denied_actions") and not envelope.get("response"):
         return "agy produced no response because a tool action was denied"
     return None

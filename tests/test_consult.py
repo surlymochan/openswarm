@@ -24,6 +24,11 @@ xs = _load.load()
 POLICY = xs.load_policy()
 
 class ConsultComparisonTest(unittest.TestCase):
+    def test_early_agy_json_is_not_accepted_as_a_complete_answer(self):
+        partial = {'status':'SUCCESS', 'finished_reason':'print_timeout',
+                   'response':json.dumps({'opinion':'partial', 'confidence':'high', 'evidence':[], 'risks':[]})}
+        self.assertIn('print_timeout', consult._agy_execution_error(json.dumps(partial), ''))
+
     def test_different_wording_is_not_labeled_disagreement(self):
         answers = [
             {'valid':True, 'family':'OpenAI', 'answer':{'opinion':'Empty input raises ZeroDivisionError.'}},
@@ -67,7 +72,10 @@ if backend == "codex":
     with open(output, "w") as stream:
         stream.write(text)
 elif backend == "agy":
-    print(json.dumps({"response": text, "model": "agy-test"}))
+    result = {"response": text, "model": "agy-test"}
+    if os.environ.get("FAKE_CONSULT_AGY_EARLY"):
+        result.update({"status":"SUCCESS", "finished_reason":"print_timeout"})
+    print(json.dumps(result))
 else:
     print(json.dumps({"type": "message_end", "message": {"role": "assistant",
         "content": [{"type": "text", "text": text}]}}))
@@ -98,13 +106,14 @@ class ConsultTests(unittest.TestCase):
                                              "concurrency": {"codex": 2, "agy": 2, "pi": 2, "total": 8}})
         self.env_keys = ("FAKE_CONSULT_LOG_DIR", "FAKE_CONSULT_BARRIER", "FAKE_CONSULT_TIMEOUT_BACKEND",
                          "FAKE_CONSULT_MALFORMED_BACKEND", "FAKE_CONSULT_REPAIR_BACKEND",
-                         "FAKE_CONSULT_SLEEP_SECONDS")
+                         "FAKE_CONSULT_SLEEP_SECONDS", "FAKE_CONSULT_AGY_EARLY")
         self.old_env = {key: os.environ.get(key) for key in self.env_keys}
         os.environ["FAKE_CONSULT_LOG_DIR"] = self.logs
         os.environ.pop("FAKE_CONSULT_TIMEOUT_BACKEND", None)
         os.environ.pop("FAKE_CONSULT_MALFORMED_BACKEND", None)
         os.environ.pop("FAKE_CONSULT_REPAIR_BACKEND", None)
         os.environ.pop("FAKE_CONSULT_SLEEP_SECONDS", None)
+        os.environ.pop("FAKE_CONSULT_AGY_EARLY", None)
         os.environ.pop("FAKE_CONSULT_BARRIER", None)
         self.cwd_patch = mock.patch("openswarm_consult.os.getcwd", return_value=self.repo)
         self.cwd_patch.start()
@@ -145,6 +154,16 @@ class ConsultTests(unittest.TestCase):
         self.assertTrue(record["exec_pass"])
         self.assertEqual(len(record["backends_asked"]), 3)
         self.assertFalse([name for name in os.listdir(xs.RUNS) if name.startswith("consult-slot-")])
+
+    def test_early_agy_result_produces_partial_consult(self):
+        os.environ['FAKE_CONSULT_AGY_EARLY'] = '1'
+        code, result = self.run_consult(['codex', 'agy'])
+        self.assertEqual(code, 1)
+        self.assertEqual(result['status'], 'partial')
+        agy = next(x for x in result['answers'] if x['backend'] == 'agy')
+        self.assertFalse(agy['valid'])
+        self.assertIn('print_timeout', agy['error'])
+        self.assertFalse([name for name in os.listdir(xs.RUNS) if name.startswith('consult-slot-')])
 
     def test_each_backend_command_enforces_read_only_mode(self):
         code, _ = self.run_consult(["codex", "agy", "pi"])
