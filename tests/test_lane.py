@@ -494,6 +494,16 @@ class LaneTests(unittest.TestCase):
             self.assertEqual(json.loads(status.stdout)["reservations"], [])
             self.wait_for(lambda: self.lane_state().get("state") == "idle")
 
+    def test_agy_retries_one_transient_403(self):
+        self.set_config("agy")
+        self.env["FAKE_AGY_MODE"] = "forbidden-once"
+        self.env["FAKE_AGY_ONCE_MARKER"] = str(self.root / "agy-failed-once")
+        self.start_lane()
+        run_id = self.assign("create a file")
+        self.assertEqual(self.wait_run(run_id)["status"], "done")
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual([item["error_class"] for item in result["attempts"]], ["upstream_forbidden", None])
+
     def test_agy_steer_aborts_the_process_and_resumes_the_conversation(self):
         self.set_config("agy")
         self.start_lane()

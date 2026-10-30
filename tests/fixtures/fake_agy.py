@@ -39,6 +39,11 @@ if mode == "auth":
 if mode == "sleep":
     time.sleep(30)
     sys.exit(0)
+if mode == "forbidden-once":
+    marker = os.environ["FAKE_AGY_ONCE_MARKER"]
+    if not os.path.exists(marker):
+        open(marker, "w").close()
+        mode = "forbidden-exit"
 if mode in ("forbidden", "forbidden-exit"):
     send({"type": "result", "status": "ERROR", "error": 'request failed (code 403): HTML response "Error 403 (Forbidden)!!1"'})
     if mode == "forbidden":

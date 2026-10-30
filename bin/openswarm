@@ -7604,6 +7604,7 @@ def lane_do_run(lane, spec, child, server, current):
         final, usage, error_class, rc, evp, error_tail = None, {}, "exec_error", 1, None, None
         attempt_lane = lane
         attempt_number = 0
+        forbidden_retried = False
         _, max_rate_retries = rate_limit_policy(load_policy())
         for number, model in enumerate(models, 1):
             attempt_lane = dict(lane, model=model)
@@ -7649,6 +7650,16 @@ def lane_do_run(lane, spec, child, server, current):
                                  "meta": {"usage": usage}, "events": evp, "error_tail": error_tail})
                 if allow_fallback and error_class == "exec_error" and MODEL_UNAVAILABLE_RE.search(error_tail or ""):
                     error_class = attempts[-1]["error_class"] = "model_unavailable"
+                # A transient Google 403 can occur before any work starts. Retry once
+                # only after the old request released its slot and left no edits.
+                if (error_class == "upstream_forbidden" and lane["backend"] == "agy" and not forbidden_retried
+                        and not spec.get("abort_requested") and NOW() + 10 < deadline
+                        and os.path.realpath(rdir) not in _FLEET_RESERVATIONS
+                        and not git(["status", "--porcelain"], ws["root"])[1].strip()):
+                    forbidden_retried = True
+                    child.proc = None
+                    turn = {}
+                    continue
                 if error_class != "rate_limit":
                     break
                 trip_breaker(rate_limit_breaker_key(attempt_lane["backend"], attempt_lane,
