@@ -6515,7 +6515,7 @@ def lane_rebuild_worktree(repo, wt, base):
         raise RuntimeError(f"lane worktree rebuild failed: {err[:250]}")
 
 
-def lane_prepare_workspace(lane, rid, base_rev=None):
+def lane_prepare_workspace(lane, rid, base_rev=None, readonly_workspace=False):
     repo = os.path.realpath(lane["repo"])
     rc, top, err = lane_git(["rev-parse", "--show-toplevel"], repo)
     if rc:
@@ -6524,7 +6524,7 @@ def lane_prepare_workspace(lane, rid, base_rev=None):
     rc, base, err = lane_git(["rev-parse", "--verify", "--end-of-options", f"{base_rev or 'HEAD'}^{{commit}}"], repo)
     if rc:
         raise RuntimeError(f"invalid base revision {base_rev!r}: {err}")
-    wt = os.path.join(lane_root(lane["name"]), "wt")
+    wt = os.path.join(lane_root(lane["name"]), "wt-readonly" if readonly_workspace else "wt")
     os.makedirs(os.path.dirname(wt), exist_ok=True)
     if not lane_worktree_matches(repo, wt):
         lane_rebuild_worktree(repo, wt, base)
@@ -6572,7 +6572,7 @@ def lane_prepare_workspace(lane, rid, base_rev=None):
 
 
 class LaneChild:
-    def __init__(self, lane, cwd, policy):
+    def __init__(self, lane, cwd, policy, read_only=False):
         self.lane, self.cwd = lane, cwd
         _tmpdir, self.env = configure_executor_environment(cwd)
         self.events = queue.Queue()
@@ -6598,6 +6598,8 @@ class LaneChild:
             if lane.get("provider"):
                 cmd += ["--provider", lane["provider"]]
             cmd += ["--model", lane["model"]]
+            if read_only:
+                cmd += ["--tools", "read,grep,find,ls"]
         elif backend == "hermes":
             binary = lane.get("binary") or hermes_bin(policy)
             if not binary:
@@ -6924,10 +6926,7 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                 answer["state"] = jload(lane_state_path(lane["name"]), {})
             elif op == "assign":
                 state = jload(lane_state_path(lane["name"]), {}) or {}
-                if (lane["backend"] == "pi" and (load_policy().get("pi") or {}).get("require_isolation", True)
-                        and (req.get("read_only") or req.get("card_type") in READ_ONLY_CARD_TYPES)):
-                    answer = {"ok": False, "error": "isolated Pi does not yet support read-only runs"}
-                elif state.get("state") != "idle" or current.get("run_id"):
+                if state.get("state") != "idle" or current.get("run_id"):
                     answer = {"ok": False, "error": f"lane {lane['name']} is busy ({state.get('state')})"}
                 else:
                     rid = req.get("run_id")
@@ -7622,9 +7621,15 @@ def lane_do_run(lane, spec, child, server, current):
     if lane["backend"] in ("cursor", "copilot"):
         lane_write_state(lane["name"], model=lane["model"], resolved_model=None)
     ws = None
+    readonly_child = None
     turn, pending = {}, []
     try:
-        ws = lane_prepare_workspace(lane, rid, spec.get("base"))
+        isolated_pi_readonly = (lane["backend"] == "pi"
+                                and (load_policy().get("pi") or {}).get("require_isolation", True)
+                                and (spec.get("read_only") or spec.get("card_type") in READ_ONLY_CARD_TYPES))
+        # The writable resident can retain background processes. Its sandbox must not
+        # share the worktree used by a later read-only assignment.
+        ws = lane_prepare_workspace(lane, rid, spec.get("base"), readonly_workspace=isolated_pi_readonly)
         if ws.get("workspace_note"):
             set_status(rdir, workspace_note=ws["workspace_note"])
         ws["prepare"] = []
@@ -7643,6 +7648,9 @@ def lane_do_run(lane, spec, child, server, current):
                            "meta": {"usage": {}}, "events": evp, "error_tail": None}
                 return lane_finalize_run(lane, spec, ws, None, {}, "prepare_failed", prepared["rc"], evp,
                                          attempts=[attempt])
+        if isolated_pi_readonly:
+            readonly_child = LaneChild(lane, ws["path"], load_policy(), read_only=True)
+            child = readonly_child
         if spec.get("verify"):
             rewritten = rewrite_verify_paths(spec["verify"], ws["repo"], ws["root"])
             if rewritten != spec["verify"]:
@@ -7793,6 +7801,9 @@ def lane_do_run(lane, spec, child, server, current):
                            **exec_pass_fields(False, False, bool(spec.get("verify")), None)})
             return status
         return lane_finalize_run(lane, spec, ws, None, {}, error_class, 1, evp)
+    finally:
+        if readonly_child is not None:
+            readonly_child.close()
 
 
 def cmd_lane_serve(lane, policy):
@@ -8749,8 +8760,11 @@ def host_openswarm(host, args):
     return shell_path(binary) + " " + shlex.join([str(arg) for arg in args])
 
 
-def host_json(host, args, timeout=60):
-    rc, out, _ = host_run(host, host_openswarm(host, args), timeout=timeout)
+def host_json(host, args, timeout=60, capacity_only=False):
+    command = host_openswarm(host, args)
+    if capacity_only:
+        command = "OPENSWARM_FLEET_CAPACITY_ONLY=1 " + command
+    rc, out, _ = host_run(host, command, timeout=timeout)
     if rc:
         raise RuntimeError(f"{host['name']}: openswarm command failed (rc={rc})")
     try:
@@ -8845,6 +8859,7 @@ def instabox_states(hosts):
 
 
 def fleet_snapshot():
+    capacity_only = os.environ.get("OPENSWARM_FLEET_CAPACITY_ONLY") == "1"
     config_error = None
     try:
         lanes = lane_status_rows() if os.path.exists(envvar("LANES_FILE", os.path.join(DATA, "lanes.json"))) else []
@@ -8852,14 +8867,17 @@ def fleet_snapshot():
         lanes, config_error = [], str(error)
     runs = []
     for path in sorted(glob.glob(os.path.join(RUNS, "*", "status.json"))):
+        if capacity_only and (jload(path, {}) or {}).get("state") in ("finished", "unroutable", "dry-run"):
+            continue
         row = run_digest(os.path.basename(os.path.dirname(path)))
         if row["state"] not in ("finished", "unroutable", "dry-run", "dead"):
             runs.append(row)
     policy = load_policy()
     providers = {backend: execution_provider(backend, policy=policy)
                  for backend in ("codex", "cursor", "agy", "pi", "ocgo", "deepseek")}
+    backends = {} if capacity_only else {"agy": agy_status(policy)}
     return {"lanes": lanes, "active_runs": runs, "providers": providers,
-            "backends": {"agy": agy_status(policy)}, "lane_config_valid": config_error is None,
+            "backends": backends, "lane_config_valid": config_error is None,
             "lane_config_error": config_error}
 
 
@@ -9013,7 +9031,7 @@ def batch_provider_slot_available(spec, row):
             "running", "ready", "active"):
         return False
     try:
-        target_snapshot = host_json(target_host, ["fleet", "_snapshot"], timeout=20)
+        target_snapshot = host_json(target_host, ["fleet", "_snapshot"], timeout=20, capacity_only=True)
     except RuntimeError:
         return False
     provider = ((target_snapshot.get("providers") or {}).get(spec["backend"])) or spec.get("provider")
@@ -9029,7 +9047,7 @@ def batch_provider_slot_available(spec, row):
                 "running", "ready", "active"):
             continue
         try:
-            snapshots[name] = host_json(host, ["fleet", "_snapshot"], timeout=20)
+            snapshots[name] = host_json(host, ["fleet", "_snapshot"], timeout=20, capacity_only=True)
         except RuntimeError:
             # An unreachable host may still hold a slot; fail closed for configured fleet-wide caps.
             return False

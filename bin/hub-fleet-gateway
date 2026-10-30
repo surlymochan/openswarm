@@ -18,6 +18,11 @@ def result(cmd, payload=None, timeout=45):
     try: data = json.loads(p.stdout)
     except ValueError: raise ValueError('fleet command returned invalid JSON')
     if p.returncode or (isinstance(data, dict) and data.get('ok') is False):
+        if isinstance(data, dict) and data.get('error') in (
+                'no available fleet lane', 'available lanes changed or rejected the task',
+                'local lane status unavailable', 'local dispatch acknowledgement unavailable',
+                'gocc dispatch gateway unavailable', 'gocc dispatch gateway rejected request'):
+            raise ValueError(data['error'])
         raise ValueError('fleet command rejected request')
     return data
 

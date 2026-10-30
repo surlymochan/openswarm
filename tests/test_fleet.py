@@ -87,6 +87,28 @@ class FleetTests(unittest.TestCase):
         self.assertIn("invalid lane config", snapshot["lane_config_error"])
         self.assertIn("lanes.json", snapshot["lane_config_error"])
 
+    def test_capacity_snapshot_skips_model_probe_but_keeps_capacity_fields(self):
+        with mock.patch.dict(os.environ, {"OPENSWARM_FLEET_CAPACITY_ONLY": "1"}), \
+                mock.patch.object(xs, "agy_status") as status:
+            snapshot = xs.fleet_snapshot()
+        status.assert_not_called()
+        self.assertIn("active_runs", snapshot)
+        self.assertIn("providers", snapshot)
+        self.assertEqual(snapshot["backends"], {})
+
+    def test_capacity_snapshot_skips_completed_run_logs(self):
+        runs = self.root / "runs"
+        for name, state in (("done", "finished"), ("active", "running")):
+            directory = runs / name
+            directory.mkdir(parents=True)
+            (directory / "status.json").write_text(json.dumps({"state": state}))
+        with mock.patch.dict(os.environ, {"OPENSWARM_FLEET_CAPACITY_ONLY": "1"}), \
+                mock.patch.object(xs, "RUNS", str(runs)), \
+                mock.patch.object(xs, "run_digest", side_effect=lambda rid: {"id": rid, "state": "running"}) as digest:
+            snapshot = xs.fleet_snapshot()
+        digest.assert_called_once_with("active")
+        self.assertEqual([row["id"] for row in snapshot["active_runs"]], ["active"])
+
     def test_text_status_shows_config_invalid_with_reason(self):
         self.config([{"name": "host", "kind": "local"}])
         output = io.StringIO()

@@ -44,7 +44,9 @@ alive for the run. Interrupting it or reaching its time limit closes its SSH ses
 and removes its private sockets. It is a transport process, not an executor.
 
 Pi read-only review and consult use read-only workspace mounts and the read-only
-tool set. Read-only assignments to a resident writable Pi lane are rejected.
+tool set. A read-only Pi lane assignment starts a separate isolated RPC process
+with the same read-only mount and tool set; the resident writable process is not
+used for that task and remains available for later writable work.
 One-shot isolated Pi cannot resume a rate-limited session;
 resident RPC Pi keeps its session inside the sandbox. A missing bridge, unsupported
 host, unapproved model or unisolated binary fails closed. Do not turn off
