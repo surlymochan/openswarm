@@ -69,6 +69,11 @@ class LaneTests(unittest.TestCase):
         return subprocess.run(["git", *args], cwd=self.repo, check=True, capture_output=True, text=True).stdout.strip()
 
     def cli(self, *args, check=True, timeout=15):
+        if self.backend == "pi":
+            policy_file = self.data / "policy.local.json"
+            policy = json.loads(policy_file.read_text()) if policy_file.exists() else {}
+            policy.setdefault("pi", {})["require_isolation"] = False
+            policy_file.write_text(json.dumps(policy))
         result = subprocess.run([sys.executable, str(CLI), *map(str, args)], env=self.env, text=True,
                                 capture_output=True, timeout=timeout)
         if check and result.returncode:
@@ -361,7 +366,7 @@ class LaneTests(unittest.TestCase):
         self.assertIn("session/set_config_option", methods)
         self.assertIn("session/prompt", methods)
         argv = next(entry["argv"] for entry in self.cursor_log() if "argv" in entry)
-        self.assertEqual(argv[1:], ["acp"])
+        self.assertEqual(argv[1:], ["--sandbox", "enabled", "acp"])
         self.assertEqual(json.loads((self.data / "lanes" / "L1" / "state.json").read_text())["model"],
                          "composer-2.5")
         choice = next(entry for entry in self.cursor_log() if entry.get("method") == "session/set_config_option")
@@ -473,6 +478,9 @@ class LaneTests(unittest.TestCase):
         self.start_lane()
         run_id = self.assign("LANE_TEST_WAIT original task")
         self.wait_running(run_id)
+        event_file = self.data / "runs" / run_id / "events.1.agy.jsonl"
+        self.wait_for(lambda: event_file.exists() and '"conversation_id": "conv-1"' in event_file.read_text(),
+                      description="Antigravity conversation initialization")
         self.cli("lane", "steer", self.lane_name, "--text", "write steered instruction")
         self.assertEqual(self.wait_run(run_id)["status"], "done")
         calls = [json.loads(line) for line in pathlib.Path(self.env["FAKE_AGY_LOG"]).read_text().splitlines()]

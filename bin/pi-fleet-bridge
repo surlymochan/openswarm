@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Open a time-limited private Pi broker bridge over existing SSH identities."""
+import argparse
+import os
+import pathlib
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--broker-host', default='gocc')
+parser.add_argument('--worker', default='gores1')
+parser.add_argument('--model', default='MiniMax-M3.1-Flash')
+parser.add_argument('--minutes', type=int, default=120)
+args = parser.parse_args()
+for value in (args.broker_host, args.worker, args.model):
+    if not re.fullmatch(r'[A-Za-z0-9_.-]{1,80}', value):
+        parser.error('host aliases and model must contain only letters, digits, dot, dash and underscore')
+if not 1 <= args.minutes <= 480:
+    parser.error('minutes must be between 1 and 480')
+ssh = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', '-o', 'ControlMaster=no', '-o', 'ControlPath=none']
+broker_source = pathlib.Path(__file__).resolve().with_name('pi-minimax-broker.mjs').read_bytes()
+processes = []
+dirs = {}
+stopping = False
+
+def stop_signal(_number, _frame):
+    global stopping
+    stopping = True
+
+def run(host, command, **kwargs):
+    return subprocess.run([*ssh, host, command], check=True, timeout=20, **kwargs)
+
+def remote_dir(host):
+    out = run(host, 'umask 077; mktemp -d /tmp/openswarm-pi-XXXXXXXX', capture_output=True, text=True).stdout.strip()
+    if not re.fullmatch(r'/tmp/openswarm-pi-[A-Za-z0-9]{8}', out):
+        raise RuntimeError('remote temporary directory was invalid')
+    dirs[host] = out
+    return out
+
+def wait_ready(check, related, seconds=20):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline and not stopping:
+        if any(p.poll() is not None for p in related):
+            raise RuntimeError('a bridge process exited during startup')
+        if check():
+            return
+        time.sleep(0.2)
+    raise RuntimeError('bridge did not become ready')
+
+for sig in (signal.SIGINT, signal.SIGTERM):
+    signal.signal(sig, stop_signal)
+
+try:
+    if args.broker_host == args.worker:
+        parser.error('broker and worker must use separate hosts')
+    broker_dir, worker_dir = remote_dir(args.broker_host), remote_dir(args.worker)
+    broker_socket, worker_socket = broker_dir + '/broker.sock', worker_dir + '/broker.sock'
+    run(args.broker_host, 'umask 077; cat > ' + shlex.quote(broker_dir + '/broker.mjs'), input=broker_source)
+    command = ('umask 077; echo $$ > ' + shlex.quote(broker_dir + '/pid') +
+               '; export PATH="$HOME/.local/node-v24.14.1/bin:$HOME/.local/bin:/opt/homebrew/bin:$PATH"; '
+               'exec node ' + shlex.quote(broker_dir + '/broker.mjs') + ' ' + shlex.quote(broker_socket) +
+               ' "$HOME/.local/node-v24.14.1/lib/node_modules/@mariozechner/pi-coding-agent/dist/core/auth-storage.js" ' +
+               shlex.quote(args.model))
+    broker = subprocess.Popen([*ssh, args.broker_host, command], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    processes.append(broker)
+    wait_ready(lambda: subprocess.run([*ssh, args.broker_host, 'test -S ' + shlex.quote(broker_socket)],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0, [broker])
+    with tempfile.TemporaryDirectory(prefix='openswarm-pi-bridge-') as local_dir:
+        local_socket = local_dir + '/bridge.sock'
+        forward = subprocess.Popen([*ssh, '-o', 'ExitOnForwardFailure=yes', '-N', '-L',
+                                    local_socket + ':' + broker_socket, args.broker_host],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        processes.append(forward)
+        wait_ready(lambda: os.path.exists(local_socket), [broker, forward])
+        reverse = subprocess.Popen([*ssh, '-o', 'ExitOnForwardFailure=yes', '-N', '-R',
+                                    worker_socket + ':' + local_socket, args.worker],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        processes.append(reverse)
+        wait_ready(lambda: subprocess.run([*ssh, args.worker, 'test -S ' + shlex.quote(worker_socket)],
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0,
+                   [broker, forward, reverse])
+        print('Pi bridge ready; worker socket: ' + worker_socket, flush=True)
+        print('Set OPENSWARM_PI_BROKER_SOCKET to that socket and OPENSWARM_PI_RUNTIME to the Pi install directory.', flush=True)
+        deadline = time.monotonic() + args.minutes * 60
+        while not stopping and time.monotonic() < deadline:
+            if any(p.poll() is not None for p in processes):
+                raise RuntimeError('a bridge process exited')
+            time.sleep(1)
+except (OSError, subprocess.SubprocessError, RuntimeError) as error:
+    print('Pi bridge failed: ' + str(error), file=sys.stderr)
+    sys.exit(1)
+finally:
+    for p in reversed(processes):
+        if p.poll() is None:
+            p.terminate()
+    for p in reversed(processes):
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+    for host, directory in dirs.items():
+        try:
+            if host == args.broker_host:
+                # The PID belongs to this private directory; check the exact broker command before signalling.
+                cmd = ('if test -f ' + shlex.quote(directory + '/pid') + '; then p=$(cat ' +
+                       shlex.quote(directory + '/pid') + '); case "$p" in *[!0-9]*|\'\') ;; *) '
+                       'c=$(ps -p "$p" -o command= 2>/dev/null || true); case "$c" in *' +
+                       shlex.quote(directory + '/broker.mjs') + '*) kill -TERM "$p" 2>/dev/null || true;; esac;; esac; fi; ')
+                cmd += 'rm -f ' + shlex.quote(directory + '/pid') + ' ' + shlex.quote(directory + '/broker.mjs') + ' ' + shlex.quote(directory + '/broker.sock') + '; rmdir ' + shlex.quote(directory) + ' 2>/dev/null || true'
+            else:
+                cmd = 'rm -f ' + shlex.quote(directory + '/broker.sock') + '; rmdir ' + shlex.quote(directory) + ' 2>/dev/null || true'
+            subprocess.run([*ssh, host, cmd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            pass

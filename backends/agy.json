@@ -2,7 +2,7 @@
   "id": "agy",
   "name": "Antigravity CLI (agy -p)",
   "role": "opt-in executor. Not selected unless --backend agy (alias --backend gemini) is passed, or \"agy\" is listed in routing.default_order",
-  "invoke": "agy -p <prompt> --model <slug> --output-format stream-json --dangerously-skip-permissions",
+  "invoke": "agy -p <prompt> --model <slug> --output-format stream-json --sandbox --dangerously-skip-permissions",
   "stdin": "/dev/null",
   "cwd": "<worktree>",
   "binary_resolution": "OPENSWARM_AGY_BIN, else agy on PATH, else ~/.local/bin/agy",
