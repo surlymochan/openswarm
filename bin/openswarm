@@ -7658,6 +7658,8 @@ def lane_do_run(lane, spec, child, server, current):
                 final, usage, error_class, rc, evp, error_tail = lane_run_turn(
                     attempt_lane, child, spec, retry_prompt, ws, rdir, server, turn, pending,
                     attempt=attempt_number, continuation=continuation)
+                if lane["backend"] == "agy" and error_class is None:
+                    lane_write_state(lane["name"], quota_model=None, quota_until=None)
                 # Stop headless requests before releasing their slot after an
                 # early result, rate limit or upstream 403.
                 if ((error_class == "upstream_forbidden" and lane["backend"] == "agy")
@@ -7694,6 +7696,8 @@ def lane_do_run(lane, spec, child, server, current):
                                                      error_tail or "rate limited"),
                              load_policy(), error_tail or "rate limited")
                 reset_seconds = agy_quota_reset_seconds(attempt_lane["backend"], error_tail)
+                if reset_seconds is not None and reset_seconds > 0:
+                    lane_write_state(lane["name"], quota_model=model, quota_until=NOW() + reset_seconds)
                 can_retry = (retries < max_rate_retries and not spec.get("abort_requested")
                              and (reset_seconds is None or NOW() + reset_seconds < deadline))
                 wait_seconds = max(rate_limit_delay(load_policy(), retries), reset_seconds or 0) if can_retry else 0
@@ -7965,8 +7969,14 @@ def lane_status_rows():
             lane_state = "down"
         elif not pid_alive(pid):
             lane_state = "crashed"
+        model = state.get("resolved_model") or lane["model"]
+        quota_until = state.get("quota_until")
+        if (lane_state == "idle" and lane["backend"] == "agy" and state.get("quota_model") == model
+                and isinstance(quota_until, (int, float)) and not isinstance(quota_until, bool) and quota_until > NOW()):
+            lane_state = "quota_exhausted"
         rows.append({"name": lane["name"], "state": lane_state, "backend": lane["backend"],
-                     "model": state.get("resolved_model") or lane["model"], "pid": state.get("child_pid"), "supervisor_pid": pid,
+                     "model": model, "pid": state.get("child_pid"), "supervisor_pid": pid,
+                     "quota_reset_at": quota_until if lane_state == "quota_exhausted" else None,
                      "current_run": state.get("current_run"),
                      "run_state": state.get("turn_state"),
                      "provider": execution_provider(lane["backend"], policy=load_policy(), lane=lane),

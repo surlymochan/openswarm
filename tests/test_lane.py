@@ -513,6 +513,16 @@ class LaneTests(unittest.TestCase):
         result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
         self.assertEqual(len(result["attempts"]), 1)
         self.assertEqual(result["attempts"][0]["error_class"], "rate_limit")
+        self.wait_for(lambda: self.lane_state().get("state") == "idle")
+        rows = json.loads(self.cli("lane", "status").stdout)
+        self.assertEqual(rows[0]["state"], "quota_exhausted")
+        self.assertGreater(rows[0]["quota_reset_at"], time.time())
+        state_path = self.data / "lanes" / self.lane_name / "state.json"
+        state = json.loads(state_path.read_text())
+        state["quota_until"] = 1
+        state_path.write_text(json.dumps(state))
+        rows = json.loads(self.cli("lane", "status").stdout)
+        self.assertEqual(rows[0]["state"], "idle")
 
     def test_agy_403_stops_process_and_releases_fleet_slot(self):
         self.set_config("agy")
