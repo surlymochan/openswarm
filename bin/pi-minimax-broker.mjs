@@ -34,6 +34,7 @@ const server = createServer((req, res) => {
   req.on('error', release);
   req.on('aborted', release);
   req.on('end', () => {
+    req.setTimeout(0);
     let parsed;
     try { parsed = JSON.parse(Buffer.concat(parts).toString('utf8')); } catch { release(); return fail(400, 'invalid JSON'); }
     if (size !== length || !parsed || parsed.model !== model || !Array.isArray(parsed.messages)) {

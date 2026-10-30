@@ -23,7 +23,10 @@ args = parser.parse_args()
 model = os.environ.get('OPENSWARM_PI_ISOLATED_MODEL', 'MiniMax-M3.1-Flash')
 runtime = os.path.realpath(os.environ.get('OPENSWARM_PI_RUNTIME', ''))
 broker = os.path.realpath(os.environ.get('OPENSWARM_PI_BROKER_SOCKET', ''))
-worktree = os.path.realpath(os.getcwd())
+cwd = os.path.realpath(os.getcwd())
+root_query = subprocess.run(['git', '-C', cwd, 'rev-parse', '--show-toplevel'],
+                            capture_output=True, text=True, timeout=10)
+worktree = os.path.realpath(root_query.stdout.strip()) if root_query.returncode == 0 else cwd
 read_only = args.tools == 'read,grep,find,ls'
 if args.provider != 'minimax-cn' or args.model != model or args.tools not in ('read,bash,edit,write,grep,find,ls', 'read,grep,find,ls'):
     sys.exit('isolated Pi rejected provider, model or tool configuration')
@@ -90,7 +93,7 @@ fi
     if bun and os.path.isfile(os.path.join(bun, 'node_modules/.bin/bun')):
         cmd += ['--ro-bind', os.path.realpath(bun), '/bun']
         path = '/bun/node_modules/.bin:' + path
-    cmd += ['--ro-bind' if read_only else '--bind', worktree, worktree, '--chdir', worktree,
+    cmd += ['--ro-bind' if read_only else '--bind', worktree, worktree, '--chdir', cwd,
             '--clearenv', '--setenv', 'HOME', '/home/pi', '--setenv', 'PATH', path,
             '--setenv', 'GIT_OPTIONAL_LOCKS', '0', '--setenv', 'PI_CODING_AGENT_DIR', '/tmp/agent',
             '/usr/bin/sh', '-c', script, 'pi-isolated', args.mode, model, args.tools, args.prompt or '']
