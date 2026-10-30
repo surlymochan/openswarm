@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Run a one-shot Copilot CLI in the macOS GUI/keychain security session."""
+import json
+import os
+import pathlib
+import plistlib
+import select
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+
+def worker(directory):
+    root = pathlib.Path(directory)
+    request = json.loads((root / 'request.json').read_text())
+    args = request['args']
+    required = {'--sandbox', '--disable-builtin-mcps', '--assisted-approval', '--no-ask-user'}
+    forbidden = {'--allow-all', '--yolo', '--allow-all-tools', '--allow-all-paths', '--allow-all-urls', '--acp'}
+    if not required.issubset(args) or forbidden.intersection(args):
+        return 2
+    peer = socket.socket(socket.AF_UNIX)
+    peer.connect(str(root / 'control.sock'))
+    binary = pathlib.Path.home() / 'tools/copilot-executor/node_modules/.bin/copilot'
+    child = None
+    def stop(_signal, _frame):
+        raise SystemExit(130)
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    try:
+        with (root / 'stdout').open('wb') as out, (root / 'stderr').open('wb') as err:
+            child = subprocess.Popen([str(binary), *args], cwd=request['cwd'], stdin=subprocess.DEVNULL,
+                                     stdout=out, stderr=err, start_new_session=True)
+            while child.poll() is None:
+                ready, _, _ = select.select([peer], [], [], 0.2)
+                if ready and not peer.recv(1):
+                    os.killpg(child.pid, signal.SIGTERM)
+                    try:
+                        child.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(child.pid, signal.SIGKILL)
+                        child.wait()
+                    return 1
+            (root / 'exit').write_text(str(child.returncode))
+            peer.sendall(b'D')
+            return child.returncode
+    finally:
+        if child and child.poll() is None:
+            try:
+                os.killpg(child.pid, signal.SIGTERM)
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(child.pid, signal.SIGKILL)
+                child.wait()
+            except ProcessLookupError:
+                pass
+        peer.close()
+
+
+if len(sys.argv) == 3 and sys.argv[1] == '--worker':
+    sys.exit(worker(sys.argv[2]))
+
+if sys.platform != 'darwin':
+    sys.exit('Copilot GUI bridge requires macOS')
+label = 'app.openswarm.copilot.oneshot.' + uuid.uuid4().hex
+domain = 'gui/' + str(os.getuid())
+with tempfile.TemporaryDirectory(prefix='os-copilot-', dir='/tmp') as directory:
+    root = pathlib.Path(directory)
+    root.chmod(0o700)
+    (root / 'request.json').write_text(json.dumps({'cwd': os.getcwd(), 'args': sys.argv[1:]}))
+    (root / 'request.json').chmod(0o600)
+    server = socket.socket(socket.AF_UNIX)
+    server.bind(str(root / 'control.sock'))
+    os.chmod(root / 'control.sock', 0o600)
+    server.listen(1)
+    server.settimeout(30)
+    home = pathlib.Path.home()
+    plist = {'Label': label, 'ProgramArguments': [str(pathlib.Path(__file__).resolve()), '--worker', directory],
+             'EnvironmentVariables': {'HOME': str(home), 'COPILOT_HOME': str(home / 'Library/Application Support/openswarm-copilot-secure'),
+                                      'PATH': str(home / '.local/node-v24.14.1/bin') + ':/opt/homebrew/bin:/usr/bin:/bin'},
+             'RunAtLoad': True}
+    with (root / 'agent.plist').open('wb') as stream:
+        plistlib.dump(plist, stream)
+    old_handlers = {}
+    def interrupted(_signal, _frame):
+        raise KeyboardInterrupt()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        old_handlers[sig] = signal.signal(sig, interrupted)
+    peer = None
+    offsets = {'stdout': 0, 'stderr': 0}
+    def drain():
+        for name, stream in (('stdout', sys.stdout.buffer), ('stderr', sys.stderr.buffer)):
+            path = root / name
+            if path.exists():
+                with path.open('rb') as source:
+                    source.seek(offsets[name]); data = source.read(); offsets[name] = source.tell()
+                if data:
+                    stream.write(data); stream.flush()
+    try:
+        result = subprocess.run(['launchctl', 'bootstrap', domain, str(root / 'agent.plist')],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+        if result.returncode:
+            sys.exit('Copilot GUI bridge could not start')
+        peer, _ = server.accept()
+        while True:
+            drain()
+            ready, _, _ = select.select([peer], [], [], 0.2)
+            if ready:
+                signal_byte = peer.recv(1)
+                drain()
+                if signal_byte == b'D' and (root / 'exit').exists():
+                    sys.exit(int((root / 'exit').read_text()))
+                sys.exit('Copilot GUI bridge disconnected')
+    except (KeyboardInterrupt, socket.timeout):
+        sys.exit(130)
+    finally:
+        if peer:
+            peer.close()
+        server.close()
+        subprocess.run(['launchctl', 'bootout', domain + '/' + label], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=15)
+        for sig, handler in old_handlers.items():
+            signal.signal(sig, handler)
