@@ -7659,6 +7659,7 @@ def lane_do_run(lane, spec, child, server, current):
                     forbidden_retried = True
                     child.proc = None
                     turn = {}
+                    continuation, retry_prompt = False, prompt
                     continue
                 if error_class != "rate_limit":
                     break

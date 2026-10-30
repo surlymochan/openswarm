@@ -44,6 +44,16 @@ if mode == "forbidden-once":
     if not os.path.exists(marker):
         open(marker, "w").close()
         mode = "forbidden-exit"
+if mode == "rate-then-forbidden":
+    marker = os.environ["FAKE_AGY_ONCE_MARKER"]
+    try:
+        with open(marker) as stream:
+            count = int(stream.read())
+    except FileNotFoundError:
+        count = 0
+    with open(marker, "w") as stream:
+        stream.write(str(count + 1))
+    mode = "rate" if count == 0 else "forbidden-exit" if count == 1 else "ok"
 if mode in ("forbidden", "forbidden-exit"):
     send({"type": "result", "status": "ERROR", "error": 'request failed (code 403): HTML response "Error 403 (Forbidden)!!1"'})
     if mode == "forbidden":
