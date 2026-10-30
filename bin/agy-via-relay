@@ -2,7 +2,8 @@
 # Scope the relay to Antigravity. Other OpenSwarm executors keep their own network settings.
 set -eu
 agy_bin=${OPENSWARM_AGY_REAL_BIN:-"$HOME/.local/bin/agy"}
-if nc -z -w 1 127.0.0.1 18744 >/dev/null 2>&1; then
+if curl --silent --show-error --head --max-time 5 --noproxy '' \
+  --proxy http://127.0.0.1:18744 https://www.googleapis.com/ >/dev/null 2>&1; then
   export HTTPS_PROXY=http://127.0.0.1:18744
   export https_proxy="$HTTPS_PROXY"
 else

@@ -13,7 +13,7 @@ class AgyRelayTests(unittest.TestCase):
     def test_relay_scope_and_inherited_fallback(self):
         with tempfile.TemporaryDirectory() as root:
             directory = pathlib.Path(root)
-            probe = directory / "nc"
+            probe = directory / "curl"
             agent = directory / "agent"
             agent.write_text('#!/bin/sh\nprintf "{\\"proxy\\":\\"%s\\"}\\n" "$HTTPS_PROXY"\n')
             agent.chmod(0o755)

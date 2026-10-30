@@ -9,6 +9,6 @@ ssh -N -T -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 \
   -o ServerAliveCountMax=2 -R 127.0.0.1:18744:127.0.0.1:18743 <executor-host>
 ```
 
-执行主机将 `bin/agy-via-relay` 配置为 Antigravity 的可执行文件。它只为 Antigravity 子进程设置 `HTTPS_PROXY`；转发端口不可连接时使用原有路径并输出提示。`OPENSWARM_AGY_REAL_BIN` 可指定真实 CLI，默认为 `~/.local/bin/agy`。中继只监听回环地址，并仅接收 Google API 和账号域名的 HTTPS CONNECT；它不读取模型内容或凭据。
+执行主机将 `bin/agy-via-relay` 配置为 Antigravity 的可执行文件。它先通过中继检查 Google HTTPS 连接，再只为 Antigravity 子进程设置 `HTTPS_PROXY`；连接失败时保留原有网络设置并输出提示。`OPENSWARM_AGY_REAL_BIN` 可指定真实 CLI，默认为 `~/.local/bin/agy`。中继只监听回环地址，并仅接收 Google API 和账号域名的 HTTPS CONNECT；它不读取模型内容或凭据。
 
 长期使用时，将中继和 SSH 转发交给本机的服务管理器监督，并先验证机器重启后的连接、真实任务和全局名额释放。中继或本机离线时，任务可能回到原先间歇出现 403 的路径；不要把降级路径当作问题已解决。其他执行器、代理节点和系统代理设置无需改变。
