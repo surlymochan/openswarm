@@ -8,6 +8,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -24,7 +25,7 @@ CONSULT_SCHEMA = {
     },
 }
 READ_ONLY_PI_TOOLS = "read,grep,find,ls"
-SUPPORTED_BACKENDS = {"codex", "agy", "pi"}
+SUPPORTED_BACKENDS = {"codex", "agy", "pi", "copilot"}
 
 
 def backend_family(backend, model=None, provider=None):
@@ -49,7 +50,7 @@ def parse_ask(value):
     backend, sep, model = value.partition(":")
     backend = backend.strip().lower()
     if backend not in SUPPORTED_BACKENDS:
-        raise ValueError(f"unsupported consult backend {backend!r}; choose codex, agy, or pi")
+        raise ValueError(f"unsupported consult backend {backend!r}; choose codex, agy, pi, or copilot")
     model = model.strip() if sep else None
     if sep and not model:
         raise ValueError(f"empty model in --ask {value!r}")
@@ -78,29 +79,46 @@ def _model(core, state, policy, backend, requested=None, lane=None):
     config = policy.get(backend) or {}
     if backend == "codex":
         models = known.get("models") or []
-        return (models[0].get("id") if models else None) or known.get("config_model")
+        return config.get("default_model") or (models[0].get("id") if models else None) or known.get("config_model")
     if backend == "agy":
         return config.get("default_model") or known.get("default_model") or core.AGY_DEFAULT_MODEL
     return config.get("default_model") or known.get("default_model")
 
 
 def _profile(core, state, policy, backend, requested_model=None, lane=None):
-    if backend == "pi" and (policy.get("pi") or {}).get("require_isolation", True):
-        raise ValueError("isolated Pi does not yet support read-only consultations")
     provider = (lane or {}).get("provider") or (policy.get(backend) or {}).get("provider")
     model = _model(core, state, policy, backend, requested_model, lane)
-    return {"backend": backend, "model": model, "family": backend_family(backend, model, provider),
-            "provider": provider, "binary": _binary(core, state, backend, lane),
+    binary = _binary(core, state, backend, lane)
+    if backend == "copilot" and sys.platform == "darwin":
+        gui = os.path.join(os.path.dirname(os.path.realpath(core.__file__)), "copilot-gui-run")
+        binary = gui if os.access(gui, os.X_OK) else None
+    if backend == "pi" and (policy.get("pi") or {}).get("require_isolation", True):
+        binary = core.pi_bin()
+        expected = os.path.join(os.path.dirname(os.path.realpath(core.__file__)), "pi-isolated")
+        if not binary or os.path.realpath(binary) != os.path.realpath(expected):
+            raise ValueError("read-only Pi consultation requires the isolated launcher")
+    effort = (lane or {}).get("effort") or ((policy.get("codex") or {}).get("default_effort") if backend == "codex" else None)
+    return {"backend": backend, "model": model, "effort": effort, "family": backend_family(backend, model, provider),
+            "provider": provider, "binary": binary,
             "lane": (lane or {}).get("name"), "cwd": (lane or {}).get("repo") or os.getcwd()}
 
 
 def default_profiles(core, state, policy):
     candidates = []
-    for backend in ("codex", "agy", "pi"):
-        if backend == "pi" and (policy.get("pi") or {}).get("require_isolation", True):
+    try:
+        rows = core.lane_status_rows()
+        lanes = core.lane_config()
+    except (OSError, ValueError):
+        rows, lanes = [], []
+    unavailable = {(row.get("backend"), row.get("model")) for row in rows if row.get("state") == "quota_exhausted"}
+    copilot_lane = next((lane for lane in lanes if lane.get("name") == "GH1" and lane.get("backend") == "copilot"), None)
+    for backend in ("codex", "agy", "copilot", "pi"):
+        if backend == "copilot" and not copilot_lane:
             continue
-        profile = _profile(core, state, policy, backend)
+        profile = _profile(core, state, policy, backend, lane=copilot_lane if backend == "copilot" else None)
         if not profile["binary"]:
+            continue
+        if (backend, profile["model"]) in unavailable:
             continue
         if backend == "agy" and (state.get("agy") or {}).get("login") == "not logged in":
             continue
@@ -139,6 +157,8 @@ def build_command(profile, prompt, run_dir):
         command = [binary, "exec"]
         if model:
             command += ["-m", model]
+        if profile.get("effort"):
+            command += ["-c", f'model_reasoning_effort="{profile["effort"]}"']
         command += ["-s", "read-only", "-C", profile["cwd"], "--json", "--skip-git-repo-check",
                     "--output-schema", schema_path, "-o", output_path, prompt]
         profile["output_path"] = output_path
@@ -151,6 +171,12 @@ def build_command(profile, prompt, run_dir):
         if model:
             command += ["--model", model]
         command += ["--mode", "plan", "--output-format", "json", "--json-schema", schema_path]
+        return command
+    if backend == "copilot":
+        command = [binary, "-p", prompt, "--model", model, "--output-format", "json", "--sandbox",
+                   "--assisted-approval", "--no-ask-user", "--disable-builtin-mcps", "--available-tools=view"]
+        if profile.get("effort"):
+            command += ["--reasoning-effort", profile["effort"]]
         return command
     if backend == "pi":
         session_dir = os.path.join(run_dir, "pi-session")
@@ -193,6 +219,18 @@ def _response_text(backend, stdout, output_path=None):
                 responses.append(response if isinstance(response, str) else json.dumps(response, ensure_ascii=False))
         if responses:
             return responses[-1]
+    elif backend == "copilot":
+        messages = []
+        for line in stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            data = event.get("data") if isinstance(event, dict) else None
+            if isinstance(event, dict) and event.get("type") == "assistant.message" and isinstance(data, dict) and isinstance(data.get("content"), str):
+                messages.append(data["content"])
+        if messages:
+            return messages[-1]
     elif backend == "pi":
         responses = []
         for line in stdout.splitlines():
@@ -275,6 +313,8 @@ def _agy_execution_error(raw, stderr):
         envelope = json.loads(raw)
     except (ValueError, TypeError):
         return None
+    if isinstance(envelope, dict) and isinstance(envelope.get("finished_reason"), str) and envelope["finished_reason"].strip():
+        return f"agy turn ended early: {envelope['finished_reason']}"
     if isinstance(envelope, dict) and envelope.get("denied_actions") and not envelope.get("response"):
         return "agy produced no response because a tool action was denied"
     return None
@@ -308,6 +348,11 @@ def _ask_one(core, profile, prompt, run_dir, deadline, policy, reservation_id):
     slot_dir = os.path.join(core.RUNS, f"consult-slot-{reservation_id}")
     provider = profile.get("provider") or core.execution_provider(profile["backend"], policy=policy)
     acquired = False
+    process = None
+    worktree = None
+    worktree_parent = None
+    worktree_repo = None
+    worktree_head = None
     try:
         acquired = core.reserve_provider_slot(slot_dir, profile["backend"], provider, policy,
                                               keep_waiting=lambda: core.NOW() < deadline)
@@ -315,6 +360,33 @@ def _ask_one(core, profile, prompt, run_dir, deadline, policy, reservation_id):
             row["error"] = "deadline exceeded while waiting for a concurrency slot"
             return row
         os.makedirs(run_dir, exist_ok=True)
+        worktree_repo = profile["cwd"]
+        worktree_parent = tempfile.mkdtemp(prefix="consult-worktree-")
+        worktree = os.path.join(worktree_parent, "worktree")
+        source_head = subprocess.run(["git", "-C", worktree_repo, "rev-parse", "--verify", "HEAD"],
+                                     capture_output=True, text=True, timeout=30)
+        if source_head.returncode:
+            # Consult accepts a question and explicit context files even when the
+            # caller is outside a repository. Give that case an empty worktree.
+            worktree_repo = os.path.join(worktree_parent, "seed")
+            os.mkdir(worktree_repo)
+            init = subprocess.run(["git", "init", "-q", worktree_repo], capture_output=True, timeout=30)
+            if init.returncode:
+                raise RuntimeError("could not initialize consult workspace")
+            commit = subprocess.run(["git", "-C", worktree_repo, "-c", "user.name=OpenSwarm",
+                                     "-c", "user.email=openswarm@localhost", "commit", "--allow-empty", "-qm", "consult workspace"],
+                                    capture_output=True, timeout=30)
+            if commit.returncode:
+                raise RuntimeError("could not initialize consult workspace")
+        prepared = subprocess.run(["git", "-C", worktree_repo, "worktree", "add", "--detach", worktree, "HEAD"],
+                                  capture_output=True, text=True, timeout=30)
+        if prepared.returncode:
+            raise RuntimeError("could not create independent consult worktree")
+        head = subprocess.run(["git", "-C", worktree, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=30)
+        if head.returncode:
+            raise RuntimeError("could not inspect consult worktree HEAD")
+        worktree_head = head.stdout.strip()
+        profile = dict(profile, cwd=worktree)
         raw_attempts = []
         active_prompt = prompt
         for attempt in (1, 2):
@@ -352,6 +424,18 @@ def _ask_one(core, profile, prompt, run_dir, deadline, policy, reservation_id):
                                 + (f"\n[stderr]\n{stderr}" if stderr else ""))
             row["raw"] = "\n\n".join(raw_attempts)
             execution_error = (_agy_execution_error(raw, stderr) if profile["backend"] == "agy" else None)
+            if profile["backend"] == "copilot":
+                events = []
+                for line in stdout.splitlines():
+                    try:
+                        event = json.loads(line)
+                        if isinstance(event, dict):
+                            events.append(event)
+                    except ValueError:
+                        pass
+                results = [event for event in events if event.get("type") == "result"]
+                if process.returncode or not results or results[-1].get("exitCode") != 0 or any(event.get("type") == "session.error" for event in events):
+                    execution_error = "Copilot execution did not complete successfully"
             if execution_error:
                 row["error"] = execution_error
                 if stderr.strip():
@@ -380,11 +464,34 @@ def _ask_one(core, profile, prompt, run_dir, deadline, policy, reservation_id):
     finally:
         if acquired:
             try:
-                core.set_status(slot_dir, state="finished", finished=core.NOW())
+                # An unexpectedly live child keeps its fleet reservation. Never
+                # free capacity merely because the consult wrapper failed.
+                if process is None or process.poll() is not None:
+                    if core.release_fleet_slot(slot_dir):
+                        core.set_status(slot_dir, state="finished", finished=core.NOW())
             except Exception:
                 pass
         import shutil
-        shutil.rmtree(slot_dir, ignore_errors=True)
+        stopped = process is None or process.poll() is not None
+        if worktree and worktree_repo and stopped and os.path.isdir(worktree):
+            status = subprocess.run(["git", "-C", worktree, "status", "--porcelain"],
+                                    capture_output=True, text=True, timeout=30)
+            head = subprocess.run(["git", "-C", worktree, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=30)
+            if status.returncode or head.returncode or worktree_head is None:
+                row.update(valid=False, error="could not inspect consult worktree before cleanup")
+                row["worktree_changes_detected"] = None
+            else:
+                row["worktree_changes_detected"] = bool(status.stdout) or head.stdout.strip() != worktree_head
+            removed = subprocess.run(["git", "-C", worktree_repo, "worktree", "remove", "--force", worktree],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+            if removed.returncode:
+                row.update(valid=False, error="could not remove consult worktree; manual cleanup required")
+            elif worktree_parent:
+                shutil.rmtree(worktree_parent, ignore_errors=True)
+        elif worktree_parent and stopped and not os.path.exists(worktree or ""):
+            shutil.rmtree(worktree_parent, ignore_errors=True)
+        if not acquired or (process is None or process.poll() is not None) and os.path.realpath(slot_dir) not in core._FLEET_RESERVATIONS:
+            shutil.rmtree(slot_dir, ignore_errors=True)
 
 
 def _agreement(answers):
@@ -394,13 +501,12 @@ def _agreement(answers):
                 "summary": "Not enough schema-valid answers to compare recommendations.", "disagreement": []}
     normalized = [" ".join(row["answer"]["opinion"].split()).casefold() for row in valid]
     if len(set(normalized)) == 1:
-        summary = "The schema-valid answers give identical recommendations."
-        disagreement = []
-    else:
-        summary = "The schema-valid answers give different recommendations."
-        disagreement = [{"family": row["family"], "opinion": row["answer"]["opinion"]} for row in valid]
-    return {"identical_recommendations": len(set(normalized)) == 1, "summary": summary,
-            "disagreement": disagreement}
+        return {"identical_recommendations": True,
+                "summary": "The schema-valid answers have identical opinion wording.", "disagreement": []}
+    # Different wording alone is not evidence that the recommendations disagree.
+    return {"identical_recommendations": None,
+            "summary": "The opinion wording differs; compare the answers to assess agreement.",
+            "disagreement": []}
 
 
 def _read_question(args):
@@ -425,7 +531,14 @@ def _profiles(args, core, policy, state):
         profiles = []
         for value in args.ask:
             requested = parse_ask(value)
-            profiles.append(_profile(core, state, policy, requested["backend"], requested["model"]))
+            lane = None
+            if requested["backend"] == "copilot":
+                lanes = [item for item in core.lane_config() if item.get("backend") == "copilot"]
+                lane = next((item for item in lanes if requested["model"] and item.get("model") == requested["model"]), None)
+                lane = lane or next((item for item in lanes if item.get("name") == "GH1"), None)
+                if not lane:
+                    raise ValueError("no Copilot consult lane is configured")
+            profiles.append(_profile(core, state, policy, requested["backend"], requested["model"], lane=lane))
         if len(profiles) < 2:
             raise ValueError("consult requires at least two --ask executors")
         return profiles

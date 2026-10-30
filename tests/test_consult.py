@@ -22,13 +22,31 @@ import openswarm_consult as consult  # noqa: E402
 
 xs = _load.load()
 POLICY = xs.load_policy()
+
+class ConsultComparisonTest(unittest.TestCase):
+    def test_early_agy_json_is_not_accepted_as_a_complete_answer(self):
+        partial = {'status':'SUCCESS', 'finished_reason':'print_timeout',
+                   'response':json.dumps({'opinion':'partial', 'confidence':'high', 'evidence':[], 'risks':[]})}
+        self.assertIn('print_timeout', consult._agy_execution_error(json.dumps(partial), ''))
+
+    def test_different_wording_is_not_labeled_disagreement(self):
+        answers = [
+            {'valid':True, 'family':'OpenAI', 'answer':{'opinion':'Empty input raises ZeroDivisionError.'}},
+            {'valid':True, 'family':'Google', 'answer':{'opinion':'An empty list causes division by zero.'}},
+        ]
+        comparison = consult._agreement(answers)
+        self.assertIsNone(comparison['identical_recommendations'])
+        self.assertEqual(comparison['disagreement'], [])
+        self.assertIn('compare the answers', comparison['summary'])
+
 FAKE = r"""#!/usr/bin/env python3
 import json, os, sys, time
 argv = sys.argv[1:]
-backend = "codex" if argv[:1] == ["exec"] else ("agy" if "--output-format" in argv else "pi")
+backend = "copilot" if "--available-tools=view" in argv else ("codex" if argv[:1] == ["exec"] else ("agy" if "--output-format" in argv else "pi"))
 log_dir = os.environ["FAKE_CONSULT_LOG_DIR"]
 with open(os.path.join(log_dir, backend + ".json"), "w") as stream:
-    # These timestamps are compared across separate executor processes.
+    # On macOS Python 3.9, monotonic() has a process-local origin; these
+    # timestamps are compared across two separate executor processes.
     started = time.clock_gettime(time.CLOCK_MONOTONIC) if hasattr(time, "clock_gettime") else time.time()
     json.dump({"argv": argv, "cwd": os.getcwd(), "started": started}, stream)
 if os.environ.get("FAKE_CONSULT_BARRIER"):
@@ -53,8 +71,16 @@ if backend == "codex":
     output = argv[argv.index("-o") + 1]
     with open(output, "w") as stream:
         stream.write(text)
+elif backend == "copilot":
+    with open("consult-generated-file", "w") as stream:
+        stream.write("discard me")
+    print(json.dumps({"type": "assistant.message", "data": {"content": text}}))
+    print(json.dumps({"type": "result", "exitCode": 0}))
 elif backend == "agy":
-    print(json.dumps({"response": text, "model": "agy-test"}))
+    result = {"response": text, "model": "agy-test"}
+    if os.environ.get("FAKE_CONSULT_AGY_EARLY"):
+        result.update({"status":"SUCCESS", "finished_reason":"print_timeout"})
+    print(json.dumps(result))
 else:
     print(json.dumps({"type": "message_end", "message": {"role": "assistant",
         "content": [{"type": "text", "text": text}]}}))
@@ -70,6 +96,8 @@ class ConsultTests(unittest.TestCase):
         os.chmod(self.script, os.stat(self.script).st_mode | stat.S_IEXEC)
         self.repo = os.path.join(self.tmp, "repo")
         os.makedirs(self.repo)
+        subprocess.run(["git", "init", "-q", self.repo], check=True)
+        subprocess.run(["git", "-C", self.repo, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "initial"], check=True)
         self.data = os.path.join(self.tmp, "data")
         xs.DATA = self.data
         xs.RUNS = os.path.join(self.data, "runs")
@@ -85,13 +113,14 @@ class ConsultTests(unittest.TestCase):
                                              "concurrency": {"codex": 2, "agy": 2, "pi": 2, "total": 8}})
         self.env_keys = ("FAKE_CONSULT_LOG_DIR", "FAKE_CONSULT_BARRIER", "FAKE_CONSULT_TIMEOUT_BACKEND",
                          "FAKE_CONSULT_MALFORMED_BACKEND", "FAKE_CONSULT_REPAIR_BACKEND",
-                         "FAKE_CONSULT_SLEEP_SECONDS")
+                         "FAKE_CONSULT_SLEEP_SECONDS", "FAKE_CONSULT_AGY_EARLY")
         self.old_env = {key: os.environ.get(key) for key in self.env_keys}
         os.environ["FAKE_CONSULT_LOG_DIR"] = self.logs
         os.environ.pop("FAKE_CONSULT_TIMEOUT_BACKEND", None)
         os.environ.pop("FAKE_CONSULT_MALFORMED_BACKEND", None)
         os.environ.pop("FAKE_CONSULT_REPAIR_BACKEND", None)
         os.environ.pop("FAKE_CONSULT_SLEEP_SECONDS", None)
+        os.environ.pop("FAKE_CONSULT_AGY_EARLY", None)
         os.environ.pop("FAKE_CONSULT_BARRIER", None)
         self.cwd_patch = mock.patch("openswarm_consult.os.getcwd", return_value=self.repo)
         self.cwd_patch.start()
@@ -118,6 +147,35 @@ class ConsultTests(unittest.TestCase):
         with open(xs.LEDGER, encoding="utf-8") as stream:
             return [json.loads(line) for line in stream]
 
+    def test_default_skips_exhausted_agy_and_discards_copilot_worktree_changes(self):
+        lanes = [{"name": "GH1", "backend": "copilot", "model": "haiku-test", "effort": "medium", "binary": self.script, "repo": self.repo}]
+        rows = [{"backend": "agy", "model": consult._model(xs, self.state, self.policy, "agy", None, None), "state": "quota_exhausted"}]
+        with mock.patch.object(xs, "lane_status_rows", return_value=rows), mock.patch.object(xs, "lane_config", return_value=lanes), mock.patch.object(consult.sys, "platform", "linux"):
+            code, result = self.run_consult([])
+        self.assertEqual(code, 0)
+        copilot = next(row for row in result["answers"] if row["backend"] == "copilot")
+        self.assertTrue(copilot["valid"])
+        self.assertTrue(copilot["worktree_changes_detected"])
+        with open(os.path.join(self.logs, "copilot.json"), encoding="utf-8") as stream:
+            worktree = json.load(stream)["cwd"]
+        self.assertNotEqual(worktree, self.repo)
+        self.assertFalse(os.path.exists(worktree))
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "consult-generated-file")))
+
+    def test_consult_outside_git_uses_temporary_worktrees(self):
+        outside = os.path.join(self.tmp, "outside")
+        os.mkdir(outside)
+        with mock.patch("openswarm_consult.os.getcwd", return_value=outside):
+            code, result = self.run_consult(["codex", "agy"])
+        self.assertEqual(code, 0)
+        self.assertTrue(all(row["valid"] for row in result["answers"]))
+        for backend in ("codex", "agy"):
+            with open(os.path.join(self.logs, backend + ".json"), encoding="utf-8") as stream:
+                worktree = json.load(stream)["cwd"]
+            self.assertNotEqual(worktree, outside)
+            self.assertFalse(os.path.exists(worktree))
+        self.assertEqual(os.listdir(outside), [])
+
     def test_schema_answers_are_parallel_persisted_and_ledgered(self):
         code, result = self.run_consult(["codex:codex-test", "agy:gemini-test", "pi:minimax-test"])
         self.assertEqual(code, 0)
@@ -133,6 +191,16 @@ class ConsultTests(unittest.TestCase):
         self.assertEqual(len(record["backends_asked"]), 3)
         self.assertFalse([name for name in os.listdir(xs.RUNS) if name.startswith("consult-slot-")])
 
+    def test_early_agy_result_produces_partial_consult(self):
+        os.environ['FAKE_CONSULT_AGY_EARLY'] = '1'
+        code, result = self.run_consult(['codex', 'agy'])
+        self.assertEqual(code, 1)
+        self.assertEqual(result['status'], 'partial')
+        agy = next(x for x in result['answers'] if x['backend'] == 'agy')
+        self.assertFalse(agy['valid'])
+        self.assertIn('print_timeout', agy['error'])
+        self.assertFalse([name for name in os.listdir(xs.RUNS) if name.startswith('consult-slot-')])
+
     def test_each_backend_command_enforces_read_only_mode(self):
         code, _ = self.run_consult(["codex", "agy", "pi"])
         self.assertEqual(code, 0)
@@ -141,7 +209,8 @@ class ConsultTests(unittest.TestCase):
                 return json.load(stream)["argv"]
         codex, agy, pi = argv("codex"), argv("agy"), argv("pi")
         self.assertEqual(codex[codex.index("-s") + 1], "read-only")
-        self.assertEqual(codex[codex.index("-C") + 1], self.repo)
+        self.assertNotEqual(codex[codex.index("-C") + 1], self.repo)
+        self.assertFalse(os.path.exists(codex[codex.index("-C") + 1]))
         self.assertEqual(agy[agy.index("--mode") + 1], "plan")
         self.assertEqual(agy[agy.index("--output-format") + 1], "json")
         self.assertIn("--json-schema", agy)
@@ -151,7 +220,7 @@ class ConsultTests(unittest.TestCase):
         self.assertNotIn("bash", pi[pi.index("--tools") + 1])
         self.assertNotIn("edit", pi[pi.index("--tools") + 1])
         self.assertNotIn("write", pi[pi.index("--tools") + 1])
-        self.assertEqual(os.listdir(self.repo), [])
+        self.assertEqual(os.listdir(self.repo), [".git"])
 
     def test_executors_run_in_parallel(self):
         os.environ["FAKE_CONSULT_BARRIER"] = "1"
