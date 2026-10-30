@@ -52,6 +52,8 @@ try:
                 command += ['--title', title]
             if verify:
                 command += ['--verify', verify]
+            if request.get('read_only') is True:
+                command.append('--read-only')
         process = subprocess.run(command, capture_output=True, text=True, timeout=30)
         try:
             result = json.loads(process.stdout)

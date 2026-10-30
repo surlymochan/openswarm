@@ -58,24 +58,7 @@ def main():
     base = args.base or subprocess.check_output(['git','-C',str(repo),'rev-parse','HEAD'], text=True).strip()
     if not base or len(base)>100 or any(c not in '0123456789abcdef' for c in base):
         raise ValueError('base must be a hexadecimal commit')
-    if args.type in ('review', 'research', 'audit', 'second-opinion'):
-        if args.verify:
-            raise ValueError('read-only review does not accept a verification shell command')
-        result = {'ok': True, 'lane': None, 'backend': 'pi', 'model': 'MiniMax-M3.1-Flash',
-                  'host': 'gores1', 'read_only': True,
-                  'profile': {'type': args.type, 'difficulty': args.difficulty}}
-        if args.dry_run:
-            print(json.dumps(result)); return
-        command = [cli, 'run', '--type', 'review', '--backend', 'pi', '--read-only', '--no-fallback',
-                   '--cwd', str(repo), '--base', base, '--prompt', prompt, '--detach',
-                   '--budget-minutes', str(args.budget_minutes)]
-        if args.title: command += ['--title', args.title]
-        proc = subprocess.run(command, capture_output=True, text=True, timeout=30)
-        if proc.returncode:
-            raise RuntimeError('isolated read-only review was rejected')
-        response = json.loads(proc.stdout)
-        result.update({'id': response['id'], 'state': response['state']})
-        print(json.dumps(result)); return
+    read_only = args.type in ('review', 'research', 'audit', 'second-opinion')
     lanes = local_lanes()
     try: lanes += remote({'op':'lanes'})
     except RuntimeError: pass
@@ -88,6 +71,7 @@ def main():
         result = {'ok': True, 'lane': lane, 'backend': row['backend'], 'model': row['model'],
                   'host': 'gores1' if lane in ('M1','K1') else 'gocc',
                   'profile': {'type': args.type, 'difficulty': args.difficulty}}
+        if read_only: result['read_only'] = True
         if args.dry_run:
             print(json.dumps(result)); return
         if lane in ('M1','K1'):
@@ -95,6 +79,7 @@ def main():
                        '--budget-minutes',str(args.budget_minutes)]
             if args.title: command += ['--title', args.title]
             if args.verify: command += ['--verify',args.verify]
+            if read_only: command.append('--read-only')
             proc = subprocess.run(command, capture_output=True, text=True, timeout=30)
             try: response = json.loads(proc.stdout)
             except ValueError: continue
@@ -102,7 +87,8 @@ def main():
         else:
             try:
                 response = remote({'op':'assign','lane':lane,'prompt':prompt,'base':base,
-                                   'title':args.title,'verify':args.verify,'budget_minutes':args.budget_minutes})
+                                   'title':args.title,'verify':args.verify,'budget_minutes':args.budget_minutes,
+                                   'read_only':read_only})
             except RuntimeError:
                 continue
         result.update({'id':response['id'], 'state':response['state']})

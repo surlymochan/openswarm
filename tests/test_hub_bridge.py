@@ -51,6 +51,13 @@ class HubBridgeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'unresolved'): MOD['run_submit'](self.args)
             with self.assertRaisesRegex(RuntimeError,'unresolved'): MOD['run_submit'](self.args)
 
+    def test_review_profile_reaches_gateway(self):
+        self.card.write_text('Repository: openbot\nExecutor-Type: review\nDifficulty: 2\nReview the code.\n')
+        gateway = mock.Mock(return_value={'id':'run-review','state':'queued','host':'gocc','backend':'copilot','model':'x'})
+        with mock.patch.dict(G, {'gateway':gateway}), contextlib.redirect_stdout(io.StringIO()):
+            MOD['run_submit'](self.args)
+        self.assertEqual(gateway.call_args.args[0]['type'], 'review')
+
     def test_unknown_workspace_and_dirty_repo_fail_before_dispatch(self):
         with mock.patch.dict(G, {'gateway':mock.Mock()}) as _:
             bad=list(self.args); bad[bad.index('--cwd')+1]=str(self.path)

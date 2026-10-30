@@ -56,8 +56,9 @@ def run_submit(args):
     # defaults to a normal Codex task instead of guessing from natural language.
     match = re.search(r'(?im)^\s*(?:executor-type|task-type)\s*:\s*([a-z-]+)\s*$',card)
     kind = match.group(1).lower() if match else 'impl'
-    valid_types = {'impl','mechanical','format','rename','docs','test','refactor','debug','migration'}
-    if kind not in valid_types: raise ValueError('invalid or read-only task type for Hub coding dispatch')
+    valid_types = {'impl','mechanical','format','rename','docs','test','refactor','debug','migration',
+                   'review','research','audit','second-opinion'}
+    if kind not in valid_types: raise ValueError('invalid task type for Hub dispatch')
     match = re.search(r'(?im)^\s*(?:difficulty|难度)\s*:\s*([1-5])\s*$',card)
     difficulty = int(match.group(1)) if match else 3
     if not 0 < opts.budget_minutes <= 40: raise ValueError('budget must be between 0 and 40 minutes')

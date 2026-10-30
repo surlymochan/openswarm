@@ -67,6 +67,21 @@ class FleetCapacityTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'required but missing'):
                 xs.fleet_guard_command()
 
+    def test_remote_review_assignment_passes_read_only_to_lane(self):
+        root = pathlib.Path(self.temp.name)
+        binary = root / '.local/bin/openswarm'
+        binary.parent.mkdir(parents=True)
+        binary.write_text('#!/usr/bin/env python3\nimport json,os,sys\n'
+                          'open(os.environ["FAKE_ARGS"],"w").write(json.dumps(sys.argv))\n'
+                          'print(json.dumps({"ok":True,"id":"test"}))\n')
+        binary.chmod(0o755)
+        self.env['HOME'] = str(root)
+        self.env['FAKE_ARGS'] = str(root / 'args.json')
+        response = self.call('gores1', op='assign', lane='GH1', prompt='review', base='abcdef0',
+                             budget_minutes=3, title='review', verify=None, read_only=True)
+        self.assertTrue(response['ok'])
+        self.assertIn('--read-only', json.loads((root / 'args.json').read_text()))
+
     def test_html_403_is_not_misclassified_as_login_failure(self):
         error = 'request failed (code 403): HTML response "Error 403 (Forbidden)!!1"'
         self.assertEqual(xs.executor_error_class(1, None, error, 'agy'), 'upstream_forbidden')
