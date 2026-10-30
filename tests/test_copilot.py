@@ -24,6 +24,16 @@ class CopilotTests(unittest.TestCase):
             self.assertTrue(xs.lane_acp_request(child, msg, os.path.join(tmp, 'events')))
             self.assertEqual(child.send.call_args.args[0]['result']['outcome']['optionId'], 'once')
 
+    def test_sandbox_bypass_is_not_automatically_approved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            child = mock.Mock()
+            child.lane = {"backend": "copilot"}
+            msg = {"id": 8, "method": "session/request_permission", "params": {
+                "toolCall": {"rawInput": {"requestSandboxBypass": True}},
+                "options": [{"kind": "allow_once", "optionId": "once"}]}}
+            self.assertTrue(xs.lane_acp_request(child, msg, os.path.join(tmp, 'events')))
+            self.assertEqual(child.send.call_args.args[0]['result']['outcome']['outcome'], 'cancelled')
+
     def test_result_and_error_are_not_confused(self):
         with tempfile.TemporaryDirectory() as tmp:
             binary = pathlib.Path(tmp, "copilot")
