@@ -33,6 +33,14 @@ if argv[:1] == ["models"]:
         print(slug)
     sys.exit(0)
 
+if argv[:2] == ["-p", "/usage"]:
+    quota_file = os.environ.get("FAKE_AGY_QUOTA_FILE")
+    fraction = float(open(quota_file).read()) if quota_file else 1.0
+    send({"status": "SUCCESS", "command": {"data": {"groups": [
+        {"name": "Gemini Models", "buckets": [{"remaining_fraction": fraction}]}
+    ]}}})
+    sys.exit(0)
+
 if mode == "auth":
     sys.stderr.write("FatalAuthenticationError: authentication required\n")
     sys.exit(1)
