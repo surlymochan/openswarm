@@ -93,6 +93,17 @@
         "limit_id": "codex"
       },
       {
+        "id": "gpt-6-luna",
+        "description": "Fast and affordable for easier tasks",
+        "priority": 4,
+        "tier": "fast",
+        "legacy": false,
+        "efforts": ["minimal", "low", "medium", "high"],
+        "default_effort": "high",
+        "context_window": 272000,
+        "limit_id": "codex"
+      },
+      {
         "id": "gpt-mini",
         "description": "Fast and affordable for easier tasks",
         "priority": 4,

@@ -242,7 +242,7 @@ class LaneTests(unittest.TestCase):
         (self.data / "policy.local.json").write_text(json.dumps({"concurrency": {"fake-provider": 1}}))
         self.cli("lane", "up", "L1")
         self.cli("lane", "up", "L2")
-        first = self.assign("LANE_TEST_WAIT_SHORT first provider task")
+        first = self.assign("LANE_TEST_WAIT first provider task")
         self.wait_running(first)
         second = json.loads(self.cli("lane", "assign", "L2", "--prompt", "second provider task").stdout)["id"]
         queued = self.wait_for(lambda: (state if (state := self.run_state(second)).get("queue_reason") else None),
@@ -250,6 +250,7 @@ class LaneTests(unittest.TestCase):
         self.assertEqual(queued["queue_reason"], "provider concurrency limit")
         lanes = {row["name"]: row for row in json.loads(self.cli("lane", "status").stdout)}
         self.assertEqual(lanes["L2"]["run_state"], "queued")
+        self.cli("lane", "steer", "L1", "--text", "finish first provider task")
         self.assertEqual(self.wait_run(first)["status"], "done")
         self.assertEqual(self.wait_run(second)["status"], "done")
 
@@ -265,12 +266,13 @@ class LaneTests(unittest.TestCase):
         (self.data / "policy.local.json").write_text(json.dumps({"concurrency": {"total": 1}}))
         self.cli("lane", "up", "L1")
         self.cli("lane", "up", "L2")
-        first = self.assign("LANE_TEST_WAIT_SHORT first total-cap task")
+        first = self.assign("LANE_TEST_WAIT first total-cap task")
         self.wait_running(first)
         second = json.loads(self.cli("lane", "assign", "L2", "--prompt", "second backend task").stdout)["id"]
         queued = self.wait_for(lambda: (state if (state := self.run_state(second)).get("queue_reason") else None),
                                description="second backend turn to queue on total cap")
         self.assertEqual(queued["queue_reason"], "provider concurrency limit")
+        self.cli("lane", "steer", "L1", "--text", "finish first total-cap task")
         self.assertEqual(self.wait_run(first)["status"], "done")
         self.assertEqual(self.wait_run(second)["status"], "done")
 
@@ -344,6 +346,29 @@ class LaneTests(unittest.TestCase):
         if not path.exists():
             return []
         return [json.loads(line) for line in path.read_text().splitlines()]
+
+    def test_review_discards_changes_and_agent_commit(self):
+        self.set_config("cursor")
+        (self.data / "policy.local.json").write_text(json.dumps({"workspace": {
+            "prepare": {"repo": "mkdir -p node_modules && touch node_modules/ready"},
+            "prepare_replaces_links": ["node_modules"]}}))
+        base = self.git("rev-parse", "HEAD")
+        self.start_lane()
+        for prompt in ("review LANE_TEST_NESTED_REPO", "review LANE_TEST_AGENT_COMMIT"):
+            run_id = self.assign(prompt, "--read-only", "--verify", "test -f node_modules/ready && test ! -f lane_result.txt && test ! -d nested")
+            self.assertEqual(self.wait_run(run_id)["status"], "done")
+            result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+            wt = self.data / "lanes" / self.lane_name / "wt"
+            self.assertIsNone(result["commit"])
+            self.assertEqual(result["verify"]["rc"], 0)
+            self.assertTrue(result["review_changes_discarded"])
+            self.assertFalse((wt / "lane_result.txt").exists())
+            ledger = [json.loads(line) for line in (self.data / "ledger.jsonl").read_text().splitlines()]
+            entry = next(row for row in ledger if row["id"] == run_id)
+            self.assertTrue(entry["read_only_output"])
+            self.assertTrue(entry["exec_pass"])
+            self.assertEqual(subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=wt, text=True).strip(), base)
+            self.assertEqual(self.git("rev-parse", "HEAD"), base)
 
     def test_cursor_assign_selects_model_and_commits_without_verify(self):
         self.set_config("cursor")
@@ -472,6 +497,107 @@ class LaneTests(unittest.TestCase):
         calls = [json.loads(line) for line in pathlib.Path(self.env["FAKE_AGY_LOG"]).read_text().splitlines()]
         self.assertEqual(calls[0][calls[0].index("--model") + 1], "gemini-3.8-flash-medium")
         self.assertEqual(calls[0][calls[0].index("--output-format") + 1], "stream-json")
+
+    def test_agy_running_status_records_live_executor_pid(self):
+        self.set_config("agy")
+        self.start_lane()
+        run_id = self.assign("LANE_TEST_WAIT inspect pid")
+        pid = self.wait_for(lambda: self.run_state(run_id).get("executor_pid"),
+                            description="headless executor pid")
+        self.assertTrue(process_alive(pid))
+        self.cli("lane", "abort", self.lane_name)
+        self.wait_run(run_id)
+
+    def test_agy_early_timeout_is_not_success_and_releases_capacity(self):
+        self.set_config("agy")
+        self.env["FAKE_AGY_MODE"] = "print-timeout"
+        self.env["OPENSWARM_FLEET_CAPACITY_DIR"] = str(self.root / "capacity")
+        guard = self.root / "guard.json"
+        guard.write_text(json.dumps({"command": [str(ROOT / "bin/fleet-capacity"), "gocc"]}))
+        self.env["OPENSWARM_FLEET_GUARD_CONFIG"] = str(guard)
+        self.start_lane()
+        run_id = self.assign("review the fixture")
+        self.wait_run(run_id)
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertNotEqual(result["status"], "done")
+        self.assertIn("print_timeout", result["attempts"][0]["error_tail"])
+        self.assertFalse(process_alive(self.run_state(run_id)['executor_pid']))
+        status = subprocess.run([str(ROOT / "bin/fleet-capacity"), "gocc"],
+                                input=json.dumps({"op": "status"}), text=True,
+                                capture_output=True, env=self.env, check=True)
+        self.assertEqual(json.loads(status.stdout)["reservations"], [])
+
+    def test_agy_quota_reset_beyond_budget_does_not_retry(self):
+        self.set_config("agy")
+        self.env["FAKE_AGY_MODE"] = "long-quota"
+        quota_file = self.root / "quota.txt"
+        quota_file.write_text("0")
+        self.env["FAKE_AGY_QUOTA_FILE"] = str(quota_file)
+        self.start_lane()
+        run_id = self.assign("review the fixture")
+        self.wait_run(run_id)
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual(len(result["attempts"]), 1)
+        self.assertEqual(result["attempts"][0]["error_class"], "rate_limit")
+        self.wait_for(lambda: self.lane_state().get("state") == "idle")
+        rows = json.loads(self.cli("lane", "status").stdout)
+        self.assertEqual(rows[0]["state"], "quota_exhausted")
+        self.assertGreater(rows[0]["quota_reset_at"], time.time())
+        self.assertLessEqual(rows[0]["quota_reset_at"], time.time() + 3600)
+        state_path = self.data / "lanes" / self.lane_name / "state.json"
+        state = json.loads(state_path.read_text())
+        state["quota_until"] = 1
+        state_path.write_text(json.dumps(state))
+        self.wait_for(lambda: self.lane_state().get("quota_until", 0) > time.time())
+        self.assertEqual(json.loads(self.cli("lane", "status").stdout)[0]["state"], "quota_exhausted")
+        quota_file.write_text("0.5")
+        state = json.loads(state_path.read_text())
+        state["quota_until"] = 1
+        state_path.write_text(json.dumps(state))
+        self.wait_for(lambda: self.lane_state().get("quota_model") is None)
+        self.assertEqual(json.loads(self.cli("lane", "status").stdout)[0]["state"], "idle")
+
+    def test_agy_403_stops_process_and_releases_fleet_slot(self):
+        self.set_config("agy")
+        self.env["FAKE_AGY_MODE"] = "forbidden"
+        self.env["OPENSWARM_FLEET_CAPACITY_DIR"] = str(self.root / "capacity")
+        guard = self.root / "guard.json"
+        guard.write_text(json.dumps({"command": [str(ROOT / "bin/fleet-capacity"), "gocc"]}))
+        self.env["OPENSWARM_FLEET_GUARD_CONFIG"] = str(guard)
+        self.start_lane()
+        for _ in range(2):
+            run_id = self.assign("review the fixture")
+            self.wait_run(run_id)
+            result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+            self.assertEqual(result["error_class"], "upstream_forbidden")
+            status = subprocess.run([str(ROOT / "bin/fleet-capacity"), "gocc"],
+                                    input=json.dumps({"op": "status"}), text=True,
+                                    capture_output=True, env=self.env, check=True)
+            self.assertEqual(json.loads(status.stdout)["reservations"], [])
+            self.wait_for(lambda: self.lane_state().get("state") == "idle")
+
+    def test_agy_retries_one_transient_403(self):
+        self.set_config("agy")
+        self.env["FAKE_AGY_MODE"] = "forbidden-once"
+        self.env["FAKE_AGY_ONCE_MARKER"] = str(self.root / "agy-failed-once")
+        self.start_lane()
+        run_id = self.assign("create a file")
+        self.assertEqual(self.wait_run(run_id)["status"], "done")
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual([item["error_class"] for item in result["attempts"]], ["upstream_forbidden", None])
+
+    def test_agy_retry_after_rate_limit_keeps_original_task(self):
+        self.set_config("agy")
+        self.env["FAKE_AGY_MODE"] = "rate-then-forbidden"
+        self.env["FAKE_AGY_ONCE_MARKER"] = str(self.root / "agy-sequence")
+        (self.data / "policy.local.json").write_text(json.dumps({"rate_limit": {"backoff_seconds": [0], "max_retries": 1}}))
+        self.start_lane()
+        run_id = self.assign("original review task")
+        self.assertEqual(self.wait_run(run_id)["status"], "done")
+        result = json.loads((self.data / "runs" / run_id / "result.json").read_text())
+        self.assertEqual([item["error_class"] for item in result["attempts"]], ["rate_limit", "upstream_forbidden", None])
+        calls = [json.loads(line) for line in pathlib.Path(self.env["FAKE_AGY_LOG"]).read_text().splitlines()]
+        self.assertIn("original review task", calls[-1][calls[-1].index("-p") + 1])
 
     def test_agy_steer_aborts_the_process_and_resumes_the_conversation(self):
         self.set_config("agy")
@@ -646,6 +772,42 @@ class LaneTests(unittest.TestCase):
         self.cli("stop", run_id)
         self.assertEqual(self.wait_run(run_id)["status"], "stopped")
         self.assertTrue(process_alive(supervisor_pid))
+
+    def test_pi_acknowledged_abort_releases_fleet_slot(self):
+        self.set_config("pi")
+        config_path = self.data / "lanes.json"
+        config = json.loads(config_path.read_text())
+        config["lanes"][0]["provider"] = "minimax-cn"
+        config_path.write_text(json.dumps(config))
+        guard = self.root / "fleet-guard.json"
+        guard.write_text(json.dumps({"command": [str(ROOT / "bin/fleet-capacity"), "gores1"]}))
+        self.env["OPENSWARM_FLEET_GUARD_CONFIG"] = str(guard)
+        self.env["OPENSWARM_FLEET_CAPACITY_DIR"] = str(self.root / "fleet")
+        self.start_lane()
+        run_id = self.assign("LANE_TEST_WAIT abort this")
+        self.wait_running(run_id)
+        self.cli("lane", "abort", self.lane_name)
+        self.assertEqual(self.wait_run(run_id)["status"], "stopped")
+        status = subprocess.run([str(ROOT / "bin/fleet-capacity"), "gores1"],
+                                input=json.dumps({"op": "status"}), env=self.env, text=True,
+                                capture_output=True, check=True)
+        self.assertEqual(json.loads(status.stdout)["reservations"], [])
+        next_id = self.assign("next task after abort")
+        self.assertEqual(self.wait_run(next_id)["status"], "done")
+
+    def test_stop_of_old_run_does_not_abort_the_next_run(self):
+        self.start_lane()
+        old = self.assign("first completed task")
+        self.wait_run(old)
+        self.wait_for(lambda: self.lane_state().get("state") == "idle", description="idle lane")
+        current = self.assign("LANE_TEST_WAIT keep this run alive")
+        self.wait_running(current)
+        response = json.loads(self.cli("stop", old).stdout)
+        self.assertEqual(response["signalled"], [])
+        self.assertEqual(response["response"]["error"], "lane is running a different run")
+        self.assertEqual(self.run_state(current)["state"], "running")
+        self.cli("stop", current)
+        self.assertEqual(self.wait_run(current)["status"], "stopped")
 
     def test_budget_interrupt_is_recorded(self):
         self.start_lane()
