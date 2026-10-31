@@ -49,13 +49,16 @@ def main():
                    '--title',title,'--base',base,'--budget-minutes',str(budget)]
             if verify: cmd += ['--verify',verify]
             return result(cmd,timeout=90)
-    if op in ('info','stop'):
+    if op in ('info','bundle','stop'):
         run_id, host = req.get('id'), req.get('host')
         if not isinstance(run_id,str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,99}',run_id): raise ValueError('invalid id')
         if host not in ('gores1','gocc'): raise ValueError('invalid host')
         if host == 'gocc':
-            data = result(ssh, {'op':'run_info' if op=='info' else 'stop','run_id':run_id})
+            data = result(ssh, {'op':{'info':'run_info','bundle':'bundle','stop':'stop'}[op],'run_id':run_id}, timeout=140)
             return data['result']
+        if op == 'bundle':
+            info = result([cli, 'fleet', '_run-info', run_id])
+            return result([sys.executable, str(Path(__file__).with_name('fleet-result-bundle'))], info, timeout=130)
         return result([cli,'fleet','_run-info',run_id] if op=='info' else [cli,'stop',run_id])
     raise ValueError('invalid operation')
 
