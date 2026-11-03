@@ -3,7 +3,7 @@ name: openswarm
 description: Claude plans, executors write the code — Codex, Pi (e.g. MiniMax), Cursor Agent, OpenCode Go, DeepSeek. Use when work involves writing or changing code across files, batch refactors, migrations, test writing, or the user says "let Codex do it", "dispatch", "swarm", "openswarm", "lane", or wants to save Claude quota. One-shot runs or resident lanes (Codex app-server, Pi RPC, Cursor ACP) that take tasks one at a time and can be steered or aborted mid-turn; lanes and runs can live on other hosts reached over SSH. Reads live quotas, routes each task to the most economical capable model, runs it in an isolated git worktree with a hard time budget, verifies on the host, streams progress/risk/stall alerts, and reports on a schedule instead of running forever.
 ---
 
-# openswarm
+# swrm
 
 **Division of labour:** Claude decomposes work, writes acceptance criteria, reviews, and integrates.
 Executors write code: **Codex** is the only backend in the default automatic routing order. **OpenCode Go** and **DeepSeek** are opt-in through `--backend` or by adding them to `routing.default_order`; when enabled, OpenCode Go handles cheap/mechanical work, non-GPT second opinions, overflow and large context, while DeepSeek is metered. **Pi** (any provider it is configured for, such as MiniMax) and **Cursor Agent** are opt-in, as one-shot backends or resident lanes.
@@ -47,7 +47,7 @@ $XS run --cwd <repo> --type impl --difficulty 3 --budget-minutes 15 --title "...
 
 **Always pass `--verify '<test command>'`** when the task has a test command. Executors run in a sandbox that can block
 local port binding, network, or keychain access, so they often report `partial` for purely environmental reasons.
-openswarm commits the executor's edit first, then runs the verify command on the host in that committed worktree (suites that refuse dirty trees pass); its exit code wins
+swrm commits the executor's edit first, then runs the verify command on the host in that committed worktree (suites that refuse dirty trees pass); its exit code wins
 (`partial`→`done` when it passes, `done`→`partial` when it fails) and is recorded in `result.verify`.
 Gitignored dependency dirs (`node_modules`, `.venv`, `venv`; override with `workspace.link_dirs` in policy) are
 symlinked from the base repo into the worktree and never committed, so imports resolve. Worktrees are created
@@ -195,7 +195,7 @@ A finished run gives you `status`, `result` (`summary`, `files_changed`, `tests`
   combined suite on the base checkout** covering every touched area: each run's `verify` only proves that run in
   isolation, and tasks can break each other or untouched callers (a stricter check in one run broke an existing
   test and a non-browser client that no single verify covered).
-- `--verify-baseline`: when the suite already has known failures, add this flag. On a failing verify openswarm reruns
+- `--verify-baseline`: when the suite already has known failures, add this flag. On a failing verify swrm reruns
   the command on the run's base commit and passes the run only if it introduced no new failing test
   (`result.verify.baseline.new_failures`). Without it, a repo with pre-existing failures can never verify green.
 - `--verify` paths: write them relative to the repo; absolute paths into the base repo are rewritten to the worktree. If something needs fixing, send a follow-up task instead of hand-editing large amounts.
@@ -211,11 +211,11 @@ When the user has opted into workflows, use `templates/openswarm-workflow.js` an
  "tasks": [{"id": "t1", "title": "...", "prompt": "...", "type": "impl", "difficulty": 3, "budgetMinutes": 30}]}
 ```
 Thin **haiku** dispatchers start each task, watch it until DONE, and stop it on dangerous RISK lines. Codex and the other executors do the coding. Claude review agents check each commit against its criteria while the other tasks are still running (pipeline, no barrier). The workflow returns a verdict per task. The main loop then merges accepted branches and re-dispatches `fix` items.
-Workflow features you keep: phases, pipeline and parallel, resume (`resumeFromRunId`), budgets. Use `isolation: 'worktree'` only for agents that edit files themselves. openswarm already isolates executors.
+Workflow features you keep: phases, pipeline and parallel, resume (`resumeFromRunId`), budgets. Use `isolation: 'worktree'` only for agents that edit files themselves. swrm already isolates executors.
 
 ## 6. Agent teams
 
-In a team, make teammates **thin openswarm dispatchers**: each teammate owns a set of tasks, runs `openswarm run --detach` and `watch`, and reports a result per task. Keep one Claude teammate as the **reviewer or integrator**. Teammates must not run tasks that touch the same files at the same time. Use `$XS status` concurrency as the team-wide cap on executor runs in flight.
+In a team, make teammates **thin swrm dispatchers**: each teammate owns a set of tasks, runs `openswarm run --detach` and `watch`, and reports a result per task. Keep one Claude teammate as the **reviewer or integrator**. Teammates must not run tasks that touch the same files at the same time. Use `$XS status` concurrency as the team-wide cap on executor runs in flight.
 
 ## 7. Routing rules (what `route` does)
 
@@ -239,9 +239,9 @@ In a team, make teammates **thin openswarm dispatchers**: each teammate owns a s
 Override anything in `~/.claude/openswarm/policy.local.json`, deep-merged over `policy.json`: thresholds, the difficulty map, exclude patterns, plan, model caps.
 
 ## 8. Safety
-- **Credentials.** openswarm never reads another tool's auth file unless you opt in (`local_sources.codex_auth_plan`,
+- **Credentials.** swrm never reads another tool's auth file unless you opt in (`local_sources.codex_auth_plan`,
   `local_sources.claude_account_plan`). Prefer `OPENSWARM_CODEX_PLAN` / `OPENSWARM_CLAUDE_PLAN` and `DEEPSEEK_API_KEY`.
-  See README "What openswarm reads on your machine".
+  See README "What swrm reads on your machine".
 
 - Controlled local executors get `workspace-write` sandbox (Codex) or edit/bash permission scoped to the worktree (opencode, `external_directory: deny`). The local runner commits on `openswarm/<id>` and does not push. The GitHub bus worker is the only path that pushes, and only to the target task repository.
 - Do not put secrets in task prompts. Prompts and diffs go to the executor's model provider. Each backend's data boundary is listed in `backends/*.json`.
@@ -289,7 +289,7 @@ Grouped by what the command does. `openswarm <command> --help` lists every flag.
 | `budget status` | Show today's executor budget usage. | `$XS budget status --json` |
 | `ingest-claude` | Record Claude plan usage from the statusline hook or from flags. | `$XS ingest-claude --five-hour 80 --seven-day 40` |
 | `fleet status` | Show reachability, paused hosts, lanes, and active runs. | `$XS fleet status --json` |
-| `fleet exec` | Run an openswarm command on another host; stdout and the exit code are forwarded. | `$XS fleet exec worker -- lane status` |
+| `fleet exec` | Run an swrm command on another host; stdout and the exit code are forwarded. | `$XS fleet exec worker -- lane status` |
 | `fleet ledger pull` | Merge the host ledgers into one fleet ledger file. | `$XS fleet ledger pull --hosts worker,sandbox` |
 
 ### Learn

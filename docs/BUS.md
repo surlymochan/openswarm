@@ -1,4 +1,9 @@
-# openswarm GitHub issue bus
+# swrm GitHub issue bus
+
+> The project was renamed from openswarm to **swrm** in v0.3.1. The bus wire format
+> deliberately keeps its `openswarm` identifiers (`openswarm:` labels, the
+> `openswarm-task` / `openswarm-result` blocks, branch prefix `openswarm/`) so cards
+> and workers created before the rename keep interoperating.
 
 Use the issue bus only for executors outside the controlled fleet, such as another person's agent, a cloud agent, or an agent on an unmanaged host. For hosts you control, use SSH fleet lanes so execution stays on the known machines.
 
