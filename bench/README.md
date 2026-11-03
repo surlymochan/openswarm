@@ -4,7 +4,7 @@ openswarm and [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent)
 
 This benchmark compares that routing slice only. OmO is a multi-agent harness; most of what it does is outside this comparison. The benchmark was written by the openswarm maintainer, so the task mix and the tier labels can favor the tool that defined them. The trace, the catalogue, both decision files, and the score tables are published under `bench/` so the result can be recomputed.
 
-The catalogue now includes the configured `gpt-6-luna` default for offline routing. Its benchmark parameters are illustrative, and the checked-in result files predate this catalogue and policy change; regenerate both sides before making a new comparison.
+The catalogue now includes the configured `gpt-6-luna` default for offline routing. Its benchmark parameters are illustrative. The openswarm decision file and scores were regenerated on 2026-11-04 (family-spread review routing, below); the OmO decision file and the coverage counts are still the checked-in pinned ones — regenerate both sides before making a new comparison. The shipped `policy.json` defaults automatic routing to Codex only, so the openswarm harness enables the three connected backends explicitly (`routing.default_order = [codex, ocgo, deepseek]`, the same opt-in `tests/test_route.py` uses) and disables the fleet's forced single Codex model (`codex.require_default_model`), which would otherwise mask the tier routing this bench compares.
 
 ## Fairness rules
 
@@ -20,7 +20,7 @@ The catalogue now includes the configured `gpt-6-luna` default for offline routi
 
 openswarm `route()` (`bin/openswarm`) picks a backend order from the task type, then a model inside that backend:
 
-- `review`, `second-opinion`, and `audit` try OpenCode Go, then Codex, then DeepSeek.
+- `review`, `second-opinion`, and `audit` try OpenCode Go, then Codex, then DeepSeek. Inside an OpenCode Go tier, a review pick spreads off the router's workhorse family (the family the newest-first pick would take) when the tier offers another family, so the review does not repeat the family implementation work itself uses after a spill.
 - `mechanical`, `docs`, `test`, `format`, `rename`, and `migration` at difficulty ≤ 2 try OpenCode Go first.
 - Everything else tries Codex, then OpenCode Go, then DeepSeek.
 - Context above 220k tokens moves OpenCode Go and DeepSeek ahead of Codex.
@@ -193,7 +193,7 @@ Per-pass shares are the mean of the seven scenarios. Each scenario is one pass o
 
 | Tool | Wasted first | Unrouted | Review independence | Failed attempts | Metered USD | Go account USD | Go 5h share per pass | Go 5h share (sum) | Codex 5h share per pass | Codex 5h share (sum) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| openswarm | 0.0% | 0.0% | 54.8% | 0 | 0.0000 | 31.0513 | 1.4378 | 10.0651 | 0.4763 | 3.3338 |
+| openswarm | 0.0% | 0.0% | 85.7% | 0 | 0.0000 | 31.0513 | 1.4378 | 10.0651 | 0.4763 | 3.3338 |
 | OmO | 23.4% | 19.8% | 71.4% | 254 | 1.5396 | 23.0340 | 1.0969 | 7.6780 | 0.8502 | 5.9512 |
 | Codex default | 28.6% | 28.6% | 0.0% | 160 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 1.7812 | 12.4685 |
 | strongest | 28.6% | 28.6% | 0.0% | 160 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 1.7812 | 12.4685 |
@@ -255,12 +255,12 @@ Twelve review or audit tasks per scenario.
 | Scenario | openswarm | OmO | Codex default | strongest | cheapest |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | fresh | 100.0% | 100.0% | 0.0% | 0.0% | 0.0% |
-| codex_soft_90 | 33.3% | 100.0% | 0.0% | 0.0% | 0.0% |
-| codex_hard_97 | 33.3% | 66.7% | 0.0% | 0.0% | 0.0% |
+| codex_soft_90 | 100.0% | 100.0% | 0.0% | 0.0% | 0.0% |
+| codex_hard_97 | 100.0% | 66.7% | 0.0% | 0.0% | 0.0% |
 | ocgo_hot | 100.0% | 100.0% | 0.0% | 0.0% | 0.0% |
 | deepseek_floor | 100.0% | 100.0% | 0.0% | 0.0% | 0.0% |
-| mixed_late_week | 16.7% | 33.3% | 0.0% | 0.0% | 0.0% |
-| tight_friday | 0.0% | 0.0% | 0.0% | 0.0% | 0.0% |
+| mixed_late_week | 0.0% | 33.3% | 0.0% | 0.0% | 0.0% |
+| tight_friday | 100.0% | 0.0% | 0.0% | 0.0% | 0.0% |
 
 ### How the objective numbers move
 
@@ -268,7 +268,7 @@ Twelve review or audit tasks per scenario.
 - At 97%, openswarm skips Codex before the call (wasted first attempts 0). OmO's first Codex pick fails and it walks the chain: 52.5% of tasks in that scenario waste the first attempt. Across all seven scenarios that is 254 failed attempts. `ultrabrain`, `deep-high`, and `deep-low` then stay unresolved when every reachable Codex rung is exhausted.
 - `writing` is unrouted for OmO in all 7 tasks × 7 scenarios. The chain names Google and Anthropic models only, and `requiresAnyModel` blocks a fallthrough. Those providers are not in this set.
 - A DeepSeek balance of ¥3 changes no decision for either tool. OmO's metered total ($1.54) comes from scenarios where a Codex or Go rung has already failed and the chain reaches `deepseek-flash` or `deepseek-v4-pro`.
-- Review independence is 71.4% for OmO and 54.8% for openswarm. openswarm's reviews stay independent while the reference implementer is still a GPT model. Once that implementer has spilled onto the same Go family the review uses, the rate falls (33.3% at the soft Codex limit, 0% on tight Friday).
+- Review independence is 85.7% for openswarm and 71.4% for OmO (openswarm side regenerated 2026-11-04; the OmO decision file is the checked-in pinned one). openswarm's review picks spread off the router's workhorse family inside the OpenCode Go tier, so a review stays independent even when the reference implementer has spilled off Codex onto that same Go family (100% at the soft and hard Codex limits and on tight Friday). The remaining loss is `mixed_late_week` (0%), where quota leaves a single usable Go family, so no different-family candidate exists at any tier.
 - One pass of the trace uses 0.4763 of the nominal Codex 5h budget under openswarm and 0.8502 under OmO, averaged across the seven scenarios. The two Codex baselines average 1.7812 because five of the scenarios put the whole trace on Codex (2.4937 each) and the two hard-Codex scenarios use none. OpenCode Go's per-pass share is 1.4378 for openswarm and 1.0969 for OmO. That share can exceed 1 because it sums fractions of small per-model windows.
 - On tight Friday, openswarm wastes nothing and leaves nothing unrouted, and its Go per-pass share falls to 0.0481, the same flash-only figure as the cheapest baseline. OmO wastes the first attempt on 91.2% of those tasks.
 

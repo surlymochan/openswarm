@@ -256,6 +256,14 @@ def main():
     home = tempfile.mkdtemp(prefix="openswarm-bench-home-")
     xs = load_openswarm(home)
     policy = xs.jload(os.path.join(ROOT, "policy.json"), {})
+    # The bench's premise is the three connected backends (see README,
+    # "Fairness rules"); the shipped policy defaults to Codex only, so enable
+    # all three explicitly — the same opt-in tests/test_route.py uses.
+    policy["routing"]["default_order"] = ["codex", "ocgo", "deepseek"]
+    # The bench compares the router across tiers; the fleet policy's forced
+    # single Codex model (codex.require_default_model) would mask that, so
+    # disable it here — tests/test_route.py does the same for its scenarios.
+    policy["codex"]["require_default_model"] = False
     catalogue = load_json(os.path.join(BENCH, "catalogue.json"))
     scenarios = load_json(os.path.join(BENCH, "scenarios.json"))
     trace = load_jsonl(os.path.join(BENCH, "trace.jsonl"))

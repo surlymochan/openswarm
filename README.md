@@ -57,15 +57,16 @@ providers for both routers (Codex subscription, OpenCode Go, DeepSeek). Costs ar
 | --- | --- | --- | --- |
 | First attempt sent to an already-exhausted quota | **0.0%** | 23.4% (254 failed attempts) | 28.6% |
 | Decisions with no usable model (this provider set) | **0.0%** | 19.8% ² | 28.6% |
-| Review tasks sent to a different model family | 54.8% | **71.4%** | 0% |
+| Review tasks sent to a different model family | **85.7%** | 71.4% | 0% |
 | Codex 5h window used per trace pass (computed) | **0.48** | 0.85 | 1.78 |
 | Metered spend, all scenarios (computed) | **$0.00** | $1.54 | $0.00 |
 | Routing decision latency, in-process median | **0.008 ms** | 0.026 ms | – |
 | Providers / model ids known to the router | 3 backends / 27 | **26 / 36** | – |
 
 openswarm reads quota windows before it routes, so it never spends an attempt on an exhausted plan. By design, OmO
-learns about an exhausted plan from the usage-limit error and then moves to the next rung. OmO keeps review work on a
-different model family more often, and it covers far more providers.
+learns about an exhausted plan from the usage-limit error and then moves to the next rung. openswarm's review routing
+spreads off the router's own workhorse family, so a review stays on a different family from the implementer even
+when implementation work has spilled off Codex onto OpenCode Go; OmO still covers far more providers.
 ² 49 of OmO's 111 unrouted decisions are `writing` tasks. In OmO that chain only names Google/Anthropic models, which this provider set does not connect.
 
 openswarm is a quota-aware dispatcher for coding agents. Your planner (Claude Code) breaks work into tasks and

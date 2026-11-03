@@ -12,7 +12,7 @@ The chart is `bench/results/chart.svg`. It plots the objective rates and the Cod
 
 | Tool | Wasted first | Unrouted | Review independence | Failed attempts | Metered USD | Go account USD | Go 5h share per pass | Go 5h share (sum) | Codex 5h share per pass | Codex 5h share (sum) | Codex tokens (sum) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| openswarm | 0.0% | 0.0% | 54.8% | 0 | 0.0000 | 31.0513 | 1.4378 | 10.0651 | 0.4763 | 3.3338 | 6667600 |
+| openswarm | 0.0% | 0.0% | 85.7% | 0 | 0.0000 | 31.0513 | 1.4378 | 10.0651 | 0.4763 | 3.3338 | 6667600 |
 | OmO | 23.4% | 19.8% | 71.4% | 254 | 1.5396 | 23.0340 | 1.0969 | 7.6780 | 0.8502 | 5.9512 | 11902500 |
 | Codex default | 28.6% | 28.6% | 0.0% | 160 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 1.7812 | 12.4685 | 24937000 |
 | strongest | 28.6% | 28.6% | 0.0% | 160 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 1.7812 | 12.4685 | 24937000 |
@@ -102,12 +102,12 @@ OpenCode Go 5h share:
 | Scenario | openswarm | OmO | Codex default | strongest | cheapest |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | fresh | 100.0% | 100.0% | 0.0% | 0.0% | 0.0% |
-| codex_soft_90 | 33.3% | 100.0% | 0.0% | 0.0% | 0.0% |
-| codex_hard_97 | 33.3% | 66.7% | 0.0% | 0.0% | 0.0% |
+| codex_soft_90 | 100.0% | 100.0% | 0.0% | 0.0% | 0.0% |
+| codex_hard_97 | 100.0% | 66.7% | 0.0% | 0.0% | 0.0% |
 | ocgo_hot | 100.0% | 100.0% | 0.0% | 0.0% | 0.0% |
 | deepseek_floor | 100.0% | 100.0% | 0.0% | 0.0% | 0.0% |
-| mixed_late_week | 16.7% | 33.3% | 0.0% | 0.0% | 0.0% |
-| tight_friday | 0.0% | 0.0% | 0.0% | 0.0% | 0.0% |
+| mixed_late_week | 0.0% | 33.3% | 0.0% | 0.0% | 0.0% |
+| tight_friday | 100.0% | 0.0% | 0.0% | 0.0% | 0.0% |
 
 ## Agreement with the difficulty→tier rubric
 
@@ -139,25 +139,25 @@ Overall agreement (exact / over / under), same caveat:
 
 Latency is the only non-deterministic section. Decision files do not include it.
 
-- openswarm in-process: n=1120 median=0.0075 ms p95=0.0215 ms
-- openswarm CLI cold start: n=25 median=73.9972 ms p95=86.8789 ms
+- openswarm in-process: n=1120 median=0.0119 ms p95=0.0306 ms
+- openswarm CLI cold start: n=25 median=395.921 ms p95=483.3239 ms
 - OmO in-process: n=1120 median=0.0292 ms p95=0.1027 ms
 - OmO: no standalone route CLI. model-core has no standalone route CLI. The figure is in-process time around resolveModelPipeline plus the exhaustion walk, after bun has loaded the module. It is not comparable to openswarm's process cold start.
 
 ## Environment
 
-- date: 2026-10-17T11:32:00Z
+- date: 2026-11-03T17:30:14Z
 - os: Linux-6.12.94+-x86_64-with-glibc2.41
 - kernel: 6.12.94+
 - cpu: Intel(R) Xeon(R) Processor
 - cores: 8
 - python: 3.13.5
 - bun: 1.4.2
-- openswarm_commit: 113d5514a0a78395699a39d597ab05bd7caf63c3
+- openswarm_commit: 6d5c3c555c2b2275924dacf9dd35c5e3c770b58a
 - omo_dir: `<omo-dir>`
 - omo_commit: 07776864a043acdda9f9976ac8f71659a25f1d86
 - commands:
   - `python3 bench/route_openswarm.py --out bench/results/openswarm.jsonl --latency-out bench/results/latency_openswarm.json --decisions 1000 --cli-runs 25`
-  - `bun bench/route_omo.ts --omo-dir <omo-dir> --out bench/results/omo.jsonl --latency-out bench/results/latency_omo.json --decisions 1000`
-  - `python3 bench/coverage.py --omo-dir <omo-dir> --out bench/results/coverage.json`
-  - `python3 bench/score.py --openswarm bench/results/openswarm.jsonl --out-dir bench/results --env bench/results/environment.json --latency-openswarm bench/results/latency_openswarm.json --latency-omo bench/results/latency_omo.json --coverage bench/results/coverage.json --omo bench/results/omo.jsonl`
+  - `OmO side not re-run: checked-in bench/results/omo.jsonl from the pinned run (omo_commit below) reused`
+  - `coverage not re-run: checked-in bench/results/coverage.json reused`
+  - `python3 bench/score.py --openswarm bench/results/openswarm.jsonl --omo bench/results/omo.jsonl --out-dir bench/results --env bench/results/environment.json --latency-openswarm bench/results/latency_openswarm.json --latency-omo bench/results/latency_omo.json --coverage bench/results/coverage.json`

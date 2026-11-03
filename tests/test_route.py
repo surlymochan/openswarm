@@ -122,6 +122,34 @@ class RoutingScenarios(unittest.TestCase):
         policy["routing"]["default_order"] = ["ocgo", "codex"]
         self.check(prof("mechanical", 1), scenario(), {"backend": "ocgo"}, policy)
 
+    def test_20_review_spreads_off_the_workhorse_family(self):
+        # Two balanced ocgo families: the newer one is the router's workhorse
+        # pick for implementation. A review must not land on that same family
+        # when the tier offers another one.
+        st = scenario(codex_week=0.90)  # codex soft limit: impl spills to ocgo
+        newer = copy.deepcopy(next(m for m in st["ocgo"]["models"] if m["tier"] == "balanced"))
+        newer.update({"id": "newer-coder", "name": "newer-coder", "family": "d",
+                      "release_date": "2026-10-01"})
+        st["ocgo"]["models"].append(newer)
+        impl = xs.route(prof(d=3), st, OPT_IN_POLICY)
+        self.assertEqual(impl["model"], "newer-coder")
+        review = xs.route(prof("review", 3), st, OPT_IN_POLICY)
+        self.assertEqual(review["backend"], "ocgo")
+        self.assertNotEqual(review["model"], "newer-coder")
+        fam = {m["id"]: m.get("family") for m in st["ocgo"]["models"]}
+        self.assertNotEqual(fam[review["model"]], fam[impl["model"]])
+        self.assertTrue(any("family spread" in r for r in review["reasons"]))
+
+    def test_21_impl_does_not_spread(self):
+        st = scenario(codex_week=0.90)
+        newer = copy.deepcopy(next(m for m in st["ocgo"]["models"] if m["tier"] == "balanced"))
+        newer.update({"id": "newer-coder", "name": "newer-coder", "family": "d",
+                      "release_date": "2026-10-01"})
+        st["ocgo"]["models"].append(newer)
+        impl = xs.route(prof(d=3), st, OPT_IN_POLICY)
+        self.assertEqual(impl["model"], "newer-coder")
+        self.assertFalse(any("family spread" in r for r in impl["reasons"]))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
