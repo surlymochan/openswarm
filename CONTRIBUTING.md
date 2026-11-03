@@ -1,13 +1,13 @@
-# Contributing to openswarm
+# Contributing to swrm
 
-Thanks for helping. openswarm is a single-file, standard-library-only Python CLI plus a Claude Code skill
+Thanks for helping. swrm is a single-file, standard-library-only Python CLI plus a Claude Code skill
 (`SKILL.md`). Please keep it that way: no third-party runtime dependencies.
 
 ## Dev setup
 
 ```bash
-git clone https://github.com/surlymochan/openswarm.git
-cd openswarm
+git clone https://github.com/surlymochan/swrm.git
+cd swrm
 python3 -m unittest discover -s tests -v     # Python 3.9+; no Codex/OpenCode/network needed
 ```
 

@@ -1,6 +1,6 @@
 ---
 name: Bug report
-about: Report a reproducible problem in openswarm
+about: Report a reproducible problem in swrm
 title: ""
 labels: bug
 assignees: ""
@@ -21,7 +21,7 @@ assignees: ""
 
 ## Environment
 
-- openswarm version / commit:
+- swrm version / commit:
 - OS:
 - Python version (`python3 --version`):
 - Backend(s) involved (codex / opencode / deepseek / cursor / pi / agy / none):

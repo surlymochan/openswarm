@@ -12,13 +12,13 @@ assignees: ""
 
 ## Proposal
 
-<!-- What should openswarm do instead? Include the exact command / flag / output shape if you have one in mind. -->
+<!-- What should swrm do instead? Include the exact command / flag / output shape if you have one in mind. -->
 
 ## Alternatives considered
 
 ## Constraints checklist
 
-- [ ] Keeps openswarm single-file, standard-library-only (no third-party runtime dependencies)
+- [ ] Keeps swrm single-file, standard-library-only (no third-party runtime dependencies)
 - [ ] Does not read another tool's credentials by default; any new local data source goes behind a `local_sources.*` switch in `policy.json` and is listed in the README table
 - [ ] Can be tested without a real backend, network, Keychain, or a real `~/.codex` / `~/.claude` (fixtures / temp dirs only)
 - [ ] Behaviour or flag changes are reflected in `SKILL.md`

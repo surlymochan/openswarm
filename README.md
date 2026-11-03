@@ -1,11 +1,18 @@
-# openswarm
+# swrm
 
-[![CI](https://github.com/surlymochan/openswarm/actions/workflows/ci.yml/badge.svg)](https://github.com/surlymochan/openswarm/actions/workflows/ci.yml)
+[![CI](https://github.com/surlymochan/swrm/actions/workflows/ci.yml/badge.svg)](https://github.com/surlymochan/swrm/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-informational)
 ![deps: none](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen)
 
 **Claude plans. Codex, OpenCode Go and DeepSeek write the code.**
+
+**swrm** is a distributed, heterogeneous agent task dispatcher: executors claim tasks
+under lease and return with evidence, routed by live quota across model families.
+
+> **Renamed in v0.3.1:** openswarm is now **swrm**. Old GitHub links redirect here.
+> The CLI command, the skill name and install path, and the `OPENSWARM_*` environment
+> variables keep the old name for now, so existing setups keep working.
 
 ## Benchmarks: openswarm vs oh-my-openagent (2026-10-17)
 
@@ -33,7 +40,7 @@ pytest because of a shared temp-dir race in grading; it is now fixed and regrade
 resolved 3/4 and superpowers 2/4; openswarm had no clean MiniMax run because the plan's usage cap was hit.
 
 Raw per-run records and logs: [`bench/swebench/results/`](bench/swebench/results/). Optimization backlog from these
-results: [#3](https://github.com/surlymochan/openswarm/issues/3).
+results: [#3](https://github.com/surlymochan/swrm/issues/3).
 
 **Synthetic end-to-end tasks.** 8 small real tasks (4 JS, 4 Python), hidden acceptance tests applied only after the agent exits.
 For these synthetic tasks, every arm runs `grok-4.7-high` through the local `cursor-agent` (openswarm uses its new `--backend cursor` executor).
@@ -85,7 +92,7 @@ If you pay for several AI subscriptions, the scarce one is usually the planner. 
 before a Codex or OpenCode Go plan does. Spending Claude tokens on typing out a refactor wastes the
 expensive model.
 
-openswarm splits the work:
+swrm splits the work:
 
 - **Claude** decomposes the task, writes acceptance criteria, reviews diffs and integrates.
 - **Executors** do the typing:
@@ -130,7 +137,7 @@ OpenCode Go plan, or a DeepSeek API key.
 
 ```bash
 # 1. Install as a Claude Code skill
-git clone https://github.com/surlymochan/openswarm.git ~/.claude/skills/openswarm
+git clone https://github.com/surlymochan/swrm.git ~/.claude/skills/openswarm
 alias openswarm=~/.claude/skills/openswarm/bin/openswarm
 
 # 2. See what you have: plans, quotas, models, recommended concurrency
@@ -210,7 +217,7 @@ Every subcommand, grouped by what it does. `openswarm <command> --help` lists al
 | `openswarm budget status` | Show today's executor budget usage. | `openswarm budget status --json` |
 | `openswarm ingest-claude` | Record Claude plan usage from the statusline hook or from flags. | `openswarm ingest-claude --five-hour 80 --seven-day 40` |
 | `openswarm fleet status` | Show reachability, paused hosts, lanes, and active runs. | `openswarm fleet status --json` |
-| `openswarm fleet exec` | Run an openswarm command on another host; stdout and the exit code are forwarded. | `openswarm fleet exec worker -- lane status` |
+| `openswarm fleet exec` | Run an swrm command on another host; stdout and the exit code are forwarded. | `openswarm fleet exec worker -- lane status` |
 | `openswarm fleet ledger pull` | Merge the host ledgers into one fleet ledger file. | `openswarm fleet ledger pull --hosts worker,sandbox` |
 | `openswarm run --rework-of` | Resume an earlier run's task as a rework, linked in the ledger as `rework_of`. | `openswarm run --rework-of <run-id> --cwd ~/code/myrepo --task-file /tmp/task.md` |
 
@@ -462,7 +469,7 @@ memory and CPU. The planner can run acceptance checks on its host. `lane systemd
 
 ## Fleet and batch dispatch
 
-Put named executor hosts in `$OPENSWARM_HOME/fleet.json`. Install the same openswarm version, Python 3.9+, git,
+Put named executor hosts in `$OPENSWARM_HOME/fleet.json`. Install the same swrm version, Python 3.9+, git,
 and an authenticated executor on each host. `repos` maps the same logical repo name to each host's checkout:
 
 ```json
@@ -497,7 +504,7 @@ openswarm batch --repo project --cards ./cards --hosts worker,sandbox --per-host
 openswarm batch status <batch-id>
 ```
 
-The batch wakes each selected instabox once, checks openswarm and the checkout, and makes `--base REV` available
+The batch wakes each selected instabox once, checks swrm and the checkout, and makes `--base REV` available
 on every host (default: the planner checkout's `HEAD`). Sorted cards are assigned round-robin; `--per-host`
 defaults to 1, with remaining cards queued until slots free. Backend, model and effort flags are optional and pass
 through to each `run --detach`. One line is printed per state change; detached output goes to
@@ -637,7 +644,7 @@ Override any key in `$OPENSWARM_HOME/policy.local.json`. It is deep-merged over 
 
 `workspace.prepare` keys may be an absolute repository path or its basename. This is particularly useful for Bun
 workspaces: linked `node_modules` can otherwise resolve workspace packages back to the base checkout. Without a policy,
-openswarm only emits `workspace_note` when it detects `package.json` workspaces plus `bun.lock`; it preserves existing
+swrm only emits `workspace_note` when it detects `package.json` workspaces plus `bun.lock`; it preserves existing
 link behavior.
 
 | Environment variable | Purpose |
@@ -650,9 +657,9 @@ link behavior.
 | `OPENSWARM_STATE_FILE` | Offline mode: route against a saved or synthetic state; nothing is probed |
 | `XSWARM_*` | Legacy names from before the rename (formerly *xswarm*); still honoured, `OPENSWARM_*` wins |
 
-### What openswarm reads on your machine
+### What swrm reads on your machine
 
-openswarm reads other tools' local files only to measure quota. It never uploads them. The `status` output
+swrm reads other tools' local files only to measure quota. It never uploads them. The `status` output
 starts with a `Sources` line showing what is enabled.
 
 | Source | Default | What is read | Switch |
@@ -670,7 +677,7 @@ Prompts and diffs go to the executor's model provider. Each backend's data bound
 ## Safety model
 
 - Codex runs with `-s workspace-write`. OpenCode gets edit and bash permission scoped to the worktree with `external_directory: deny`.
-- Executors never commit; openswarm commits on `openswarm/<id>`. Nothing is pushed or merged automatically.
+- Executors never commit; swrm commits on `openswarm/<id>`. Nothing is pushed or merged automatically.
 - If a worktree can't be created, the run fails. It never falls back to editing your checkout in place.
 - Codex `ultra` effort is never used, because it self-delegates and blows budgets.
 
