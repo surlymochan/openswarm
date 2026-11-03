@@ -1974,8 +1974,14 @@ def probe_ocgo(policy):
         m["tier"] = "fast" if i < n / 3 else ("balanced" if i < 2 * n / 3 else "deep")
     for m in models:
         m.setdefault("tier", None)
+    # Discovery is live (opencode's own catalogue), but the monthly-limit
+    # table in policy.json is hand-maintained. A discovered model missing
+    # from it silently prices at the _default limit; surface those ids so
+    # the gap is visible in `status` instead of absorbed.
+    unknown = sorted(m["id"] for m in models if not m["excluded"] and m["id"] not in limits)
     return {"binary": opencode_bin(), "plan": plan, "plan_inferred": cfg["plan"] == "auto",
             "limits_source": cfg["monthly_limits_source"], "models": models,
+            "unknown_models": unknown,
             "spend_note": "only opencode-run usage is visible locally; traffic outside `opencode run` is not counted"}
 
 
@@ -2911,6 +2917,21 @@ def ocgo_pick(prof, st, policy, tier, notes):
         if cands:
             # newest release first, then most headroom
             cands.sort(key=lambda x: (-(int((x[1].get("release_date") or "0").replace("-", "") or 0)), x[0]))
+            if prof.get("type") in ((policy.get("routing") or {}).get("review_types") or []):
+                # Independent review: leaving the GPT family is not enough when
+                # implementation work itself spilled onto OpenCode Go — the
+                # review would land on the same workhorse family that wrote
+                # the code. When this tier offers another family, take the
+                # best of those instead of the router's first-choice family.
+                families = {x[1].get("family") for x in cands}
+                if len(families) > 1:
+                    workhorse = cands[0][1]
+                    alt = [x for x in cands if x[1].get("family") != workhorse.get("family")]
+                    if alt:
+                        notes.append(f"review: family spread — {alt[0][1]['id']} "
+                                     f"({alt[0][1].get('family')}) over workhorse family "
+                                     f"{workhorse.get('family')} for an independent second opinion")
+                        cands = alt
             if t != tier:
                 notes.append(f"ocgo tier {tier} unavailable, using {t}")
             if hot:
@@ -10115,6 +10136,31 @@ def pct(w):
     return s
 
 
+def policy_staleness(policy, today=None):
+    """Age check for the hand-maintained price/quota tables in policy.json.
+
+    The tables (ocgo monthly limits, deepseek tiers, codex tier keywords) go
+    stale silently: providers rename models and move prices, and the router
+    keeps trusting the old numbers. policy.json carries the retrieval date in
+    _meta.tables_last_updated; returns None when it is absent, otherwise a
+    dict with age_days and stale (age over _meta.stale_after_days, default
+    30, or an unparseable date).
+    """
+    meta = policy.get("_meta") or {}
+    raw = meta.get("tables_last_updated")
+    if not raw:
+        return None
+    try:
+        updated = dt.date.fromisoformat(str(raw)[:10])
+    except ValueError:
+        return {"last_updated": str(raw), "age_days": None,
+                "stale_after_days": meta.get("stale_after_days", 30), "stale": True}
+    age = ((today or dt.date.today()) - updated).days
+    limit = meta.get("stale_after_days", 30)
+    return {"last_updated": updated.isoformat(), "age_days": age,
+            "stale_after_days": limit, "stale": age > limit}
+
+
 def cmd_status(policy, refresh):
     st = get_state(policy, refresh)
     c, cx, oc, ds = st["claude"], st["codex"], st["ocgo"], st["deepseek"]
@@ -10122,6 +10168,14 @@ def cmd_status(policy, refresh):
     ls = policy.get("local_sources") or {}
     print("Sources  " + "  ".join(f"{k}={'on' if v else 'off'}" for k, v in ls.items() if not k.startswith("_"))
           + ("  (offline: OPENSWARM_STATE_FILE)" if envvar("STATE_FILE") else "") + "\n")
+    stale = policy_staleness(policy)
+    if stale and stale["stale"]:
+        print(f"Policy   ⚠ price/quota tables last updated {stale['last_updated']}"
+              f" ({stale['age_days'] if stale['age_days'] is not None else '?'}d ago, limit {stale['stale_after_days']}d): "
+              "providers move prices and rename models — refresh ocgo.monthly_limits and the deepseek tiers "
+              "from the provider docs, then bump _meta.tables_last_updated in policy.json")
+    elif stale:
+        print(f"Policy   tables updated {stale['last_updated']} ({stale['age_days']}d ago)")
     print(f"Claude   plan={c['plan']}{' ($' + str((policy.get('claude') or {}).get('plan_usd')) + ')' if (policy.get('claude') or {}).get('plan_usd') else ''} provider={c['provider']} source={c['source'] or '-'} age={'-' if c['age_minutes'] is None else str(c['age_minutes']) + 'm'}"
           f"{' STALE' if c['stale'] else ''}")
     print(f"         5h {pct(c['five_hour'])}   7d {pct(c['seven_day'])}")
@@ -10139,6 +10193,9 @@ def cmd_status(policy, refresh):
     for m in cx["models"]:
         print(f"         {m['tier']:<8} {m['id']:<16} {'legacy ' if m['legacy'] else ''}efforts={','.join(m['efforts'])}")
     print(f"OCGo     plan={oc['plan']}{' (inferred)' if oc['plan_inferred'] else ''}")
+    if oc.get("unknown_models"):
+        print(f"         ⚠ discovered model(s) missing from policy ocgo.monthly_limits "
+              f"(priced at the _default limit): {', '.join(oc['unknown_models'])}")
     for m in sorted([m for m in oc["models"] if not m["excluded"]], key=lambda m: ("fast balanced deep".split().index(m["tier"]), m["id"])):
         u = max(m["usage"].values())
         print(f"         {m['tier']:<8} {m['id']:<22} ${m['cost_out']}/M out  limit ${m['monthly_limit_usd']}/mo  used {u:.0%}"

@@ -1,5 +1,10 @@
 {
   "_doc": "openswarm default policy. Override any key in ~/.claude/openswarm/policy.local.json (deep-merged). Fractions are 0..1.",
+  "_meta": {
+    "_doc": "tables_last_updated is when the hand-maintained price/quota tables below (ocgo.monthly_limits from ocgo.monthly_limits_source, deepseek tiers, codex tier keywords) were last retrieved from the provider docs. `openswarm status` warns once the tables are older than stale_after_days; bump the date whenever the tables are refreshed.",
+    "tables_last_updated": "2026-10-06",
+    "stale_after_days": 30
+  },
   "local_sources": {
     "_doc": "What openswarm may read from other tools on this machine. Usage metadata only; see README 'What openswarm reads'. Auth-file reads are opt-in.",
     "codex_sessions": true,
