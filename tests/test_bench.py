@@ -41,6 +41,40 @@ class BenchOpenswarm(unittest.TestCase):
             os.environ.clear()
             os.environ.update(old)
 
+    def test_mixed_late_week_reviews_degrade_with_model_level_separation(self):
+        # mixed_late_week leaves one usable family for the reference
+        # implementer: family-level independence stays honestly at 0, but
+        # single-family reviews must degrade to a different model (marked
+        # `degraded: single-family`) instead of silently re-using the
+        # implementer's own model. The four reviews whose implementer proxy
+        # is Codex (d4/d5) keep the reference model; they are cross-family
+        # against their own implementer, an artifact of the one-reference
+        # scoring rule, so model-level lands at 8/12, not 12/12.
+        import score  # bench/score.py
+        old = os.environ.copy()
+        try:
+            home = tempfile.mkdtemp(prefix="openswarm-bench-test-")
+            xs = harness.load_openswarm(home)
+            policy = xs.jload(os.path.join(harness.ROOT, "policy.json"), {})
+            policy["routing"]["default_order"] = ["codex", "ocgo", "deepseek"]
+            policy["codex"]["require_default_model"] = False
+            catalogue = harness.load_json(os.path.join(BENCH, "catalogue.json"))
+            scenarios = harness.load_json(os.path.join(BENCH, "scenarios.json"))
+            trace = harness.load_jsonl(os.path.join(BENCH, "trace.jsonl"))
+            prices = harness.load_json(os.path.join(BENCH, "prices.json"))
+            rows, _ = harness.route_all(xs, policy, catalogue, scenarios, trace)
+            block = score.accumulate("openswarm", rows, trace, scenarios, catalogue, prices)
+            mlw = block["scenarios"]["mixed_late_week"]
+            self.assertEqual(mlw["review_independent_rate"], 0.0)
+            self.assertEqual(mlw["review_model_independent_rate"], round(8 / 12, 4))
+            self.assertEqual(mlw["review_degraded"], mlw["review_n"])
+            self.assertEqual(mlw["review_degraded_model_independent"], 8)
+            self.assertEqual(mlw["review_degraded_flagged"], 6)
+            self.assertEqual(block["overall"]["review_independent_rate"], 0.8571)
+        finally:
+            os.environ.clear()
+            os.environ.update(old)
+
     def test_decisions_are_deterministic(self):
         old = os.environ.copy()
         try:
