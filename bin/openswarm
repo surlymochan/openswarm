@@ -3949,6 +3949,14 @@ def configure_executor_environment(worktree, env=None):
         pass
 
     executor_env = dict(os.environ if env is None else env)
+    if os.name == "nt":
+        # A caller-supplied environment replaces os.environ wholesale; Windows
+        # children still need the OS location variables (without SystemRoot,
+        # CPython <= 3.9 cannot even seed its hash randomisation and dies with
+        # "_Py_HashRandomization_Init: failed to get random numbers").
+        for name in ("SystemRoot", "windir", "COMSPEC", "USERPROFILE", "PATHEXT"):
+            if name not in executor_env and name in os.environ:
+                executor_env[name] = os.environ[name]
     for name in ("TMPDIR", "TMP", "TEMP"):
         executor_env[name] = tmpdir
     return tmpdir, executor_env
