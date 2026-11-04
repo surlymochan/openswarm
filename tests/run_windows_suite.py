@@ -17,4 +17,8 @@ signal.signal(signal.SIGINT, signal.SIG_IGN)
 if __name__ == "__main__":
     program = unittest.main(module=None, argv=[sys.argv[0], "discover", "-s", "tests", "-v"],
                             exit=False)
-    sys.exit(0 if program.result.wasSuccessful() else 1)
+    result = program.result
+    print(f"suite-result: failures={len(result.failures)} errors={len(result.errors)} "
+          f"skipped={len(result.skipped)} successful={result.wasSuccessful()}",
+          file=sys.stderr, flush=True)
+    sys.exit(0 if result.wasSuccessful() else 1)
