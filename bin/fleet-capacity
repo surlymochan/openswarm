@@ -7,6 +7,21 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+
+
+def _spawnable(command):
+    # Windows cannot exec an extensionless python-shebang script directly; rerun it
+    # through the interpreter. POSIX behaviour is unchanged.
+    if os.name == "nt" and command and isinstance(command[0], str) and os.path.isfile(command[0]):
+        try:
+            with open(command[0], "rb") as stream:
+                first = stream.readline().decode(errors="replace")
+        except OSError:
+            first = ""
+        if first.startswith("#!") and "python" in first:
+            return [sys.executable, *command]
+    return command
+import sys
 import time
 
 ALLOWED = {'codex', 'pi', 'cursor', 'agy', 'copilot'}
@@ -54,7 +69,7 @@ try:
                 command += ['--verify', verify]
             if request.get('read_only') is True:
                 command.append('--read-only')
-        process = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        process = subprocess.run(_spawnable(command), capture_output=True, text=True, timeout=30)
         try:
             result = json.loads(process.stdout)
         except ValueError:

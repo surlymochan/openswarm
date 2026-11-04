@@ -52,6 +52,7 @@ class WorkspaceTest(unittest.TestCase):
                                capture_output=True, text=True).stdout.split()
         self.assertEqual(files, ["pkg/b.txt"])
 
+    @unittest.skipIf(os.name == "nt", 'worktree dependency linking relies on POSIX symlinks and shell prepare steps; Windows git/symlink semantics differ')
     def test_openbot_prepare_does_not_commit_nested_dependency_symlinks(self):
         write(os.path.join(self.repo, "apps", "auth-api", "index.js"), "export {}\n")
         sh("git", "add", "apps/auth-api/index.js", cwd=self.repo)
@@ -69,6 +70,7 @@ class WorkspaceTest(unittest.TestCase):
         files = subprocess.check_output(["git", "diff", "--cached", "--name-only"], cwd=wt, text=True).splitlines()
         self.assertEqual(files, ["real.py"])
 
+    @unittest.skipIf(os.name == "nt", 'worktree dependency linking relies on POSIX symlinks and shell prepare steps; Windows git/symlink semantics differ')
     def test_executor_directories_and_logs_are_never_committed(self):
         ws = xs.prepare_workspace(self.repo, "artifacts", True)
         excluded = [".pi/session.jsonl", ".codex/session.jsonl", "pkg/.cursor/log.jsonl", "codex-run.log"]
@@ -99,6 +101,7 @@ class WorkspaceTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(ws["root"], "node_modules", "leftpad", "index.js")))
         xs.cleanup_worktree(ws, None)
 
+    @unittest.skipIf(os.name == "nt", 'worktree dependency linking relies on POSIX symlinks and shell prepare steps; Windows git/symlink semantics differ')
     def test_concurrent_repo_prepares_are_serialized(self):
         home = os.path.join(self.tmp, "home")
         active = os.path.join(self.tmp, "prepare-active")
@@ -130,6 +133,7 @@ class WorkspaceTest(unittest.TestCase):
         self.assertTrue(all(result["rc"] == 0 for result in results), results)
         self.assertTrue(all(result["attempts"] == [0] for result in results), results)
 
+    @unittest.skipIf(os.name == "nt", 'worktree dependency linking relies on POSIX symlinks and shell prepare steps; Windows git/symlink semantics differ')
     def test_workspace_prepare_retries_once_after_failure(self):
         home = os.path.join(self.tmp, "retry-home")
         marker = os.path.join(self.tmp, "prepare-first-attempt")
@@ -186,6 +190,7 @@ class WorkspaceTest(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(ws["root"], "pkg", "sdk-link", "index.js")))
         xs.finalize_workspace(ws, "t", "codex", self.rdir, keep=False)
 
+    @unittest.skipIf(os.name == "nt", 'worktree dependency linking relies on POSIX symlinks and shell prepare steps; Windows git/symlink semantics differ')
     def test_verify_sees_committed_clean_tree(self):
         # Release builders refuse dirty sources; verify must run after the executor's edit is committed.
         ws = xs.prepare_workspace(self.repo, "r3", True)
@@ -222,6 +227,7 @@ class WorkspaceTest(unittest.TestCase):
         self.assertNotIn("error: argument", out.stderr)
         self.assertEqual(out.stdout.count("DONE: "), 2, out.stdout + out.stderr)
 
+    @unittest.skipIf(os.name == "nt", 'worktree dependency linking relies on POSIX symlinks and shell prepare steps; Windows git/symlink semantics differ')
     def test_partially_tracked_node_modules_gets_missing_packages(self):
         nm = os.path.join(self.repo, "node_modules")
         os.makedirs(os.path.join(nm, "@x", "tracked"))
