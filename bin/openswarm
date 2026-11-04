@@ -3536,7 +3536,7 @@ def fleet_guard_command():
 
 def fleet_guard_call(command, payload):
     try:
-        result = subprocess.run(command, input=json.dumps(payload), text=True, capture_output=True, timeout=15)
+        result = subprocess.run(_spawnable(command), input=json.dumps(payload), text=True, capture_output=True, timeout=15)
         answer = json.loads(result.stdout)
         if result.returncode != 0 or not answer.get("ok"):
             raise ValueError(answer.get("error") or "coordinator rejected request")
@@ -4786,8 +4786,11 @@ def link_dependency_dirs(base, wt):
 
 
 def rewrite_verify_paths(cmd, repo, root):
+    # Tolerate both separators in the command string: on Windows a verify
+    # command may legitimately spell paths with '/' while os.sep is '\\'.
     for base in {os.path.realpath(repo), repo}:
-        cmd = cmd.replace(base.rstrip(os.sep) + os.sep, root.rstrip(os.sep) + os.sep)
+        for sep in {os.sep, "/"}:
+            cmd = cmd.replace(base.rstrip("/\\") + sep, root.rstrip("/\\") + sep)
     return cmd
 
 
@@ -6856,7 +6859,7 @@ class LaneChild:
             os.makedirs(child_env["HERMES_HOME"], exist_ok=True)
             if lane.get("model"):
                 child_env["HERMES_MODEL"] = lane["model"]
-        self.proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        self.proc = subprocess.Popen(_spawnable(cmd), cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.DEVNULL, text=True, bufsize=1, start_new_session=True,
                                      env=child_env)
         self.reader = threading.Thread(target=self._read, daemon=True)
@@ -6984,7 +6987,7 @@ class AgyChild:
         cfg = load_policy().get("agy") or {}
         cmd = agy_command(binary, model or self.lane["model"], prompt, effort or self.lane.get("effort"),
                           conversation, cfg)
-        proc = subprocess.Popen(cmd, cwd=self.cwd, env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        proc = subprocess.Popen(_spawnable(cmd), cwd=self.cwd, env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, bufsize=1, start_new_session=True)
         events, stderr_lines = queue.Queue(), []
         self.proc, self.events, self.stderr_lines = proc, events, stderr_lines
@@ -7062,7 +7065,7 @@ class CursorHeadlessChild(AgyChild):
         if conversation:
             cmd.append("--continue")
         cmd += ["--", prompt]
-        proc = subprocess.Popen(cmd, cwd=self.cwd, env=self.env, stdin=subprocess.DEVNULL,
+        proc = subprocess.Popen(_spawnable(cmd), cwd=self.cwd, env=self.env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
                                 start_new_session=True)
         events, stderr_lines = queue.Queue(), []

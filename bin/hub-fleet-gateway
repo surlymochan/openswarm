@@ -12,8 +12,25 @@ home = Path.home()
 cli = str(home / '.local/bin/openswarm')
 ssh = ['/usr/bin/ssh', '-T', '-F', str(home / '.ssh/openswarm-fleet/config'), 'openswarm-pi-broker']
 
+def _spawnable(command):
+    """Windows cannot CreateProcess a script directly (WinError 193): when the
+    target is a file with a python shebang, re-invoke it with this interpreter."""
+    if os.name != "nt" or not command:
+        return command
+    head = str(command[0])
+    if head.lower().endswith((".exe", ".com", ".bat", ".cmd")):
+        return command
+    try:
+        with open(head, "rb") as fh:
+            first = fh.readline(256).decode("utf-8", "replace")
+    except OSError:
+        return command
+    if first.startswith("#!") and "python" in first:
+        return [sys.executable, *command]
+    return command
+
 def result(cmd, payload=None, timeout=45):
-    p = subprocess.run(cmd, input=json.dumps(payload) if payload is not None else None,
+    p = subprocess.run(_spawnable(cmd), input=json.dumps(payload) if payload is not None else None,
                        text=True, capture_output=True, timeout=timeout)
     try: data = json.loads(p.stdout)
     except ValueError: raise ValueError('fleet command returned invalid JSON')

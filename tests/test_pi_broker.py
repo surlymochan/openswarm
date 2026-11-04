@@ -25,6 +25,8 @@ class UnixHTTP(http.client.HTTPConnection):
 
 
 @unittest.skipUnless(shutil.which('node'), 'requires node')
+@unittest.skipIf(os.name == "nt",
+                 "pi broker binds a '/'-rooted unix-domain socket by design; no Windows transport")
 class PiBrokerTests(unittest.TestCase):
     def test_beta_request_preserves_upstream_opt_in(self):
         with tempfile.TemporaryDirectory() as root:

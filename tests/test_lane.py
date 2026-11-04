@@ -2,6 +2,7 @@ import json
 import os
 import pathlib
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,8 @@ CLI = ROOT / "bin" / "openswarm"
 FIXTURES = ROOT / "tests" / "fixtures"
 
 
+@unittest.skipUnless(hasattr(socket, "AF_UNIX"),
+                     "lane control plane is AF_UNIX-based; Windows named-pipe transport is not implemented")
 class LaneTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="oslane-", dir=tempfile.gettempdir())
