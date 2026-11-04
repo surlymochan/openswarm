@@ -1,24 +1,26 @@
 # Head-to-head routing benchmark
 
-openswarm and [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent) (OmO) v5.1.35 answer the same question: given a delegated coding task and a fixed set of subscriptions, which model runs it?
+_Naming note: this benchmark was first run before the rename, when the tool was called openswarm. Product names in this document have been unified to the current name (swrm); versions and all figures are as originally recorded._
 
-This benchmark compares that routing slice only. OmO is a multi-agent harness; most of what it does is outside this comparison. The benchmark was written by the openswarm maintainer, so the task mix and the tier labels can favor the tool that defined them. The trace, the catalogue, both decision files, and the score tables are published under `bench/` so the result can be recomputed.
+swrm and [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent) (OmO) v5.1.35 answer the same question: given a delegated coding task and a fixed set of subscriptions, which model runs it?
 
-The catalogue now includes the configured `gpt-6-luna` default for offline routing. Its benchmark parameters are illustrative. The openswarm decision file and scores were regenerated on 2026-11-04 (family-spread review routing, below); the OmO decision file and the coverage counts are still the checked-in pinned ones — regenerate both sides before making a new comparison. The shipped `policy.json` defaults automatic routing to Codex only, so the openswarm harness enables the three connected backends explicitly (`routing.default_order = [codex, ocgo, deepseek]`, the same opt-in `tests/test_route.py` uses) and disables the fleet's forced single Codex model (`codex.require_default_model`), which would otherwise mask the tier routing this bench compares.
+This benchmark compares that routing slice only. OmO is a multi-agent harness; most of what it does is outside this comparison. The benchmark was written by the swrm maintainer, so the task mix and the tier labels can favor the tool that defined them. The trace, the catalogue, both decision files, and the score tables are published under `bench/` so the result can be recomputed.
+
+The catalogue now includes the configured `gpt-6-luna` default for offline routing. Its benchmark parameters are illustrative. The swrm decision file and scores were regenerated on 2026-11-04 (family-spread review routing, below); the OmO decision file and the coverage counts are still the checked-in pinned ones — regenerate both sides before making a new comparison. The shipped `policy.json` defaults automatic routing to Codex only, so the swrm harness enables the three connected backends explicitly (`routing.default_order = [codex, ocgo, deepseek]`, the same opt-in `tests/test_route.py` uses) and disables the fleet's forced single Codex model (`codex.require_default_model`), which would otherwise mask the tier routing this bench compares.
 
 ## Fairness rules
 
 - Both tools see the same tasks, the same token estimates, and the same quota scenario.
-- The model ids are the intersection of the two pinned trees. Codex slugs are the exception: openswarm does not pin them (it classifies live `codex debug models` text). The slugs here are the ones OmO's `packages/model-core` category chains and `supplemental-entries.ts` name, with descriptions that `policy.json` `tier_keywords` classify. See `catalogue.json`.
-- Connected providers are the three backends openswarm can target: `chatgpt-subscription` (the Codex plan), `opencode-go`, and `deepseek`. The OpenAI API provider, Anthropic, Google, Copilot, OpenCode Zen, xAI, Z.ai, Xiaomi, and Moonshot are not connected. A chain rung that names only those providers is unreachable.
-- openswarm's `exclude_patterns` still apply on the openswarm side. OmO does not read that list.
+- The model ids are the intersection of the two pinned trees. Codex slugs are the exception: swrm does not pin them (it classifies live `codex debug models` text). The slugs here are the ones OmO's `packages/model-core` category chains and `supplemental-entries.ts` name, with descriptions that `policy.json` `tier_keywords` classify. See `catalogue.json`.
+- Connected providers are the three backends swrm can target: `chatgpt-subscription` (the Codex plan), `opencode-go`, and `deepseek`. The OpenAI API provider, Anthropic, Google, Copilot, OpenCode Zen, xAI, Z.ai, Xiaomi, and Moonshot are not connected. A chain rung that names only those providers is unreachable.
+- swrm's `exclude_patterns` still apply on the swrm side. OmO does not read that list.
 - No network calls, no paid API, no `codex` or `opencode` process. Routing is in-process.
 - Task labels were fixed in `rubric.py` and this file before `bench/run.sh`. They are not adjusted after a score.
 - Dollar amounts and window shares are `prices.json` × estimated tokens. They are not invoices. The file says so on every cost figure.
 
 ## What each router actually does
 
-openswarm `route()` (`bin/openswarm`) picks a backend order from the task type, then a model inside that backend:
+swrm `route()` (`bin/openswarm`) picks a backend order from the task type, then a model inside that backend:
 
 - `review`, `second-opinion`, and `audit` try OpenCode Go, then Codex, then DeepSeek. Inside an OpenCode Go tier, a review pick spreads off the router's workhorse family (the family the newest-first pick would take) when the tier offers another family, so the review does not repeat the family implementation work itself uses after a spill.
 - `mechanical`, `docs`, `test`, `format`, `rename`, and `migration` at difficulty ≤ 2 try OpenCode Go first.
@@ -37,13 +39,13 @@ OmO does not read a quota window. Exhaustion is simulated the way the runtime le
 3. The error is passed to `classifyRuntimeFallbackError` and `shouldRetryError`. The simulated errors are `{message: "usage limit exceeded", statusCode: 429}` and `{message: "insufficient balance"}`. Both classify as `quota_exceeded` and are retryable.
 4. `getNextFallback` walks the chain from the start. Unreachable rungs and a no-op repeat of the model that just failed are skipped with no attempt, matching the background-agent retry loop. The next reachable exhausted rung is another failed attempt. The first reachable model that is not exhausted is the one that runs.
 
-A Codex window ≥ 95% exhausts every `chatgpt-subscription` model. An OpenCode Go model is exhausted only when its max window usage is ≥ 1.0 (the budget is gone). Usage of 0.90 is above openswarm's 85% skip and is not an OmO error. DeepSeek is exhausted below ¥10.
+A Codex window ≥ 95% exhausts every `chatgpt-subscription` model. An OpenCode Go model is exhausted only when its max window usage is ≥ 1.0 (the budget is gone). Usage of 0.90 is above swrm's 85% skip and is not an OmO error. DeepSeek is exhausted below ¥10.
 
 model-core has no standalone route command. OmO latency is in-process, after bun has loaded the module. It is not comparable to `openswarm route` cold start.
 
 ## Rubric
 
-`min_tier` is the minimum adequate capability, taken from openswarm's difficulty map, with one exception. Agreement with that map is reported later as "Agreement with the difficulty→tier rubric". It is not a quality score. openswarm agrees with the map by construction whenever quota still allows the tier it would have picked on a fresh window, so the row shows how each router deviates under quota pressure.
+`min_tier` is the minimum adequate capability, taken from swrm's difficulty map, with one exception. Agreement with that map is reported later as "Agreement with the difficulty→tier rubric". It is not a quality score. swrm agrees with the map by construction whenever quota still allows the tier it would have picked on a fresh window, so the row shows how each router deviates under quota pressure.
 
 | Difficulty or type | Minimum tier |
 | --- | --- |
@@ -56,7 +58,7 @@ model-core has no standalone route command. OmO latency is in-process, after bun
 
 OmO has no type field. The category mapping is a judgment:
 
-| openswarm shape | OmO category | Why |
+| swrm shape | OmO category | Why |
 | --- | --- | --- |
 | `docs` | `writing` | Prose lane. Its chain names Google and Anthropic only. |
 | `review` | `unspecified-high` | No review category. This is the broad multi-surface lane. |
@@ -67,11 +69,11 @@ OmO has no type field. The category mapping is a judgment:
 | difficulty 5 `debug` | `deep-high` | Treated as a cause that one read may not settle. |
 | other difficulty 5 | `deep-low` | OmO's default deep lane. |
 
-`research` is a large-context read. openswarm has no special case for that type, so it uses the default Codex-first order unless context exceeds 220k tokens. The category still follows the difficulty row above.
+`research` is a large-context read. swrm has no special case for that type, so it uses the default Codex-first order unless context exceeds 220k tokens. The category still follows the difficulty row above.
 
 Token estimates are a formula, not a measurement. fast is 8k/0.8k input/output, balanced 22k/3k, deep 64k/9k. A context of at least 220k replaces the input with that context and sets output to 1.5k. Review and audit inputs are at least 36k and outputs at least 4k. Context for an ordinary task is 8k, 24k, or 48k by tier. The large-read tasks set 280k or 640k explicitly.
 
-The reference implementer, for the independence metric, is the model chosen for the first `impl` at difficulty 3 whose context is under 220k (`t06`), in that same scenario. A review counts as family-independent when its model family differs from that implementer's family, and as model-independent when its model differs from the implementer's model, even inside the same family. A review that stays in the reference family is a degraded (single-family) review; openswarm flags the ones it knowingly degrades with `degraded: single-family` on the decision. An unrouted review counts as neither.
+The reference implementer, for the independence metric, is the model chosen for the first `impl` at difficulty 3 whose context is under 220k (`t06`), in that same scenario. A review counts as family-independent when its model family differs from that implementer's family, and as model-independent when its model differs from the implementer's model, even inside the same family. A review that stays in the reference family is a degraded (single-family) review; swrm flags the ones it knowingly degrades with `degraded: single-family` on the decision. An unrouted review counts as neither.
 
 An unrouted decision counts as under-provisioned. The unrouted rate is also reported alone.
 
@@ -87,13 +89,13 @@ Tiers for Codex models come from `classify_codex` on the description. Tiers for 
 | `gpt-6-luna-fast` | Codex subscription | fast | OmO quick primary. |
 | `gpt-6.1-sol-fast` | Codex subscription | fast | deep-low rung. |
 | `gpt-5.6-sol-fast` | Codex subscription | fast, legacy | deep-low rung. |
-| `glm-5.3-flash` | OpenCode Go, cap $60 | fast | Openswarm can select it. OmO's quick rung names `zai-coding-plan` only, which is not connected. |
+| `glm-5.3-flash` | OpenCode Go, cap $60 | fast | swrm can select it. OmO's quick rung names `zai-coding-plan` only, which is not connected. |
 | `mimo-v2.6-flash` | OpenCode Go, cap $60 | fast | OmO's quick rung names `xiaomi` only. |
 | `grok-4.7` | OpenCode Go, cap $15 | balanced | Context 500,000 from model-core. |
 | `mimo-v2.6-pro` | OpenCode Go, cap $15 | balanced | unspecified-low rung. Context 1,000,000 (Go default; no supplemental entry). |
 | `glm-5.3` | OpenCode Go, cap $15 | deep | unspecified-high rung. |
 | `kimi-k3` | OpenCode Go, cap $15 | deep | Context 262,144 from model-core. |
-| `minimax-m3` | OpenCode Go, cap $15 | balanced (judgment) | Excluded by openswarm (`minimax`). OmO quick can still select it. |
+| `minimax-m3` | OpenCode Go, cap $15 | balanced (judgment) | Excluded by swrm (`minimax`). OmO quick can still select it. |
 | `minimax-m2.7` | OpenCode Go, cap $60 | fast (judgment) | Same exclusion. |
 | `deepseek-flash` | DeepSeek, metered | fast | policy fast tier and OmO quick rung. |
 | `deepseek-v4-pro` | DeepSeek, metered | deep | policy uses this id for both balanced and deep. A balanced task that lands here counts as over-provisioned. |
@@ -104,11 +106,11 @@ DeepSeek prices are the off-peak cache-miss list from <https://api-docs.deepseek
 
 Codex has no per-token price. Its 5-hour share is `(input + output tokens) / 2,000,000`. The denominator is a bench convention, not an OpenAI quota. Compare tools only on that same denominator.
 
-Codex context figures are the model-core supplemental limits. A 640k read needs `context > 640000 × 1.15`, so `grok-4.7` (500k) and `kimi-k3` (262k) do not fit that task. openswarm still prefers a 1M-class backend once context exceeds 220k, even when a Codex model has a larger window. That threshold is `policy.json`.
+Codex context figures are the model-core supplemental limits. A 640k read needs `context > 640000 × 1.15`, so `grok-4.7` (500k) and `kimi-k3` (262k) do not fit that task. swrm still prefers a 1M-class backend once context exceeds 220k, even when a Codex model has a larger window. That threshold is `policy.json`.
 
 ## Scenarios
 
-Pace and the "quota resets soon, raise effort" rule are not exercised. Windows have no `pace` and no `hours_to_reset`, so those openswarm adjustments do not move the score.
+Pace and the "quota resets soon, raise effort" rule are not exercised. Windows have no `pace` and no `hours_to_reset`, so those swrm adjustments do not move the score.
 
 | Id | Codex 5h / 7d | OpenCode Go | DeepSeek |
 | --- | --- | --- | --- |
@@ -134,7 +136,7 @@ bench/run.sh --omo-dir /path/to/oh-my-openagent
 
 The OmO checkout used for the published run is tag `v5.1.35`, commit `07776864a043acdda9f9976ac8f71659a25f1d86`. Results record that checkout as `<omo-dir>` plus the commit. bun on this host was 1.4.2.
 
-If `--omo-dir` is missing, or bun is missing, the script scores openswarm and the three baselines and writes `bench/results/omo_skipped.txt`.
+If `--omo-dir` is missing, or bun is missing, the script scores swrm and the three baselines and writes `bench/results/omo_skipped.txt`.
 
 Outputs in `bench/results/`:
 
@@ -148,7 +150,7 @@ Outputs in `bench/results/`:
 | `latency_openswarm.json`, `latency_omo.json` | Median and p95 |
 | `environment.json` | CPU, core count, OS, kernel, Python, bun, both commits, date, commands |
 
-A decision carries `task_id`, `scenario`, `tool`, `backend`, `provider`, `model`, `effort`, `variant`, `tier`, `attempts`, `failed_attempts`, and `reasons`. `attempts` includes failed attempts on an exhausted quota. An openswarm review that stays in the implementer's family also carries `degraded: "single-family"`.
+A decision carries `task_id`, `scenario`, `tool`, `backend`, `provider`, `model`, `effort`, `variant`, `tier`, `attempts`, `failed_attempts`, and `reasons`. `attempts` includes failed attempts on an exhausted quota. A swrm review that stays in the implementer's family also carries `degraded: "single-family"`.
 
 Baselines have no fallback. If the single model is exhausted they record one failed attempt and no model. A hot-but-not-exhausted Go model (usage 0.90) does not fail a baseline, because a naive caller would not see a usage-limit error yet.
 
@@ -158,9 +160,9 @@ Baselines have no fallback. If the single model is exhausted they record one fai
 - Unrouted: decisions that end with no model. Broken down by OmO category and reason. On this provider set a category can be unrouted because its chain names only providers that are not connected (the `writing` chain names Google and Anthropic), or because every reachable rung hit a usage-limit error. That is a consequence of connecting Codex, OpenCode Go, and DeepSeek, not of OmO in general.
 - Review independence, two levels: family level is the share of review and audit tasks whose model family differs from the scenario's reference implementer; model level is the share whose model differs from the implementer's model, even inside the same family. Reviews that stay in the reference family are counted as degraded, with sub-counts for how many still ran on a different model and how many carry the router's `degraded: single-family` mark.
 - Computed cost: metered USD (DeepSeek), OpenCode Go accounting USD, and Codex token totals. Subscription usage is the sum across scenarios and the mean per scenario. Each scenario is one pass over the 80-task trace, so the per-pass figure is the share of the nominal 5h budget one pass would use. Failed attempts add no token cost. The call was rejected before generation.
-- Coverage: distinct providers and model ids referenced by OmO model-core category and agent fallback chains, and the number of categories, counted from the pinned commit. Compared with openswarm's three backends and the model ids in `policy.json`.
-- Agreement with the difficulty→tier rubric: exact, over, under against `min_tier`. This is not a quality score and it is not the headline. openswarm agrees by construction when quota allows. Unrouted is included in under.
-- Latency: in-process per decision, at least 1000 samples, median and p95. openswarm also reports CLI cold start over 25 runs of `bin/openswarm route --type impl --difficulty 3`.
+- Coverage: distinct providers and model ids referenced by OmO model-core category and agent fallback chains, and the number of categories, counted from the pinned commit. Compared with swrm's three backends and the model ids in `policy.json`.
+- Agreement with the difficulty→tier rubric: exact, over, under against `min_tier`. This is not a quality score and it is not the headline. swrm agrees by construction when quota allows. Unrouted is included in under.
+- Latency: in-process per decision, at least 1000 samples, median and p95. swrm also reports CLI cold start over 25 runs of `bin/openswarm route --type impl --difficulty 3`.
 
 ## Environment
 
@@ -173,7 +175,7 @@ Recorded by `bench/run.sh` into `bench/results/environment.json` on 2026-10-17T1
 | CPU | Intel(R) Xeon(R) Processor, 8 cores |
 | Python | 3.13.5 |
 | bun | 1.4.2 |
-| openswarm commit | `113d5514a0a78395699a39d597ab05bd7caf63c3` on `bench/head-to-head` (the bench files themselves are uncommitted working-tree changes) |
+| swrm commit | `113d5514a0a78395699a39d597ab05bd7caf63c3` on `bench/head-to-head` (the bench files themselves are uncommitted working-tree changes) |
 | OmO | `<omo-dir>` at `07776864a043acdda9f9976ac8f71659a25f1d86` (tag v5.1.35) |
 
 Commands, from the repository root:
@@ -193,7 +195,7 @@ Per-pass shares are the mean of the seven scenarios. Each scenario is one pass o
 
 | Tool | Wasted first | Unrouted | Review independence (family) | Review independence (model) | Failed attempts | Metered USD | Go account USD | Go 5h share per pass | Go 5h share (sum) | Codex 5h share per pass | Codex 5h share (sum) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| openswarm | 0.0% | 0.0% | 85.7% | 95.2% | 0 | 0.0000 | 30.6145 | 1.4159 | 9.9117 | 0.4763 | 3.3338 |
+| swrm | 0.0% | 0.0% | 85.7% | 95.2% | 0 | 0.0000 | 30.6145 | 1.4159 | 9.9117 | 0.4763 | 3.3338 |
 | OmO | 23.4% | 19.8% | 71.4% | 71.4% | 254 | 1.5396 | 23.0340 | 1.0969 | 7.6780 | 0.8502 | 5.9512 |
 | Codex default | 28.6% | 28.6% | 0.0% | 0.0% | 160 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 1.7812 | 12.4685 |
 | strongest | 28.6% | 28.6% | 0.0% | 0.0% | 160 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 1.7812 | 12.4685 |
@@ -201,7 +203,7 @@ Per-pass shares are the mean of the seven scenarios. Each scenario is one pass o
 
 ### Unrouted decisions by OmO category
 
-These counts follow from the provider set used for every tool: Codex (`chatgpt-subscription`), OpenCode Go, and DeepSeek. A chain that names only Google or Anthropic cannot resolve here. That is a property of this comparison, not of OmO in general. openswarm and the cheapest baseline left nothing unrouted.
+These counts follow from the provider set used for every tool: Codex (`chatgpt-subscription`), OpenCode Go, and DeepSeek. A chain that names only Google or Anthropic cannot resolve here. That is a property of this comparison, not of OmO in general. swrm and the cheapest baseline left nothing unrouted.
 
 | Tool | OmO category | Decisions | Reason |
 | --- | --- | ---: | --- |
@@ -231,14 +233,14 @@ The Codex-baseline rows are exactly the tasks in `codex_hard_97` and `tight_frid
 
 | Router | Categories | Agents | Backends | Distinct providers in fallback chains | Distinct model ids |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| openswarm | — | — | 3 (codex, ocgo, deepseek) | — | 27 in `policy.json` |
+| swrm | — | — | 3 (codex, ocgo, deepseek) | — | 27 in `policy.json` |
 | OmO model-core | 9 | 11 | — | 26 | 36 |
 
-OmO's 26 providers and 36 model ids are the union of the category fallback chains and the agent fallback chains in `<omo-dir>/packages/model-core` at `07776864a043acdda9f9976ac8f71659a25f1d86`. openswarm's model ids are the OpenCode Go monthly-cap keys plus `deepseek.tiers`. Codex slugs are not listed in `policy.json`.
+OmO's 26 providers and 36 model ids are the union of the category fallback chains and the agent fallback chains in `<omo-dir>/packages/model-core` at `07776864a043acdda9f9976ac8f71659a25f1d86`. swrm's model ids are the OpenCode Go monthly-cap keys plus `deepseek.tiers`. Codex slugs are not listed in `policy.json`.
 
 ### Wasted first attempts by scenario
 
-| Scenario | openswarm | OmO | Codex default | strongest | cheapest |
+| Scenario | swrm | OmO | Codex default | strongest | cheapest |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | fresh | 0.0% | 0.0% | 0.0% | 0.0% | 0.0% |
 | codex_soft_90 | 0.0% | 0.0% | 0.0% | 0.0% | 0.0% |
@@ -252,7 +254,7 @@ OmO's 26 providers and 36 model ids are the union of the category fallback chain
 
 Twelve review or audit tasks per scenario. Family level first:
 
-| Scenario | openswarm | OmO | Codex default | strongest | cheapest |
+| Scenario | swrm | OmO | Codex default | strongest | cheapest |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | fresh | 100.0% | 100.0% | 0.0% | 0.0% | 0.0% |
 | codex_soft_90 | 100.0% | 100.0% | 0.0% | 0.0% | 0.0% |
@@ -264,7 +266,7 @@ Twelve review or audit tasks per scenario. Family level first:
 
 Model level (a different model than the reference implementer, even in the same family):
 
-| Scenario | openswarm | OmO | Codex default | strongest | cheapest |
+| Scenario | swrm | OmO | Codex default | strongest | cheapest |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | fresh | 100.0% | 100.0% | 0.0% | 0.0% | 0.0% |
 | codex_soft_90 | 100.0% | 100.0% | 0.0% | 0.0% | 0.0% |
@@ -274,23 +276,23 @@ Model level (a different model than the reference implementer, even in the same 
 | mixed_late_week | 66.7% | 33.3% | 0.0% | 0.0% | 0.0% |
 | tight_friday | 100.0% | 0.0% | 0.0% | 0.0% | 0.0% |
 
-openswarm: 12 of 84 reviews stayed in the reference family (degraded); 8 of those still ran on a different model, and 6 carry the router's `degraded: single-family` mark.
+swrm: 12 of 84 reviews stayed in the reference family (degraded); 8 of those still ran on a different model, and 6 carry the router's `degraded: single-family` mark.
 
 ### How the objective numbers move
 
-- At 90% of the Codex window, openswarm moves difficulty ≤ 3 off Codex and lowers effort on the rest. OmO's decisions match the fresh scenario. 90% is not an error it can see, so it wastes nothing there.
-- At 97%, openswarm skips Codex before the call (wasted first attempts 0). OmO's first Codex pick fails and it walks the chain: 52.5% of tasks in that scenario waste the first attempt. Across all seven scenarios that is 254 failed attempts. `ultrabrain`, `deep-high`, and `deep-low` then stay unresolved when every reachable Codex rung is exhausted.
+- At 90% of the Codex window, swrm moves difficulty ≤ 3 off Codex and lowers effort on the rest. OmO's decisions match the fresh scenario. 90% is not an error it can see, so it wastes nothing there.
+- At 97%, swrm skips Codex before the call (wasted first attempts 0). OmO's first Codex pick fails and it walks the chain: 52.5% of tasks in that scenario waste the first attempt. Across all seven scenarios that is 254 failed attempts. `ultrabrain`, `deep-high`, and `deep-low` then stay unresolved when every reachable Codex rung is exhausted.
 - `writing` is unrouted for OmO in all 7 tasks × 7 scenarios. The chain names Google and Anthropic models only, and `requiresAnyModel` blocks a fallthrough. Those providers are not in this set.
 - A DeepSeek balance of ¥3 changes no decision for either tool. OmO's metered total ($1.54) comes from scenarios where a Codex or Go rung has already failed and the chain reaches `deepseek-flash` or `deepseek-v4-pro`.
-- Review independence is 85.7% for openswarm and 71.4% for OmO at family level (openswarm side regenerated 2026-11-04; the OmO decision file is the checked-in pinned one). openswarm's review picks spread off the router's workhorse family inside the OpenCode Go tier, so a review stays independent even when the reference implementer has spilled off Codex onto that same Go family (100% at the soft and hard Codex limits and on tight Friday). The remaining family-level loss is `mixed_late_week` (0%): at the tiers a review can use, quota leaves a single usable family — the implementer's own. There the router now degrades explicitly: a sibling model of that family, a shifted effort, and a `degraded: single-family` flag on the decision, rather than silently re-using the implementer's model (before this change, 10 of the 12 reviews there ran on the implementer's exact model). Model-level independence for openswarm is 95.2% overall and 66.7% in `mixed_late_week`; the four reviews still on the reference model there are the difficulty-4/5 ones, whose own implementer proxy is Codex — against that implementer they are cross-family, and the one-reference scoring rule is what makes them look same-model.
-- One pass of the trace uses 0.4763 of the nominal Codex 5h budget under openswarm and 0.8502 under OmO, averaged across the seven scenarios. The two Codex baselines average 1.7812 because five of the scenarios put the whole trace on Codex (2.4937 each) and the two hard-Codex scenarios use none. OpenCode Go's per-pass share is 1.4159 for openswarm and 1.0969 for OmO. That share can exceed 1 because it sums fractions of small per-model windows.
-- On tight Friday, openswarm wastes nothing and leaves nothing unrouted, and its Go per-pass share falls to 0.0481, the same flash-only figure as the cheapest baseline. OmO wastes the first attempt on 91.2% of those tasks.
+- Review independence is 85.7% for swrm and 71.4% for OmO at family level (swrm side regenerated 2026-11-04; the OmO decision file is the checked-in pinned one). swrm's review picks spread off the router's workhorse family inside the OpenCode Go tier, so a review stays independent even when the reference implementer has spilled off Codex onto that same Go family (100% at the soft and hard Codex limits and on tight Friday). The remaining family-level loss is `mixed_late_week` (0%): at the tiers a review can use, quota leaves a single usable family — the implementer's own. There the router now degrades explicitly: a sibling model of that family, a shifted effort, and a `degraded: single-family` flag on the decision, rather than silently re-using the implementer's model (before this change, 10 of the 12 reviews there ran on the implementer's exact model). Model-level independence for swrm is 95.2% overall and 66.7% in `mixed_late_week`; the four reviews still on the reference model there are the difficulty-4/5 ones, whose own implementer proxy is Codex — against that implementer they are cross-family, and the one-reference scoring rule is what makes them look same-model.
+- One pass of the trace uses 0.4763 of the nominal Codex 5h budget under swrm and 0.8502 under OmO, averaged across the seven scenarios. The two Codex baselines average 1.7812 because five of the scenarios put the whole trace on Codex (2.4937 each) and the two hard-Codex scenarios use none. OpenCode Go's per-pass share is 1.4159 for swrm and 1.0969 for OmO. That share can exceed 1 because it sums fractions of small per-model windows.
+- On tight Friday, swrm wastes nothing and leaves nothing unrouted, and its Go per-pass share falls to 0.0481, the same flash-only figure as the cheapest baseline. OmO wastes the first attempt on 91.2% of those tasks.
 
 ### Agreement with the difficulty→tier rubric
 
-This section is not a quality score and it is not the headline. `min_tier` is openswarm's difficulty map. openswarm agrees with that map by construction whenever quota still allows the tier it would have picked on a fresh window. The cells are exact / over / under, and an unrouted decision counts as under.
+This section is not a quality score and it is not the headline. `min_tier` is swrm's difficulty map. swrm agrees with that map by construction whenever quota still allows the tier it would have picked on a fresh window. The cells are exact / over / under, and an unrouted decision counts as under.
 
-| Scenario | openswarm | OmO | Codex default | strongest | cheapest |
+| Scenario | swrm | OmO | Codex default | strongest | cheapest |
 | --- | --- | --- | --- | --- | --- |
 | fresh | 100.0% / 0.0% / 0.0% | 62.5% / 22.5% / 15.0% | 41.2% / 40.0% / 18.8% | 18.8% / 81.2% / 0.0% | 40.0% / 0.0% / 60.0% |
 | codex_soft_90 | 100.0% / 0.0% / 0.0% | 62.5% / 22.5% / 15.0% | 41.2% / 40.0% / 18.8% | 18.8% / 81.2% / 0.0% | 40.0% / 0.0% / 60.0% |
@@ -300,7 +302,7 @@ This section is not a quality score and it is not the headline. `min_tier` is op
 | mixed_late_week | 96.2% / 0.0% / 3.8% | 62.5% / 2.5% / 35.0% | 41.2% / 40.0% / 18.8% | 18.8% / 81.2% / 0.0% | 40.0% / 0.0% / 60.0% |
 | tight_friday | 40.0% / 0.0% / 60.0% | 33.8% / 18.8% / 47.5% | 0.0% / 0.0% / 100.0% | 0.0% / 0.0% / 100.0% | 40.0% / 0.0% / 60.0% |
 
-Overall, same caveat: openswarm 90.9% / 0.0% / 9.1%, OmO 57.0% / 18.8% / 24.3%, Codex default 29.5% / 28.6% / 42.0%, strongest 13.4% / 58.0% / 28.6%, cheapest 40.0% / 0.0% / 60.0%.
+Overall, same caveat: swrm 90.9% / 0.0% / 9.1%, OmO 57.0% / 18.8% / 24.3%, Codex default 29.5% / 28.6% / 42.0%, strongest 13.4% / 58.0% / 28.6%, cheapest 40.0% / 0.0% / 60.0%.
 
 ### Latency
 
@@ -308,23 +310,23 @@ Latency is the only non-deterministic section.
 
 | Measurement | n | median | p95 |
 | --- | ---: | ---: | ---: |
-| openswarm in-process `route()` | 1120 | 0.0075 ms | 0.0215 ms |
-| openswarm `bin/openswarm route` cold start | 25 | 74.0 ms | 86.9 ms |
+| swrm in-process `route()` | 1120 | 0.0075 ms | 0.0215 ms |
+| swrm `bin/openswarm route` cold start | 25 | 74.0 ms | 86.9 ms |
 | OmO in-process, module already loaded | 1120 | 0.0292 ms | 0.1027 ms |
 
-OmO has no route CLI, so there is no cold-start number for it. Both in-process medians are well under a tenth of a millisecond. The number a person would feel for openswarm is the CLI cold start.
+OmO has no route CLI, so there is no cold-start number for it. Both in-process medians are well under a tenth of a millisecond. The number a person would feel for swrm is the CLI cold start.
 
 ## Limitations
 
-- Agreement with the difficulty→tier rubric measures deviation from openswarm's difficulty map under quota pressure. It is not evidence that one router chose a better model.
+- Agreement with the difficulty→tier rubric measures deviation from swrm's difficulty map under quota pressure. It is not evidence that one router chose a better model.
 - The trace is synthetic. Token counts are estimates from the rubric, not tokenizer output and not a bill.
-- The tier of a model is this bench's label. `gpt-6.1-sol` is the balanced workhorse in openswarm's keyword scheme. OmO's `deep-low` lane uses that same model, so a difficulty-5 task mapped to `deep-low` can count as under-provisioned even though OmO considers the lane a deep default.
+- The tier of a model is this bench's label. `gpt-6.1-sol` is the balanced workhorse in swrm's keyword scheme. OmO's `deep-low` lane uses that same model, so a difficulty-5 task mapped to `deep-low` can count as under-provisioned even though OmO considers the lane a deep default.
 - `deepseek-v4-pro` is scored as deep, because that is the stronger of the two policy slots that share the id. A balanced task that falls through to it counts as over-provisioned.
-- MiniMax tiers are judgments. Those models are excluded before openswarm's price tercile.
+- MiniMax tiers are judgments. Those models are excluded before swrm's price tercile.
 - Codex window share uses a nominal 2,000,000-token budget. It is not an OpenAI quota.
 - OpenCode Go "prices" are subscription accounting rates from the demo state, not a second invoice.
 - OmO's category chains prefer several providers this subscription set does not include. That is intentional: the bench holds the subscriptions fixed. It also means some categories, notably `writing`, do not resolve here.
 - Soft quota, hard quota, and a usage-limit error are different events. The bench keeps them different on purpose.
-- Burn pace and the expiring-quota effort bump are part of openswarm and are not in these scenarios.
-- OmO latency does not include a process cold start. openswarm's CLI number does.
-- Author bias: the task list, the category map, and the tier labels were chosen by the openswarm maintainer. Raw decisions are in the JSONL files.
+- Burn pace and the expiring-quota effort bump are part of swrm and are not in these scenarios.
+- OmO latency does not include a process cold start. swrm's CLI number does.
+- Author bias: the task list, the category map, and the tier labels were chosen by the swrm maintainer. Raw decisions are in the JSONL files.
