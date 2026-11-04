@@ -1533,6 +1533,12 @@ def source_enabled(policy, name):
     return bool((policy.get("local_sources") or {}).get(name, False))
 
 
+def _symlink(src, dst):
+    # A directory target needs target_is_directory on Windows, or the link is
+    # created as a file link and neither git nor readers treat it as a directory.
+    os.symlink(src, dst, target_is_directory=(os.name == "nt" and os.path.isdir(src)))
+
+
 def _spawnable(cmd):
     """Windows cannot CreateProcess a script directly (WinError 193): when the
     target is a file with a python shebang, re-invoke it with this interpreter.
