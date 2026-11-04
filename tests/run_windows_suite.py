@@ -8,11 +8,19 @@ and neither the suite nor the product uses SIGINT semantics). Ignoring
 SIGINT in the test process makes the run immune; child processes still
 get the default disposition via subprocess' restore_signals.
 """
+import atexit
 import signal
 import sys
 import unittest
 
 signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+def _shutdown_marker():
+    print("suite-runner: atexit reached", file=sys.stderr, flush=True)
+
+
+atexit.register(_shutdown_marker)
 
 if __name__ == "__main__":
     program = unittest.main(module=None, argv=[sys.argv[0], "discover", "-s", "tests", "-v"],
