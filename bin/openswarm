@@ -6872,7 +6872,7 @@ class LaneChild:
             if lane.get("model"):
                 child_env["HERMES_MODEL"] = lane["model"]
         self.proc = subprocess.Popen(_spawnable(cmd), cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.DEVNULL, text=True, bufsize=1, newline="", start_new_session=True,
+                                     stderr=subprocess.DEVNULL, text=True, bufsize=1, start_new_session=True,
                                      env=child_env)
         self.reader = threading.Thread(target=self._read, daemon=True)
         self.reader.start()
