@@ -9,6 +9,12 @@ import subprocess
 import sys
 
 
+def _home():
+    # Windows Path.home() ignores the HOME environment variable; the fleet's
+    # config and these tests key off HOME, so honour it first as POSIX does.
+    return os.environ.get('HOME') or os.path.expanduser('~')
+
+
 def _spawnable(command):
     # Windows cannot exec an extensionless python-shebang script directly; rerun it
     # through the interpreter. POSIX behaviour is unchanged.
@@ -36,14 +42,14 @@ try:
     if op in ('lanes', 'assign', 'run_info', 'bundle', 'stop'):
         if host != 'gores1':
             raise ValueError('remote dispatcher host required')
-        command = [str(Path.home() / '.local/bin/openswarm'), 'lane']
+        command = [str(Path(_home()) / '.local/bin/openswarm'), 'lane']
         if op == 'lanes':
             command += ['status']
         elif op in ('run_info', 'bundle', 'stop'):
             run_id = request.get('run_id')
             if not isinstance(run_id, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,99}', run_id):
                 raise ValueError('invalid run id')
-            command = [str(Path.home() / '.local/bin/openswarm')]
+            command = [str(Path(_home()) / '.local/bin/openswarm')]
             command += ['fleet', '_run-info', run_id] if op in ('run_info', 'bundle') else ['stop', run_id]
         else:
             lane = request.get('lane')
@@ -85,7 +91,7 @@ try:
     if op not in ('acquire', 'release', 'status', 'recover'):
         raise ValueError('invalid operation')
     root = Path(os.environ.get('OPENSWARM_FLEET_CAPACITY_DIR') or
-                (Path.home() / '.claude/openswarm-fleet-capacity'))
+                (Path(_home()) / '.claude/openswarm-fleet-capacity'))
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     db = sqlite3.connect(str(root / 'capacity.sqlite'), timeout=10, isolation_level=None)
     os.chmod(root / 'capacity.sqlite', 0o600)

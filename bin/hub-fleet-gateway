@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 
-home = Path.home()
+home = Path(os.environ.get("HOME") or os.path.expanduser("~"))  # Windows Path.home() ignores $HOME
 cli = str(home / '.local/bin/openswarm')
 ssh = ['/usr/bin/ssh', '-T', '-F', str(home / '.ssh/openswarm-fleet/config'), 'openswarm-pi-broker']
 

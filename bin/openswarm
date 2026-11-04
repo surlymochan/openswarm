@@ -3288,7 +3288,10 @@ def plan_pi(prof, st, policy, forced, notes):
 
 def minimax_key_from_pi():
     """Read Pi's MiniMax credential without exposing it in command arguments."""
-    auth = jload(os.path.expanduser("~/.pi/agent/auth.json"), {}) or {}
+    # Resolved at call time, honouring $HOME first: Windows home resolution
+    # (expanduser/Path.home) ignores the HOME variable, POSIX expanduser does not.
+    home = os.environ.get("HOME") or os.path.expanduser("~")
+    auth = jload(os.path.join(home, ".pi", "agent", "auth.json"), {}) or {}
     entry = auth.get("minimax-cn") or {}
     return entry.get("key") if isinstance(entry, dict) else None
 
