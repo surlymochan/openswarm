@@ -144,6 +144,7 @@ class FleetTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             xs.fleet_config()
 
+    @unittest.skipIf(os.name == "nt", 'the test drives an extensionless `ssh` shim placed on PATH; Windows process creation only resolves PATHEXT executables, so the fake remote transport cannot be discovered (local-only ledger behaviour is covered by other fleet tests)')
     def test_ledger_pull_merges_redacts_deduplicates_and_skips_unreachable_hosts(self):
         fake_bin = self.root / "bin"
         fake_bin.mkdir()

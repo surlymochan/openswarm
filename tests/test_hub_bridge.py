@@ -156,7 +156,7 @@ class HubBridgeTests(unittest.TestCase):
         fake_cli.chmod(0o755)
         tunnel = self.path / 'gateway-tunnel.py'
         tunnel.write_text('import os,sys\nos.environ["HOME"]=' + repr(str(fake_home)) + '\n' +
-                          'os.execv(sys.executable,[sys.executable,' + repr(str(ROOT / 'bin/hub-fleet-gateway')) + '])\n')
+                          'import subprocess\nsys.exit(subprocess.call([sys.executable,' + repr(str(ROOT / 'bin/hub-fleet-gateway')) + ']))\n')
         with mock.patch.dict(G, {'transport':[sys.executable, str(tunnel)]}):
             with self.assertRaisesRegex(RuntimeError, 'no available fleet lane.*retry'):
                 MOD['run_submit'](self.args)

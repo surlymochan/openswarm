@@ -322,10 +322,28 @@ def _agy_execution_error(raw, stderr):
     return None
 
 
+def _spawnable(command):
+    """Windows cannot CreateProcess a script directly (WinError 193): when the
+    target is a file with a python shebang, re-invoke it with this interpreter."""
+    if os.name != "nt" or not command:
+        return command
+    head = str(command[0])
+    if head.lower().endswith((".exe", ".com", ".bat", ".cmd")):
+        return command
+    try:
+        with open(head, "rb") as fh:
+            first = fh.readline(256).decode("utf-8", "replace")
+    except OSError:
+        return command
+    if first.startswith("#!") and "python" in first:
+        return [sys.executable, *command]
+    return command
+
+
 def _kill_process(process):
     try:
         os.killpg(process.pid, signal.SIGTERM)
-    except (OSError, ProcessLookupError):
+    except Exception:  # Windows has no killpg (AttributeError); terminate() below is the fallback
         try:
             process.terminate()
         except OSError:
@@ -335,7 +353,7 @@ def _kill_process(process):
     except subprocess.TimeoutExpired:
         try:
             os.killpg(process.pid, signal.SIGKILL)
-        except (OSError, ProcessLookupError):
+        except Exception:  # see above
             process.kill()
         process.wait()
 
@@ -404,7 +422,7 @@ def _ask_one(core, profile, prompt, run_dir, deadline, policy, reservation_id):
                 except FileNotFoundError:
                     pass
             remaining = max(0.01, deadline - core.NOW())
-            process = subprocess.Popen(command, cwd=profile["cwd"], stdin=subprocess.DEVNULL,
+            process = subprocess.Popen(_spawnable(command), cwd=profile["cwd"], stdin=subprocess.DEVNULL,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
             try:
                 stdout, stderr = process.communicate(timeout=remaining)

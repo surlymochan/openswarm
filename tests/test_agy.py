@@ -135,6 +135,7 @@ class AgyBackend(unittest.TestCase):
         self.assertEqual(xs.canonical_backend("gemini"), "agy")
         self.assertEqual(xs.canonical_backend("codex"), "codex")
 
+    @unittest.skipIf(os.name == "nt", "PATH discovery of an extensionless executable is POSIX semantics; Windows resolves via PATHEXT")
     def test_binary_discovery_order(self):
         self.assertEqual(xs.agy_bin(), self.script)
         os.environ["OPENSWARM_AGY_BIN"] = os.path.join(self.tmp, "missing")

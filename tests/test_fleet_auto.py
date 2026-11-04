@@ -138,9 +138,10 @@ class FleetAutoTests(unittest.TestCase):
             MOD['main']()
         self.assertEqual(run.call_count, 1)
 
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "exercises a raw AF_UNIX lane socket, unavailable on this platform")
     def test_real_lane_socket_close_keeps_dispatch_uncertain(self):
         lane = runpy.run_path(str(pathlib.Path(__file__).resolve().parents[1] / 'bin' / 'openswarm'))
-        with tempfile.TemporaryDirectory(prefix='ack-', dir='/tmp') as directory:
+        with tempfile.TemporaryDirectory(prefix='ack-', dir=tempfile.gettempdir()) as directory:
             sockpath = str(pathlib.Path(directory) / 'lane.sock')
             listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             listener.bind(sockpath)

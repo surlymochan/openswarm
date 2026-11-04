@@ -13,7 +13,7 @@ import tempfile
 import time
 import uuid
 
-home = Path.home()
+home = Path(os.environ.get("HOME") or os.path.expanduser("~"))  # Windows Path.home() ignores $HOME
 root = Path(__file__).resolve().parent
 native = str(root / 'openswarm-fleet')
 config_path = home / '.claude/openswarm-hub-bridge/config.json'

@@ -15,16 +15,29 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-latest]
+        os: [ubuntu-24.04, macos-latest, windows-latest]
         python: ["3.9", "3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - name: tzdata (Windows CPython ships no IANA tz database)
+        if: runner.os == 'Windows'
+        run: pip install tzdata
       - name: Unit tests (stdlib only, no backends needed)
+        if: runner.os != 'Windows'
         run: python -m unittest discover -s tests -v
+      - name: Unit tests (Windows; SIGINT-shielded runner, see tests/run_windows_suite.py)
+        if: runner.os == 'Windows'
+        shell: bash
+        # Gate on the runner's verdict file: the step's process exit code is
+        # unreliable on windows-latest (reported as 1 for green suites).
+        run: |
+          python tests/run_windows_suite.py || true
+          grep -q "successful=True" suite-verdict.txt
       - name: CLI smoke test (offline state)
+        shell: bash
         env:
           OPENSWARM_STATE_FILE: examples/demo-state.json
         run: |

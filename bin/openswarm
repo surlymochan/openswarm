@@ -41,7 +41,11 @@ import contextlib
 import datetime as dt
 import glob
 import fnmatch
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows: no fcntl; _flock() below falls back to msvcrt.
+    fcntl = None
+    import msvcrt
 import hashlib
 import html
 import importlib.util
@@ -71,6 +75,40 @@ import random
 from zoneinfo import ZoneInfo
 
 HOME = os.path.expanduser("~")
+
+
+if fcntl is not None:
+    LOCK_EX = fcntl.LOCK_EX
+    LOCK_NB = fcntl.LOCK_NB
+else:  # pragma: no cover - exercised on Windows only
+    LOCK_EX = 0x1
+    LOCK_NB = 0x2
+
+
+def _flock(target, op):
+    """Exclusive advisory lock on an open file or fd.
+
+    POSIX uses flock(2) via fcntl. Windows has no flock; msvcrt.locking on byte 0 is
+    the closest equivalent (LK_LOCK retries for ~10s instead of blocking
+    forever -- acceptable for the short-lived coordination locks used here).
+    Non-blocking contention is normalised to BlockingIOError on both
+    platforms, matching the existing call-site contract.
+    """
+    if fcntl is not None:
+        fcntl.flock(target, op)
+        return
+    fd = target if isinstance(target, int) else target.fileno()  # noqa: F821 - msvcrt imported above
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+    except OSError:
+        pass
+    try:
+        msvcrt.locking(fd, msvcrt.LK_NBLCK if op & LOCK_NB else msvcrt.LK_LOCK, 1)
+    except OSError as exc:
+        if op & LOCK_NB:
+            raise BlockingIOError(str(exc)) from exc
+        raise
+
 
 
 def envvar(name, default=None):
@@ -1161,7 +1199,7 @@ def cmd_lessons_propose(args, policy):
     if not args.dry_run:
         os.makedirs(proposals_root, exist_ok=True)
         lock = open(seen_path + ".lock", "a", encoding="utf-8")
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        _flock(lock, LOCK_EX)
     try:
         if os.path.isfile(seen_path):
             try:
@@ -1421,7 +1459,7 @@ def cmd_lessons_escalate(args, policy):
     if not args.dry_run:
         os.makedirs(proposals_root, exist_ok=True)
         lock = open(seen_path + ".lock", "a", encoding="utf-8")
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        _flock(lock, LOCK_EX)
     try:
         if os.path.isfile(seen_path):
             try:
@@ -1495,9 +1533,34 @@ def source_enabled(policy, name):
     return bool((policy.get("local_sources") or {}).get(name, False))
 
 
+def _symlink(src, dst):
+    # A directory target needs target_is_directory on Windows, or the link is
+    # created as a file link and neither git nor readers treat it as a directory.
+    os.symlink(src, dst, target_is_directory=(os.name == "nt" and os.path.isdir(src)))
+
+
+def _spawnable(cmd):
+    """Windows cannot CreateProcess a script directly (WinError 193): when the
+    target is a file with a python shebang, re-invoke it with this interpreter.
+    POSIX executes shebangs natively and never takes the fallback branch."""
+    if os.name != "nt" or not cmd:
+        return cmd
+    head = str(cmd[0])
+    if head.lower().endswith((".exe", ".com", ".bat", ".cmd")):
+        return cmd
+    try:
+        with open(head, "rb") as fh:
+            first = fh.readline(256).decode("utf-8", "replace")
+    except OSError:
+        return cmd
+    if first.startswith("#!") and "python" in first:
+        return [sys.executable, *cmd]
+    return cmd
+
+
 def sh(cmd, timeout=60, env=None, cwd=None):
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env,
+        p = subprocess.run(_spawnable(cmd), capture_output=True, text=True, timeout=timeout, env=env,
                            cwd=cwd, stdin=subprocess.DEVNULL)
         return p.returncode, p.stdout, p.stderr
     except Exception as e:  # noqa: BLE001
@@ -1629,7 +1692,7 @@ def find_codex(policy):
         if rc != 0:
             continue
         version = out.strip().split()[-1] if out.strip() else "0"
-        rc, _, _ = sh([b, "features", "list"], timeout=20, cwd="/tmp")
+        rc, _, _ = sh([b, "features", "list"], timeout=20, cwd=tempfile.gettempdir())
         if rc == 0:
             good.append((ver_key(version), version, b))
     if not good:
@@ -1709,7 +1772,7 @@ def codex_visible_models(binary):
         return None
     proc = None
     try:
-        proc = subprocess.Popen([binary, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        proc = subprocess.Popen(_spawnable([binary, "app-server"]), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, text=True, bufsize=1, start_new_session=True)
         events = queue.Queue()
         def read_events():
@@ -1762,7 +1825,7 @@ def codex_visible_models(binary):
 def codex_models(binary, policy):
     data = None
     if binary:
-        rc, out, _ = sh([binary, "debug", "models"], timeout=30, cwd="/tmp")
+        rc, out, _ = sh([binary, "debug", "models"], timeout=30, cwd=tempfile.gettempdir())
         if rc == 0:
             try:
                 data = json.loads(out)
@@ -2537,7 +2600,7 @@ def cmd_retro(args, policy):
     now = NOW()
     cutoff = now - args.days * 86400
     zone_name = (policy.get("budget") or {}).get("timezone") or policy.get("timezone")
-    zone = ZoneInfo(zone_name) if zone_name else dt.datetime.now().astimezone().tzinfo
+    zone = _tzinfo(zone_name) if zone_name else dt.datetime.now().astimezone().tzinfo
     start = dt.datetime.fromtimestamp(cutoff, zone).isoformat(timespec="seconds")
     end = dt.datetime.fromtimestamp(now, zone).isoformat(timespec="seconds")
     today = dt.datetime.fromtimestamp(now, zone).date()
@@ -2606,9 +2669,18 @@ def cmd_retro(args, policy):
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
 
 
+def _tzinfo(name):
+    """Resolve an IANA zone name. UTC is spelled via timezone.utc: a bare
+    ZoneInfo("UTC") needs a system tz database (or the tzdata package), which
+    Windows hosts do not ship with CPython."""
+    if name in ("UTC", "Etc/UTC"):
+        return dt.timezone.utc
+    return ZoneInfo(name)
+
+
 def policy_day(policy, date=None):
     name = (policy.get("budget") or {}).get("timezone") or policy.get("timezone")
-    tz = ZoneInfo(name) if name else None
+    tz = _tzinfo(name) if name else None
     now = dt.datetime.fromtimestamp(NOW(), tz).astimezone(tz)
     day = dt.date.fromisoformat(date) if date else now.date()
     start = dt.datetime.combine(day, dt.time(), tz).astimezone(tz)
@@ -2780,7 +2852,7 @@ def admit_budget(policy, backend, minutes, rdir, **status):
     os.makedirs(DATA, exist_ok=True)
     requests = status.pop("budget_requests", [(backend, minutes)])
     with open(os.path.join(DATA, "budget.lock"), "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        _flock(lock, LOCK_EX)
         check_budget(policy, requests, exclude_id=status["id"])
         set_status(rdir, backend=backend, budget_minutes=minutes, budget_requests=requests, **status)
 
@@ -3216,7 +3288,10 @@ def plan_pi(prof, st, policy, forced, notes):
 
 def minimax_key_from_pi():
     """Read Pi's MiniMax credential without exposing it in command arguments."""
-    auth = jload(os.path.expanduser("~/.pi/agent/auth.json"), {}) or {}
+    # Resolved at call time, honouring $HOME first: Windows home resolution
+    # (expanduser/Path.home) ignores the HOME variable, POSIX expanduser does not.
+    home = os.environ.get("HOME") or os.path.expanduser("~")
+    auth = jload(os.path.join(home, ".pi", "agent", "auth.json"), {}) or {}
     entry = auth.get("minimax-cn") or {}
     return entry.get("key") if isinstance(entry, dict) else None
 
@@ -3470,7 +3545,7 @@ def fleet_guard_command():
 
 def fleet_guard_call(command, payload):
     try:
-        result = subprocess.run(command, input=json.dumps(payload), text=True, capture_output=True, timeout=15)
+        result = subprocess.run(_spawnable(command), input=json.dumps(payload), text=True, capture_output=True, timeout=15)
         answer = json.loads(result.stdout)
         if result.returncode != 0 or not answer.get("ok"):
             raise ValueError(answer.get("error") or "coordinator rejected request")
@@ -3512,7 +3587,7 @@ def reserve_provider_slot(rdir, backend, provider, policy, lane_name=None, keep_
                "backend": backend, "provider": provider}
     while True:
         with open(lock_path, "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            _flock(lock, LOCK_EX)
             active = {}
             for path in glob.glob(os.path.join(RUNS, "*", "status.json")):
                 if os.path.realpath(path) == os.path.realpath(status_path):
@@ -3732,7 +3807,8 @@ def descendants(pid):
 def kill_tree(pid, grace=3):
     """Terminate a process, its process group and every descendant (executors spawn shells in new groups)."""
     procs = [int(pid)] + descendants(pid)
-    for sig in (signal.SIGTERM, signal.SIGKILL):
+    # Windows has no SIGKILL constant; os.kill(SIGTERM) already hard-terminates there.
+    for sig in (signal.SIGTERM, getattr(signal, "SIGKILL", signal.SIGTERM)):
         for p in procs:
             for fn in (lambda q: os.killpg(q, sig), lambda q: os.kill(q, sig)):
                 try:
@@ -3873,6 +3949,14 @@ def configure_executor_environment(worktree, env=None):
         pass
 
     executor_env = dict(os.environ if env is None else env)
+    if os.name == "nt":
+        # A caller-supplied environment replaces os.environ wholesale; Windows
+        # children still need the OS location variables (without SystemRoot,
+        # CPython <= 3.9 cannot even seed its hash randomisation and dies with
+        # "_Py_HashRandomization_Init: failed to get random numbers").
+        for name in ("SystemRoot", "windir", "COMSPEC", "USERPROFILE", "PATHEXT"):
+            if name not in executor_env and name in os.environ:
+                executor_env[name] = os.environ[name]
     for name in ("TMPDIR", "TMP", "TEMP"):
         executor_env[name] = tmpdir
     return tmpdir, executor_env
@@ -3896,9 +3980,12 @@ def rm_target_path_class(target, cwd, root):
     if "$" in target:
         return "outside"
     path = os.path.realpath(os.path.join(cwd, target))
-    if os.path.commonpath([tmpdir, path]) == tmpdir:
-        return "tmp"
-    return "inside" if os.path.commonpath([root, path]) == root else "outside"
+    try:
+        if os.path.commonpath([tmpdir, path]) == tmpdir:
+            return "tmp"
+        return "inside" if os.path.commonpath([root, path]) == root else "outside"
+    except ValueError:
+        return "outside"  # e.g. a different Windows drive than the worktree: outside by definition
 
 
 def rm_outside_worktree_class(command, worktree):
@@ -3927,7 +4014,8 @@ def rm_outside_worktree_class(command, worktree):
     return None
 
 
-SCRATCH_TMP_DIRS = ("/tmp", "/private/tmp", "/var/tmp")
+SCRATCH_TMP_DIRS = tuple({os.path.normpath(d) for d in
+                          ("/tmp", "/private/tmp", "/var/tmp", tempfile.gettempdir())})
 
 
 def is_scratch_tmp_file(target, cwd):
@@ -3935,7 +4023,10 @@ def is_scratch_tmp_file(target, cwd):
     if any(ch in target for ch in "*?[{~$"):
         return False
     path = os.path.normpath(os.path.join(cwd, target))
-    if os.path.dirname(path) not in SCRATCH_TMP_DIRS or os.path.basename(path) in ("", ".", ".."):
+    # Compare drive-insensitively: a rooted POSIX spelling ("/tmp/x") gains the cwd's
+    # drive when joined on Windows, while the canonical list holds it drive-less.
+    scratch_dirs = {os.path.splitdrive(d)[1] for d in SCRATCH_TMP_DIRS}
+    if os.path.splitdrive(os.path.dirname(path))[1] not in scratch_dirs or os.path.basename(path) in ("", ".", ".."):
         return False
     return not os.path.isdir(path)
 
@@ -4065,7 +4156,7 @@ def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
     silently (e.g. opencode on a plan usage limit) — kill it early and return 75 so the caller can fall back."""
     rdir = os.path.dirname(out_path)
     with open(out_path, "w") as out, open(out_path + ".err", "w") as err:
-        p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=out, stderr=err, stdin=subprocess.DEVNULL,
+        p = subprocess.Popen(_spawnable(cmd), cwd=cwd, env=env, stdout=out, stderr=err, stdin=subprocess.DEVNULL,
                              start_new_session=True)
         set_status(rdir, executor_pid=p.pid, events=out_path, attempt_started=NOW())
         end = NOW() + timeout
@@ -4617,7 +4708,7 @@ def run_workspace_prepare(repo, wd, phase):
         if attempt:
             time.sleep(0.2)
         with open(lock_path, "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            _flock(lock, LOCK_EX)
             try:
                 proc = subprocess.run(command, shell=True, cwd=wd, capture_output=True, text=True)
                 rc = proc.returncode
@@ -4706,7 +4797,7 @@ def link_dependency_dirs(base, wt):
                 dst = os.path.join(dst_parent, d)
                 if os.path.isdir(dst_parent) and not os.path.lexists(dst):
                     try:
-                        os.symlink(os.path.realpath(src), dst)
+                        _symlink(os.path.realpath(src), dst)
                         linked.append(os.path.relpath(dst, wt))
                     except OSError:
                         pass
@@ -4718,8 +4809,11 @@ def link_dependency_dirs(base, wt):
 
 
 def rewrite_verify_paths(cmd, repo, root):
+    # Tolerate both separators in the command string: on Windows a verify
+    # command may legitimately spell paths with '/' while os.sep is '\\'.
     for base in {os.path.realpath(repo), repo}:
-        cmd = cmd.replace(base.rstrip(os.sep) + os.sep, root.rstrip(os.sep) + os.sep)
+        for sep in {os.sep, "/"}:
+            cmd = cmd.replace(base.rstrip("/\\") + sep, root.rstrip("/\\") + sep)
     return cmd
 
 
@@ -4733,7 +4827,7 @@ def _link_missing_entries(src, dst, wt, depth):
         s_path, d_path = os.path.join(src, name), os.path.join(dst, name)
         if not os.path.lexists(d_path):
             try:
-                os.symlink(os.path.realpath(s_path), d_path)
+                _symlink(os.path.realpath(s_path), d_path)
                 out.append(os.path.relpath(d_path, wt))
             except OSError:
                 pass
@@ -5587,7 +5681,7 @@ def update_peer_review_ledger(run_id, peer_review):
     os.makedirs(DATA, exist_ok=True)
     with open(lock_path, "a") as lock, open(path + ".lock", "a") as ledger_lock:
         for held in sorted((lock, ledger_lock), key=lambda item: item.name):
-            fcntl.flock(held, fcntl.LOCK_EX)
+            _flock(held, LOCK_EX)
         try:
             with open(path, encoding="utf-8") as stream:
                 lines = stream.readlines()
@@ -5673,7 +5767,7 @@ def spawn_auto_review(run_id, policy):
     for index in range(cap):
         fd = os.open(os.path.join(slots, f"{index}.lock"), os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _flock(fd, LOCK_EX | LOCK_NB)
         except BlockingIOError:
             os.close(fd)
             continue
@@ -5758,7 +5852,7 @@ def gh_transport(endpoint, method="GET", payload=None, allow_not_found=False):
         command += ["--input", "-"]
         input_text = json.dumps(payload, ensure_ascii=False)
     try:
-        proc = subprocess.run(command, input=input_text, capture_output=True, text=True, timeout=60)
+        proc = subprocess.run(_spawnable(command), input=input_text, capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise BusError(bus_redact(f"gh api failed: {error}"))
     if proc.returncode:
@@ -6493,6 +6587,9 @@ def lane_last_log_error(name):
 
 
 def lane_validate_socket_path(name):
+    if not hasattr(socket, "AF_UNIX"):
+        raise RuntimeError("lane control requires AF_UNIX sockets, which this platform "
+                           "does not provide (Windows named-pipe transport is not implemented)")
     path = lane_socket_path(name)
     capacity = 104 if sys.platform == "darwin" else 108
     limit = capacity - 1  # sockaddr_un.sun_path needs room for the terminating NUL.
@@ -6587,6 +6684,8 @@ def lane_write_state(lane_name, **changes):
 
 
 def lane_call(name, request, timeout=8):
+    if not hasattr(socket, "AF_UNIX"):
+        return {"ok": False, "error": "lane control requires AF_UNIX sockets, unavailable on this platform"}
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
@@ -6783,7 +6882,7 @@ class LaneChild:
             os.makedirs(child_env["HERMES_HOME"], exist_ok=True)
             if lane.get("model"):
                 child_env["HERMES_MODEL"] = lane["model"]
-        self.proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        self.proc = subprocess.Popen(_spawnable(cmd), cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.DEVNULL, text=True, bufsize=1, start_new_session=True,
                                      env=child_env)
         self.reader = threading.Thread(target=self._read, daemon=True)
@@ -6911,7 +7010,7 @@ class AgyChild:
         cfg = load_policy().get("agy") or {}
         cmd = agy_command(binary, model or self.lane["model"], prompt, effort or self.lane.get("effort"),
                           conversation, cfg)
-        proc = subprocess.Popen(cmd, cwd=self.cwd, env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        proc = subprocess.Popen(_spawnable(cmd), cwd=self.cwd, env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, bufsize=1, start_new_session=True)
         events, stderr_lines = queue.Queue(), []
         self.proc, self.events, self.stderr_lines = proc, events, stderr_lines
@@ -6989,7 +7088,7 @@ class CursorHeadlessChild(AgyChild):
         if conversation:
             cmd.append("--continue")
         cmd += ["--", prompt]
-        proc = subprocess.Popen(cmd, cwd=self.cwd, env=self.env, stdin=subprocess.DEVNULL,
+        proc = subprocess.Popen(_spawnable(cmd), cwd=self.cwd, env=self.env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
                                 start_new_session=True)
         events, stderr_lines = queue.Queue(), []
@@ -7961,7 +8060,7 @@ def agy_quota_available(lane, child):
     if not binary:
         return False
     try:
-        result = subprocess.run([binary, "-p", "/usage", "--output-format", "json"],
+        result = subprocess.run(_spawnable([binary, "-p", "/usage", "--output-format", "json"]),
                                 cwd=child.cwd, env=child.env, stdin=subprocess.DEVNULL,
                                 capture_output=True, text=True, timeout=30)
         data = json.loads(result.stdout)
@@ -8293,8 +8392,12 @@ def generate_lane_service_definition(lane, service_manager):
         return json.dumps({"name": name, "plist": plist}, indent=2, ensure_ascii=False)
 
     if service_manager == "systemd-unit":
-        import pwd
-        user = pwd.getpwuid(os.getuid()).pw_name
+        try:
+            import pwd
+            user = pwd.getpwuid(os.getuid()).pw_name
+        except Exception:  # Windows has neither pwd nor os.getuid; the unit is text generation
+            import getpass
+            user = getpass.getuser()
         home = os.path.expanduser("~")
         path = os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
         local_bin = os.path.join(home, ".local", "bin")
@@ -8748,7 +8851,8 @@ def ledger_ingest_write(path, lines):
     fd, temporary = tempfile.mkstemp(prefix=os.path.basename(path) + ".tmp", dir=os.path.dirname(path))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            os.fchmod(stream.fileno(), mode)
+            if hasattr(os, "fchmod"):  # POSIX only; Windows has no per-fd chmod
+                os.fchmod(stream.fileno(), mode)
             stream.writelines(lines)
             stream.flush()
             os.fsync(stream.fileno())
@@ -8802,7 +8906,7 @@ def cmd_ledger_ingest(args):
     lock_path = path + ".lock"
     updated = linked_count = unlinked_count = completed = 0
     with open(lock_path, "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        _flock(lock, LOCK_EX)
         with open(path, encoding="utf-8") as stream:
             original_lines = stream.readlines()
         lines = []
@@ -8869,7 +8973,7 @@ def cmd_ledger_accept(args):
         reason = "manually accepted" if accepted else "manually rejected"
     lock_path = path + ".lock"
     with open(lock_path, "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        _flock(lock, LOCK_EX)
         with open(path, encoding="utf-8") as stream:
             lines = stream.readlines()
         matches = []
@@ -8902,7 +9006,7 @@ def cmd_ledger_backfill_pass(args):
     lock_path = path + ".lock"
     updated = skipped = 0
     with open(lock_path, "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        _flock(lock, LOCK_EX)
         with open(path, encoding="utf-8") as stream:
             lines = stream.readlines()
         for index, raw in enumerate(lines):
@@ -9306,7 +9410,7 @@ def execute_batch(spec, summary):
                         continue
                     lock_path = os.path.join(DATA, "fleet-provider-concurrency.lock")
                     with open(lock_path, "a") as lock:
-                        fcntl.flock(lock, fcntl.LOCK_EX)
+                        _flock(lock, LOCK_EX)
                         if not batch_provider_slot_available(spec, row):
                             continue
                         try:
@@ -10219,7 +10323,7 @@ def append_ledger(entry):
     os.makedirs(DATA, exist_ok=True)
     # Serialize completion writes with admissions so their ledger/reservation snapshot is coherent.
     with open(os.path.join(DATA, "budget.lock"), "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        _flock(lock, LOCK_EX)
         with open(LEDGER, "a") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -10628,7 +10732,7 @@ def update_compare_ledger(candidates, compare_id, winner_id):
     lock_path = os.path.join(DATA, "budget.lock")
     with open(lock_path, "a") as budget_lock, open(path + ".lock", "a") as ledger_lock:
         for held in sorted((budget_lock, ledger_lock), key=lambda item: item.name):
-            fcntl.flock(held, fcntl.LOCK_EX)
+            _flock(held, LOCK_EX)
         try:
             with open(path, encoding="utf-8") as stream:
                 lines = stream.readlines()

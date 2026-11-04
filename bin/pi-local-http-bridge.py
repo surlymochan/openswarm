@@ -9,6 +9,7 @@ import select
 import signal
 import socket
 import subprocess
+import sys
 import threading
 
 parser = argparse.ArgumentParser()
@@ -20,6 +21,24 @@ args = parser.parse_args()
 token = args.token_file.read_text(encoding='utf-8').strip()
 if not token:
     raise SystemExit('local broker token is empty')
+
+
+def _spawnable(command):
+    """Windows cannot CreateProcess a script directly (WinError 193): when the
+    target is a file with a python shebang, re-invoke it with this interpreter."""
+    if os.name != "nt" or not command:
+        return command
+    head = str(command[0])
+    if head.lower().endswith((".exe", ".com", ".bat", ".cmd")):
+        return command
+    try:
+        with open(head, "rb") as fh:
+            first = fh.readline(256).decode("utf-8", "replace")
+    except OSError:
+        return command
+    if first.startswith("#!") and "python" in first:
+        return [sys.executable, *command]
+    return command
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -43,8 +62,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if size < 1 or self.headers.get('transfer-encoding'):
             self.send_error(400)
             return
-        proc = subprocess.Popen([args.ssh, '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8',
-                                 args.broker_host, '~/tools/openswarm-executor-candidate/bin/pi-broker-stdio'],
+        proc = subprocess.Popen(_spawnable([args.ssh, '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8',
+                                 args.broker_host, '~/tools/openswarm-executor-candidate/bin/pi-broker-stdio']),
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         with self.server.children_lock:
             self.server.children.add(proc)

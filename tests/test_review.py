@@ -78,7 +78,8 @@ class PeerReviewTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'reviewer timed out'):
                 xs.invoke_reviewer({'backend': 'agy'}, 'review', str(self.repo), str(self.run_dir),
                                    {'review': {'timeout_seconds': 2}})
-            status = subprocess.run([str(coordinator), 'gocc'], input=json.dumps({'op': 'status'}),
+            coordinator_cmd = [sys.executable, str(coordinator)] if os.name == 'nt' else [str(coordinator)]
+            status = subprocess.run([*coordinator_cmd, 'gocc'], input=json.dumps({'op': 'status'}),
                                     text=True, capture_output=True, check=True)
         self.assertEqual(json.loads(status.stdout)['reservations'], [])
 
