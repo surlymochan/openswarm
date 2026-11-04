@@ -63,8 +63,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(400)
             return
         proc = subprocess.Popen(_spawnable([args.ssh, '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8',
-                                 args.broker_host, '~/tools/openswarm-executor-candidate/bin/pi-broker-stdio'],
-                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL))
+                                 args.broker_host, '~/tools/openswarm-executor-candidate/bin/pi-broker-stdio']),
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         with self.server.children_lock:
             self.server.children.add(proc)
         self.close_connection = True
