@@ -16,7 +16,7 @@ FIXTURES = ROOT / "tests" / "fixtures"
 
 class LaneTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="oslane-", dir="/tmp")
+        self.tmp = tempfile.TemporaryDirectory(prefix="oslane-", dir=tempfile.gettempdir())
         self.root = pathlib.Path(self.tmp.name)
         self.data = self.root / "data"
         self.repo = self.root / "repo"
