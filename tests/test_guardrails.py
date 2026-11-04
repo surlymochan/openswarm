@@ -216,8 +216,13 @@ class GuardrailsTests(unittest.TestCase):
             "'exists': os.path.isdir(tmp)}, open(os.environ['RESULT_PATH'], 'w'))\n")
         events = self.root / "runs" / "executor" / "events.jsonl"
         events.parent.mkdir(parents=True)
-        self.assertEqual(xs.run_proc([sys.executable, str(script)], str(repo),
-                                     {"RESULT_PATH": str(result_path)}, 10, str(events)), 0)
+        rc_probe = xs.run_proc([sys.executable, str(script)], str(repo),
+                               {"RESULT_PATH": str(result_path)}, 10, str(events))
+        if rc_probe != 0:
+            err_path = str(events) + ".err"
+            print("DIAG-RUNPROC rc:", rc_probe, "| err:", open(err_path).read() if os.path.exists(err_path) else "(no err file)",
+                  "| out:", open(str(events)).read() if os.path.exists(str(events)) else "(no out file)", file=sys.__stderr__)
+        self.assertEqual(rc_probe, 0)
         executor_env = json.loads(result_path.read_text())
         self.assertEqual([executor_env[name] for name in ("tmpdir", "tmp", "temp")], [tmpdir] * 3)
         self.assertTrue(executor_env["exists"])
