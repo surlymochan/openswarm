@@ -30,7 +30,12 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Unit tests (Windows; SIGINT-shielded runner, see tests/run_windows_suite.py)
         if: runner.os == 'Windows'
-        run: python tests/run_windows_suite.py
+        shell: bash
+        # Gate on the runner's verdict file: the step's process exit code is
+        # unreliable on windows-latest (reported as 1 for green suites).
+        run: |
+          python tests/run_windows_suite.py || true
+          grep -q "successful=True" suite-verdict.txt
       - name: CLI smoke test (offline state)
         shell: bash
         env:
