@@ -20,7 +20,7 @@ xs = _load.load()
 
 class GuardrailsTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
+        self.tmp = tempfile.TemporaryDirectory(dir=tempfile.gettempdir())
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         for name, value in (("DATA", str(self.root)), ("RUNS", str(self.root / "runs")),

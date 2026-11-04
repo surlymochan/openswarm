@@ -1533,9 +1533,28 @@ def source_enabled(policy, name):
     return bool((policy.get("local_sources") or {}).get(name, False))
 
 
+def _spawnable(cmd):
+    """Windows cannot CreateProcess a script directly (WinError 193): when the
+    target is a file with a python shebang, re-invoke it with this interpreter.
+    POSIX executes shebangs natively and never takes the fallback branch."""
+    if os.name != "nt" or not cmd:
+        return cmd
+    head = str(cmd[0])
+    if head.lower().endswith((".exe", ".com", ".bat", ".cmd")):
+        return cmd
+    try:
+        with open(head, "rb") as fh:
+            first = fh.readline(256).decode("utf-8", "replace")
+    except OSError:
+        return cmd
+    if first.startswith("#!") and "python" in first:
+        return [sys.executable, *cmd]
+    return cmd
+
+
 def sh(cmd, timeout=60, env=None, cwd=None):
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env,
+        p = subprocess.run(_spawnable(cmd), capture_output=True, text=True, timeout=timeout, env=env,
                            cwd=cwd, stdin=subprocess.DEVNULL)
         return p.returncode, p.stdout, p.stderr
     except Exception as e:  # noqa: BLE001
@@ -1667,7 +1686,7 @@ def find_codex(policy):
         if rc != 0:
             continue
         version = out.strip().split()[-1] if out.strip() else "0"
-        rc, _, _ = sh([b, "features", "list"], timeout=20, cwd="/tmp")
+        rc, _, _ = sh([b, "features", "list"], timeout=20, cwd=tempfile.gettempdir())
         if rc == 0:
             good.append((ver_key(version), version, b))
     if not good:
@@ -1747,7 +1766,7 @@ def codex_visible_models(binary):
         return None
     proc = None
     try:
-        proc = subprocess.Popen([binary, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        proc = subprocess.Popen(_spawnable([binary, "app-server"]), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, text=True, bufsize=1, start_new_session=True)
         events = queue.Queue()
         def read_events():
@@ -1800,7 +1819,7 @@ def codex_visible_models(binary):
 def codex_models(binary, policy):
     data = None
     if binary:
-        rc, out, _ = sh([binary, "debug", "models"], timeout=30, cwd="/tmp")
+        rc, out, _ = sh([binary, "debug", "models"], timeout=30, cwd=tempfile.gettempdir())
         if rc == 0:
             try:
                 data = json.loads(out)
@@ -2646,7 +2665,9 @@ def cmd_retro(args, policy):
 
 def policy_day(policy, date=None):
     name = (policy.get("budget") or {}).get("timezone") or policy.get("timezone")
-    tz = ZoneInfo(name) if name else None
+    # UTC is spelled via timezone.utc: a bare ZoneInfo("UTC") needs a system tz
+    # database (or the tzdata package), which Windows hosts do not ship.
+    tz = dt.timezone.utc if name in ("UTC", "Etc/UTC") else (ZoneInfo(name) if name else None)
     now = dt.datetime.fromtimestamp(NOW(), tz).astimezone(tz)
     day = dt.date.fromisoformat(date) if date else now.date()
     start = dt.datetime.combine(day, dt.time(), tz).astimezone(tz)
@@ -3965,7 +3986,8 @@ def rm_outside_worktree_class(command, worktree):
     return None
 
 
-SCRATCH_TMP_DIRS = ("/tmp", "/private/tmp", "/var/tmp")
+SCRATCH_TMP_DIRS = tuple({os.path.normpath(d) for d in
+                          ("/tmp", "/private/tmp", "/var/tmp", tempfile.gettempdir())})
 
 
 def is_scratch_tmp_file(target, cwd):
@@ -4103,7 +4125,7 @@ def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
     silently (e.g. opencode on a plan usage limit) — kill it early and return 75 so the caller can fall back."""
     rdir = os.path.dirname(out_path)
     with open(out_path, "w") as out, open(out_path + ".err", "w") as err:
-        p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=out, stderr=err, stdin=subprocess.DEVNULL,
+        p = subprocess.Popen(_spawnable(cmd), cwd=cwd, env=env, stdout=out, stderr=err, stdin=subprocess.DEVNULL,
                              start_new_session=True)
         set_status(rdir, executor_pid=p.pid, events=out_path, attempt_started=NOW())
         end = NOW() + timeout
@@ -7999,7 +8021,7 @@ def agy_quota_available(lane, child):
     if not binary:
         return False
     try:
-        result = subprocess.run([binary, "-p", "/usage", "--output-format", "json"],
+        result = subprocess.run(_spawnable([binary, "-p", "/usage", "--output-format", "json"]),
                                 cwd=child.cwd, env=child.env, stdin=subprocess.DEVNULL,
                                 capture_output=True, text=True, timeout=30)
         data = json.loads(result.stdout)
@@ -8786,7 +8808,8 @@ def ledger_ingest_write(path, lines):
     fd, temporary = tempfile.mkstemp(prefix=os.path.basename(path) + ".tmp", dir=os.path.dirname(path))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            os.fchmod(stream.fileno(), mode)
+            if hasattr(os, "fchmod"):  # POSIX only; Windows has no per-fd chmod
+                os.fchmod(stream.fileno(), mode)
             stream.writelines(lines)
             stream.flush()
             os.fsync(stream.fileno())
