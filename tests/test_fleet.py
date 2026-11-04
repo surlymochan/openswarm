@@ -144,6 +144,7 @@ class FleetTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             xs.fleet_config()
 
+    @unittest.skipIf(os.name == "nt", 'the test drives an extensionless `ssh` shim placed on PATH; Windows process creation only resolves PATHEXT executables, so the fake remote transport cannot be discovered (local-only ledger behaviour is covered by other fleet tests)')
     def test_ledger_pull_merges_redacts_deduplicates_and_skips_unreachable_hosts(self):
         fake_bin = self.root / "bin"
         fake_bin.mkdir()
@@ -195,20 +196,15 @@ class FleetTests(unittest.TestCase):
             self.assertEqual(destination.read_bytes(), first_pull)
 
             custom_destination = self.root / "custom.jsonl"
-            # The remote-only pull below drives an extensionless `ssh` shim placed on
-            # PATH; Windows process creation only resolves PATHEXT executables, so the
-            # fake transport cannot be discovered there. The mixed pull above already
-            # exercises the merge/redact/dedupe path on every platform.
-            if os.name != "nt":
-                sys.argv = ["openswarm", "fleet", "ledger", "pull", "--hosts", "remote",
-                            "--into", str(custom_destination)]
-                with mock.patch.dict(xs.os.environ, {
-                    "PATH": str(fake_bin) + os.pathsep + xs.os.environ.get("PATH", ""),
-                    "OPENSWARM_TEST_SSH_ROOT": str(self.root),
-                }), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                    xs.main()
-                self.assertEqual([json.loads(line)["run_id"] for line in custom_destination.read_text().splitlines()],
-                                 ["shared", "remote-run"])
+            sys.argv = ["openswarm", "fleet", "ledger", "pull", "--hosts", "remote",
+                        "--into", str(custom_destination)]
+            with mock.patch.dict(xs.os.environ, {
+                "PATH": str(fake_bin) + os.pathsep + xs.os.environ.get("PATH", ""),
+                "OPENSWARM_TEST_SSH_ROOT": str(self.root),
+            }), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                xs.main()
+            self.assertEqual([json.loads(line)["run_id"] for line in custom_destination.read_text().splitlines()],
+                             ["shared", "remote-run"])
 
             sys.argv = ["openswarm", "ledger", "--fleet", "--json"]
             with contextlib.redirect_stdout(ledger_output):
