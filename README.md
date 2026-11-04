@@ -16,9 +16,9 @@ under lease and return with evidence, routed by live quota across model families
 
 ## Benchmarks: swrm vs oh-my-openagent (2026-10-17)
 
-_These results were recorded when this project was named openswarm (and its sibling project was named
-OpenFlow); the version labels in this section are kept exactly as measured. Both have since been
-renamed: openswarm → swrm, OpenFlow → evalid._
+_These results were measured before the rename, when this project was named openswarm (and its sibling
+project was named OpenFlow); product names in this section have been unified to the current names
+(swrm, evalid), and all versions and figures are the original measurements._
 
 Compared with [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent) (OmO) v5.1.35 (`0777686`), whose
 `model-core` package resolves a delegated task to a model through per-category fallback chains. Scripts, raw results and
@@ -33,8 +33,8 @@ DeepSeek-V4.1-Flash (`deepseek-flash`), n=1 per cell, 20-minute cap; details and
 | --- | --- | --- | --- | --- | --- |
 | Plain agent (baseline) | 3/6 (50%) | 124 s (110–175) | $0.0234 | $0.16 | 6 |
 | superpowers v7.0.0 | 2/6 (33%) | 154 s (136–340) | $0.0285 | $0.31 | 6 |
-| OpenFlow 0.2.1 | 4/6 (67%) | 230 s (200–266) | $0.0412 | $0.23 | 6 |
-| openswarm (planner + Pi executor) | 5/6 (83%) | 228 s (187–254) | $0.0377 | $0.21 | 6 |
+| evalid 0.2.1 | 4/6 (67%) | 230 s (200–266) | $0.0412 | $0.23 | 6 |
+| swrm (planner + Pi executor) | 5/6 (83%) | 228 s (187–254) | $0.0377 | $0.21 | 6 |
 | oh-my-openagent v5.1.35 | not run ¹ | – | – | – | 0 |
 
 **Caveats:** n=1 on 6 instances, so one or two resolves are within noise. The two workflow tools took about 1.8x the
@@ -47,12 +47,12 @@ Raw per-run records and logs: [`bench/swebench/results/`](bench/swebench/results
 results: [#3](https://github.com/surlymochan/swrm/issues/3).
 
 **Synthetic end-to-end tasks.** 8 small real tasks (4 JS, 4 Python), hidden acceptance tests applied only after the agent exits.
-For these synthetic tasks, every arm runs `grok-4.7-high` through the local `cursor-agent` (openswarm uses its new `--backend cursor` executor).
+For these synthetic tasks, every arm runs `grok-4.7-high` through the local `cursor-agent` (swrm uses its new `--backend cursor` executor).
 
 | Arm | Success (hidden tests) | Median wall time (IQR) | Median tokens: total / input+output | n |
 | --- | --- | --- | --- | --- |
 | Single agent (baseline) | 24/24 (100%) | 55 s (46–132) | 105k / 28k | 24 |
-| openswarm (planner + worktree executor + host verify) | 24/24 (100%) | 220 s (137–356) | 207k / 64k | 24 |
+| swrm (planner + worktree executor + host verify) | 24/24 (100%) | 220 s (137–356) | 207k / 64k | 24 |
 | oh-my-openagent | not run ¹ | – | – | 0 |
 
 On tasks this small the single agent already succeeds every time. swrm's planner call and isolated, verified run
@@ -64,7 +64,7 @@ this benchmark. The estimated metered cost to run it on DeepSeek is about $1.3 (
 providers for both routers (Codex subscription, OpenCode Go, DeepSeek). Costs are *computed* from the price tables in
 `bench/prices.json` × estimated tokens. They are not bills.
 
-| Metric | openswarm | OmO | Codex-only baseline |
+| Metric | swrm | OmO | Codex-only baseline |
 | --- | --- | --- | --- |
 | First attempt sent to an already-exhausted quota | **0.0%** | 23.4% (254 failed attempts) | 28.6% |
 | Decisions with no usable model (this provider set) | **0.0%** | 19.8% ² | 28.6% |
