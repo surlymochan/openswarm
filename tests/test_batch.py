@@ -270,7 +270,14 @@ class BatchTests(FakeFleetFixture, unittest.TestCase):
         path = self.data / "batches" / reply["id"] / "summary.json"
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
-            summary = json.loads(path.read_text())
+            try:
+                summary = json.loads(path.read_text())
+            except (OSError, ValueError):
+                # The daemon publishes summary.json by atomic replacement; on
+                # Windows a poll can observe the file mid-replacement
+                # (PermissionError) or partially written. Keep polling.
+                time.sleep(0.05)
+                continue
             if summary["state"] in ("finished", "failed"):
                 break
             time.sleep(0.05)
