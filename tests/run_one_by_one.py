@@ -1,41 +1,45 @@
-"""Debug runner: run the whole suite test-by-test, printing each outcome immediately."""
-import os, sys, traceback, unittest
+"""Probe: isolate the Windows KeyboardInterrupt phenomenon."""
+import os, subprocess, sys, traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-def walk(suite):
-    for item in suite:
-        if isinstance(item, unittest.TestSuite):
-            yield from walk(item)
-        else:
-            yield item
+def mark(msg):
+    print(f"PROBE {msg}", flush=True)
+
+def loop(name, fn, n=60):
+    hits = 0
+    for i in range(n):
+        try:
+            fn()
+        except KeyboardInterrupt:
+            hits += 1
+            mark(f"{name}: KeyboardInterrupt at iter {i}")
+        except BaseException as e:
+            mark(f"{name}: {type(e).__name__} at iter {i}: {e}")
+    mark(f"{name}: done, {hits} interrupts / {n}")
 
 def main():
-    only = sys.argv[1] if len(sys.argv) > 1 else "test*.py"
-    suite = unittest.defaultTestLoader.discover(os.path.dirname(os.path.abspath(__file__)), pattern=only)
-    counts = {"ok": 0, "ERROR": 0, "FAIL": 0, "SKIP": 0, "RAISED-OUTER": 0}
-    for test in walk(suite):
+    mark("start")
+    loop("plain-child", lambda: subprocess.run([sys.executable, "-c", "import time; time.sleep(0.05)"],
+                                               capture_output=True, timeout=20))
+    import _load
+    xs = _load.load()
+    mark("module loaded")
+    loop("git-sh", lambda: xs.sh(["git", "--version"], timeout=20))
+    import unittest
+    for tid in ("test_pi.PiBackend.test_success_parses_result_and_records_usage",
+                "test_pi.PiBackend.test_risk_stops_runner_even_if_executor_reports_done"):
         result = unittest.TestResult()
+        test = unittest.defaultTestLoader.loadTestsFromName(tid)
         try:
             test(result)
+            mark(f"{tid}: errors={len(result.errors)} failures={len(result.failures)}")
+            for _t, tb in result.errors + result.failures:
+                print(tb[-600:], flush=True)
         except BaseException:
-            counts["RAISED-OUTER"] += 1
-            print(f"RAISED-OUTER {test.id()}", flush=True)
+            mark(f"{tid}: RAISED")
             traceback.print_exc()
-            continue
-        if result.errors:
-            status = "ERROR"
-        elif result.failures:
-            status = "FAIL"
-        elif result.skipped:
-            status = "SKIP"
-        else:
-            status = "ok"
-        counts[status] += 1
-        print(f"RESULT {status} {test.id()}", flush=True)
-        for _t, tb in result.errors + result.failures:
-            print(tb, flush=True)
-    print(f"ALL-DONE {counts}", flush=True)
+    mark("end")
 
 if __name__ == "__main__":
     main()
