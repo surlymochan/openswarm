@@ -14,7 +14,11 @@ under lease and return with evidence, routed by live quota across model families
 > The CLI command, the skill name and install path, and the `OPENSWARM_*` environment
 > variables keep the old name for now, so existing setups keep working.
 
-## Benchmarks: openswarm vs oh-my-openagent (2026-10-17)
+## Benchmarks: swrm vs oh-my-openagent (2026-10-17)
+
+_These results were recorded when this project was named openswarm (and its sibling project was named
+OpenFlow); the version labels in this section are kept exactly as measured. Both have since been
+renamed: openswarm → swrm, OpenFlow → evalid._
 
 Compared with [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent) (OmO) v5.1.35 (`0777686`), whose
 `model-core` package resolves a delegated task to a model through per-category fallback chains. Scripts, raw results and
@@ -34,10 +38,10 @@ DeepSeek-V4.1-Flash (`deepseek-flash`), n=1 per cell, 20-minute cap; details and
 | oh-my-openagent v5.1.35 | not run ¹ | – | – | – | 0 |
 
 **Caveats:** n=1 on 6 instances, so one or two resolves are within noise. The two workflow tools took about 1.8x the
-baseline's median wall-clock and cost 76% (OpenFlow) / 61% (openswarm) more per task. The first published table undercounted
+baseline's median wall-clock and cost 76% (evalid) / 61% (swrm) more per task. The first published table undercounted
 pytest because of a shared temp-dir race in grading; it is now fixed and regraded
 ([regrade notes](bench/swebench/README.md#regrade-2026-10-18)). On the MiniMax-M3.1-Flash-Preview subset, baseline
-resolved 3/4 and superpowers 2/4; openswarm had no clean MiniMax run because the plan's usage cap was hit.
+resolved 3/4 and superpowers 2/4; swrm had no clean MiniMax run because the plan's usage cap was hit.
 
 Raw per-run records and logs: [`bench/swebench/results/`](bench/swebench/results/). Optimization backlog from these
 results: [#3](https://github.com/surlymochan/swrm/issues/3).
@@ -51,7 +55,7 @@ For these synthetic tasks, every arm runs `grok-4.7-high` through the local `cur
 | openswarm (planner + worktree executor + host verify) | 24/24 (100%) | 220 s (137–356) | 207k / 64k | 24 |
 | oh-my-openagent | not run ¹ | – | – | 0 |
 
-On tasks this small the single agent already succeeds every time. openswarm's planner call and isolated, verified run
+On tasks this small the single agent already succeeds every time. swrm's planner call and isolated, verified run
 cost about 4× the time and 2× the tokens.
 ¹ OmO runs inside OpenCode/senpi with its own provider logins. Cursor's subscription can't serve it, and paid APIs were out of scope for
 this benchmark. The estimated metered cost to run it on DeepSeek is about $1.3 ([details](bench/e2e/README.md#results-2026-10-17-first-round)).
@@ -71,8 +75,8 @@ providers for both routers (Codex subscription, OpenCode Go, DeepSeek). Costs ar
 | Routing decision latency, in-process median | **0.014 ms** | 0.026 ms | – |
 | Providers / model ids known to the router | 3 backends / 27 | **26 / 36** | – |
 
-openswarm reads quota windows before it routes, so it never spends an attempt on an exhausted plan. By design, OmO
-learns about an exhausted plan from the usage-limit error and then moves to the next rung. openswarm's review routing
+swrm reads quota windows before it routes, so it never spends an attempt on an exhausted plan. By design, OmO
+learns about an exhausted plan from the usage-limit error and then moves to the next rung. swrm's review routing
 spreads off the router's own workhorse family, so a review stays on a different family from the implementer even
 when implementation work has spilled off Codex onto OpenCode Go; OmO still covers far more providers.
 When quota leaves only the implementer's own family (the bench's `mixed_late_week`), a review degrades explicitly
@@ -81,12 +85,13 @@ instead of silently re-using the implementer's model: a sibling model in that fa
 model-level independence there is 66.7%, and 95.2% overall.
 ² 49 of OmO's 111 unrouted decisions are `writing` tasks. In OmO that chain only names Google/Anthropic models, which this provider set does not connect.
 
-openswarm is a quota-aware dispatcher for coding agents. Your planner (Claude Code) breaks work into tasks and
-reviews the results. openswarm sends each task to the cheapest executor that can handle it, runs it in an
+swrm is a distributed, heterogeneous agent task dispatcher for coding agents: it routes each task by live
+quota across model families. Your planner (Claude Code) breaks work into tasks and
+reviews the results. swrm sends each task to the cheapest executor that can handle it, runs it in an
 isolated git worktree with a hard time budget, checks the result on the host, and reports back. Nothing
 runs forever.
 
-![openswarm demo](docs/demo.gif)
+![swrm demo](docs/demo.gif)
 
 <sub>The demo runs offline against a synthetic quota state (`examples/demo-state.json`), so you can reproduce
 it without any backend installed.</sub>
@@ -606,7 +611,7 @@ The full rules are in [`SKILL.md`](SKILL.md#7-routing-rules-what-route-does). Ev
         └───────┬──────────────────────────────────────▲───────────┘
                 │ openswarm run / route / watch           │ result.json, diff, verify
         ┌───────▼──────────────────────────────────────┴───────────┐
-        │ openswarm                                                   │
+        │ swrm                                                        │
         │  probe ─► state.json (models, tiers, quotas, breakers)   │
         │  route ─► backend/model/effort + reasons + fallbacks     │
         │  run   ─► git worktree ─► executor ─► commit ─► verify   │
