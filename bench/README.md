@@ -71,7 +71,7 @@ OmO has no type field. The category mapping is a judgment:
 
 Token estimates are a formula, not a measurement. fast is 8k/0.8k input/output, balanced 22k/3k, deep 64k/9k. A context of at least 220k replaces the input with that context and sets output to 1.5k. Review and audit inputs are at least 36k and outputs at least 4k. Context for an ordinary task is 8k, 24k, or 48k by tier. The large-read tasks set 280k or 640k explicitly.
 
-The reference implementer, for the independence metric, is the model chosen for the first `impl` at difficulty 3 whose context is under 220k (`t06`), in that same scenario. A review counts as independent when its model family differs from that implementer's family. An unrouted review does not.
+The reference implementer, for the independence metric, is the model chosen for the first `impl` at difficulty 3 whose context is under 220k (`t06`), in that same scenario. A review counts as family-independent when its model family differs from that implementer's family, and as model-independent when its model differs from the implementer's model, even inside the same family. A review that stays in the reference family is a degraded (single-family) review; openswarm flags the ones it knowingly degrades with `degraded: single-family` on the decision. An unrouted review counts as neither.
 
 An unrouted decision counts as under-provisioned. The unrouted rate is also reported alone.
 
@@ -148,7 +148,7 @@ Outputs in `bench/results/`:
 | `latency_openswarm.json`, `latency_omo.json` | Median and p95 |
 | `environment.json` | CPU, core count, OS, kernel, Python, bun, both commits, date, commands |
 
-A decision carries `task_id`, `scenario`, `tool`, `backend`, `provider`, `model`, `effort`, `variant`, `tier`, `attempts`, `failed_attempts`, and `reasons`. `attempts` includes failed attempts on an exhausted quota.
+A decision carries `task_id`, `scenario`, `tool`, `backend`, `provider`, `model`, `effort`, `variant`, `tier`, `attempts`, `failed_attempts`, and `reasons`. `attempts` includes failed attempts on an exhausted quota. An openswarm review that stays in the implementer's family also carries `degraded: "single-family"`.
 
 Baselines have no fallback. If the single model is exhausted they record one failed attempt and no model. A hot-but-not-exhausted Go model (usage 0.90) does not fail a baseline, because a naive caller would not see a usage-limit error yet.
 
@@ -156,7 +156,7 @@ Baselines have no fallback. If the single model is exhausted they record one fai
 
 - Wasted first attempts: share of decisions whose first try hit an exhausted quota, per scenario and overall. Total failed attempts are reported beside that, because a chain can miss more than once.
 - Unrouted: decisions that end with no model. Broken down by OmO category and reason. On this provider set a category can be unrouted because its chain names only providers that are not connected (the `writing` chain names Google and Anthropic), or because every reachable rung hit a usage-limit error. That is a consequence of connecting Codex, OpenCode Go, and DeepSeek, not of OmO in general.
-- Review independence: share of review and audit tasks whose model family differs from the scenario's reference implementer.
+- Review independence, two levels: family level is the share of review and audit tasks whose model family differs from the scenario's reference implementer; model level is the share whose model differs from the implementer's model, even inside the same family. Reviews that stay in the reference family are counted as degraded, with sub-counts for how many still ran on a different model and how many carry the router's `degraded: single-family` mark.
 - Computed cost: metered USD (DeepSeek), OpenCode Go accounting USD, and Codex token totals. Subscription usage is the sum across scenarios and the mean per scenario. Each scenario is one pass over the 80-task trace, so the per-pass figure is the share of the nominal 5h budget one pass would use. Failed attempts add no token cost. The call was rejected before generation.
 - Coverage: distinct providers and model ids referenced by OmO model-core category and agent fallback chains, and the number of categories, counted from the pinned commit. Compared with openswarm's three backends and the model ids in `policy.json`.
 - Agreement with the difficulty→tier rubric: exact, over, under against `min_tier`. This is not a quality score and it is not the headline. openswarm agrees by construction when quota allows. Unrouted is included in under.
@@ -191,13 +191,13 @@ python3 bench/score.py --openswarm bench/results/openswarm.jsonl --out-dir bench
 
 Per-pass shares are the mean of the seven scenarios. Each scenario is one pass over the 80-task trace. The sum adds those seven passes. A fresh Codex-baseline pass uses 2.4937 of the nominal Codex window; the mean is lower because the two hard-Codex scenarios contribute 0.
 
-| Tool | Wasted first | Unrouted | Review independence | Failed attempts | Metered USD | Go account USD | Go 5h share per pass | Go 5h share (sum) | Codex 5h share per pass | Codex 5h share (sum) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| openswarm | 0.0% | 0.0% | 85.7% | 0 | 0.0000 | 31.0513 | 1.4378 | 10.0651 | 0.4763 | 3.3338 |
-| OmO | 23.4% | 19.8% | 71.4% | 254 | 1.5396 | 23.0340 | 1.0969 | 7.6780 | 0.8502 | 5.9512 |
-| Codex default | 28.6% | 28.6% | 0.0% | 160 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 1.7812 | 12.4685 |
-| strongest | 28.6% | 28.6% | 0.0% | 160 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 1.7812 | 12.4685 |
-| cheapest | 0.0% | 0.0% | 0.0% | 0 | 0.0000 | 4.0443 | 0.0481 | 0.3370 | 0.0000 | 0.0000 |
+| Tool | Wasted first | Unrouted | Review independence (family) | Review independence (model) | Failed attempts | Metered USD | Go account USD | Go 5h share per pass | Go 5h share (sum) | Codex 5h share per pass | Codex 5h share (sum) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| openswarm | 0.0% | 0.0% | 85.7% | 95.2% | 0 | 0.0000 | 30.6145 | 1.4159 | 9.9117 | 0.4763 | 3.3338 |
+| OmO | 23.4% | 19.8% | 71.4% | 71.4% | 254 | 1.5396 | 23.0340 | 1.0969 | 7.6780 | 0.8502 | 5.9512 |
+| Codex default | 28.6% | 28.6% | 0.0% | 0.0% | 160 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 1.7812 | 12.4685 |
+| strongest | 28.6% | 28.6% | 0.0% | 0.0% | 160 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 1.7812 | 12.4685 |
+| cheapest | 0.0% | 0.0% | 0.0% | 0.0% | 0 | 0.0000 | 4.0443 | 0.0481 | 0.3370 | 0.0000 | 0.0000 |
 
 ### Unrouted decisions by OmO category
 
@@ -250,7 +250,7 @@ OmO's 26 providers and 36 model ids are the union of the category fallback chain
 
 ### Review independence by scenario
 
-Twelve review or audit tasks per scenario.
+Twelve review or audit tasks per scenario. Family level first:
 
 | Scenario | openswarm | OmO | Codex default | strongest | cheapest |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -262,14 +262,28 @@ Twelve review or audit tasks per scenario.
 | mixed_late_week | 0.0% | 33.3% | 0.0% | 0.0% | 0.0% |
 | tight_friday | 100.0% | 0.0% | 0.0% | 0.0% | 0.0% |
 
+Model level (a different model than the reference implementer, even in the same family):
+
+| Scenario | openswarm | OmO | Codex default | strongest | cheapest |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| fresh | 100.0% | 100.0% | 0.0% | 0.0% | 0.0% |
+| codex_soft_90 | 100.0% | 100.0% | 0.0% | 0.0% | 0.0% |
+| codex_hard_97 | 100.0% | 66.7% | 0.0% | 0.0% | 0.0% |
+| ocgo_hot | 100.0% | 100.0% | 0.0% | 0.0% | 0.0% |
+| deepseek_floor | 100.0% | 100.0% | 0.0% | 0.0% | 0.0% |
+| mixed_late_week | 66.7% | 33.3% | 0.0% | 0.0% | 0.0% |
+| tight_friday | 100.0% | 0.0% | 0.0% | 0.0% | 0.0% |
+
+openswarm: 12 of 84 reviews stayed in the reference family (degraded); 8 of those still ran on a different model, and 6 carry the router's `degraded: single-family` mark.
+
 ### How the objective numbers move
 
 - At 90% of the Codex window, openswarm moves difficulty ≤ 3 off Codex and lowers effort on the rest. OmO's decisions match the fresh scenario. 90% is not an error it can see, so it wastes nothing there.
 - At 97%, openswarm skips Codex before the call (wasted first attempts 0). OmO's first Codex pick fails and it walks the chain: 52.5% of tasks in that scenario waste the first attempt. Across all seven scenarios that is 254 failed attempts. `ultrabrain`, `deep-high`, and `deep-low` then stay unresolved when every reachable Codex rung is exhausted.
 - `writing` is unrouted for OmO in all 7 tasks × 7 scenarios. The chain names Google and Anthropic models only, and `requiresAnyModel` blocks a fallthrough. Those providers are not in this set.
 - A DeepSeek balance of ¥3 changes no decision for either tool. OmO's metered total ($1.54) comes from scenarios where a Codex or Go rung has already failed and the chain reaches `deepseek-flash` or `deepseek-v4-pro`.
-- Review independence is 85.7% for openswarm and 71.4% for OmO (openswarm side regenerated 2026-11-04; the OmO decision file is the checked-in pinned one). openswarm's review picks spread off the router's workhorse family inside the OpenCode Go tier, so a review stays independent even when the reference implementer has spilled off Codex onto that same Go family (100% at the soft and hard Codex limits and on tight Friday). The remaining loss is `mixed_late_week` (0%), where quota leaves a single usable Go family, so no different-family candidate exists at any tier.
-- One pass of the trace uses 0.4763 of the nominal Codex 5h budget under openswarm and 0.8502 under OmO, averaged across the seven scenarios. The two Codex baselines average 1.7812 because five of the scenarios put the whole trace on Codex (2.4937 each) and the two hard-Codex scenarios use none. OpenCode Go's per-pass share is 1.4378 for openswarm and 1.0969 for OmO. That share can exceed 1 because it sums fractions of small per-model windows.
+- Review independence is 85.7% for openswarm and 71.4% for OmO at family level (openswarm side regenerated 2026-11-04; the OmO decision file is the checked-in pinned one). openswarm's review picks spread off the router's workhorse family inside the OpenCode Go tier, so a review stays independent even when the reference implementer has spilled off Codex onto that same Go family (100% at the soft and hard Codex limits and on tight Friday). The remaining family-level loss is `mixed_late_week` (0%): at the tiers a review can use, quota leaves a single usable family — the implementer's own. There the router now degrades explicitly: a sibling model of that family, a shifted effort, and a `degraded: single-family` flag on the decision, rather than silently re-using the implementer's model (before this change, 10 of the 12 reviews there ran on the implementer's exact model). Model-level independence for openswarm is 95.2% overall and 66.7% in `mixed_late_week`; the four reviews still on the reference model there are the difficulty-4/5 ones, whose own implementer proxy is Codex — against that implementer they are cross-family, and the one-reference scoring rule is what makes them look same-model.
+- One pass of the trace uses 0.4763 of the nominal Codex 5h budget under openswarm and 0.8502 under OmO, averaged across the seven scenarios. The two Codex baselines average 1.7812 because five of the scenarios put the whole trace on Codex (2.4937 each) and the two hard-Codex scenarios use none. OpenCode Go's per-pass share is 1.4159 for openswarm and 1.0969 for OmO. That share can exceed 1 because it sums fractions of small per-model windows.
 - On tight Friday, openswarm wastes nothing and leaves nothing unrouted, and its Go per-pass share falls to 0.0481, the same flash-only figure as the cheapest baseline. OmO wastes the first attempt on 91.2% of those tasks.
 
 ### Agreement with the difficulty→tier rubric

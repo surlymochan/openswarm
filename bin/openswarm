@@ -2902,10 +2902,15 @@ def ocgo_pick(prof, st, policy, tier, notes):
     if "ocgo/all" in br:  # plan-wide usage limit: no OpenCode Go model can run
         return None, "ocgo plan usage limit (breaker open)"
     hot = []
-    for t in TIER_FALLBACK[tier]:
+
+    def collect(t):
         cands = []
         for m in st["ocgo"]["models"]:
             if m["excluded"] or m["tier"] != t or f"ocgo/{m['id']}" in br:
+                continue
+            if prof.get("_exclude_model") and m["id"] == prof["_exclude_model"]:
+                continue
+            if prof.get("_same_family_only") and m.get("family") != prof["_same_family_only"]:
                 continue
             if prof.get("context_tokens") and (m.get("context") or 1e9) < prof["context_tokens"] * 1.15:
                 continue
@@ -2914,17 +2919,31 @@ def ocgo_pick(prof, st, policy, tier, notes):
                 hot.append(m["id"])
                 continue
             cands.append((u, m))
+        # newest release first, then most headroom
+        cands.sort(key=lambda x: (-(int((x[1].get("release_date") or "0").replace("-", "") or 0)), x[0]))
+        return cands
+
+    is_review = prof.get("type") in ((policy.get("routing") or {}).get("review_types") or [])
+    for t in TIER_FALLBACK[tier]:
+        cands = collect(t)
         if cands:
-            # newest release first, then most headroom
-            cands.sort(key=lambda x: (-(int((x[1].get("release_date") or "0").replace("-", "") or 0)), x[0]))
-            if prof.get("type") in ((policy.get("routing") or {}).get("review_types") or []):
+            if is_review:
                 # Independent review: leaving the GPT family is not enough when
                 # implementation work itself spilled onto OpenCode Go — the
                 # review would land on the same workhorse family that wrote
                 # the code. When this tier offers another family, take the
                 # best of those instead of the router's first-choice family.
                 families = {x[1].get("family") for x in cands}
-                if len(families) > 1:
+                impl_fam = prof.get("_impl_family")
+                if len(families) > 1 and impl_fam in families:
+                    # route() resolved the implementer's family; the one
+                    # outcome to avoid is landing the review on that family.
+                    indep = [x for x in cands if x[1].get("family") != impl_fam]
+                    notes.append(f"review: family spread — {indep[0][1]['id']} "
+                                 f"({indep[0][1].get('family')}) avoids the implementer's "
+                                 f"{impl_fam} family for an independent second opinion")
+                    cands = indep
+                elif len(families) > 1:
                     workhorse = cands[0][1]
                     alt = [x for x in cands if x[1].get("family") != workhorse.get("family")]
                     if alt:
@@ -2932,6 +2951,45 @@ def ocgo_pick(prof, st, policy, tier, notes):
                                      f"({alt[0][1].get('family')}) over workhorse family "
                                      f"{workhorse.get('family')} for an independent second opinion")
                         cands = alt
+                elif not impl_fam or impl_fam == cands[0][1].get("family"):
+                    # Single-family tier, and that family is the implementer's
+                    # (or the implementer is unknown): no cross-family review
+                    # is possible here, so degrade explicitly instead of
+                    # silently landing on the implementer's own model. Take a
+                    # different model of the same family — this tier first,
+                    # then the rest of the fallback chain — and flag the pick
+                    # so plan_ocgo can mark the decision
+                    # `degraded: single-family` and shift the effort. A
+                    # different family deeper in the chain is deliberately
+                    # not taken: that would trade the review's tier for the
+                    # independence label.
+                    fam = cands[0][1].get("family")
+                    natural = cands[0][1]
+                    sibling = cands[1][1] if len(cands) > 1 else None
+                    sib_tier = t
+                    if sibling is None:
+                        chain = TIER_FALLBACK[tier]
+                        for t2 in chain[chain.index(t) + 1:]:
+                            pool = [m for _, m in collect(t2) if m.get("family") == fam]
+                            if pool:
+                                sibling, sib_tier = pool[0], t2
+                                break
+                    pick = dict(sibling or natural)
+                    pick["_review_degraded"] = "single-family"
+                    if sibling is not None and sib_tier != t:
+                        notes.append(f"review: degraded single-family — no sibling {fam} model at tier {t}; "
+                                     f"using {pick['id']} at tier {sib_tier}")
+                    elif sibling is not None:
+                        notes.append(f"review: degraded single-family — {pick['id']} ({fam}) instead of "
+                                     f"{natural['id']}; no second family has headroom at tier {t}")
+                    else:
+                        notes.append(f"review: degraded single-family — no second {fam} model with headroom; "
+                                     f"reviewing on {natural['id']} with shifted effort")
+                    if sib_tier != tier:
+                        notes.append(f"ocgo tier {tier} unavailable, using {sib_tier}")
+                    if hot:
+                        notes.append(f"ocgo skipped {len(hot)} model(s) over {th['window_soft']:.0%} of window budget")
+                    return pick, sib_tier
             if t != tier:
                 notes.append(f"ocgo tier {tier} unavailable, using {t}")
             if hot:
@@ -2950,8 +3008,21 @@ def plan_ocgo(prof, st, policy, forced, notes):
     if not m:
         return None, "no ocgo model with headroom"
     variant = clamp_effort(want["effort"], m["variants"], policy) if m["variants"] else None
-    return {"backend": "ocgo", "model": m["id"], "effort": variant, "tier": t,
-            "opencode_model": f"opencode-go/{m['id']}"}, None
+    d = {"backend": "ocgo", "model": m["id"], "effort": variant, "tier": t,
+         "opencode_model": f"opencode-go/{m['id']}"}
+    if m.get("_review_degraded"):
+        # Single-family review (see ocgo_pick): the decision itself carries
+        # the degraded flag so no report can mistake it for a cross-family
+        # independent review, and the effort shifts one step so the reviewer
+        # does not mirror the implementer's settings.
+        d["degraded"] = m["_review_degraded"]
+        if variant:
+            shifted = clamp_effort(shift_effort(variant, 1, policy), m["variants"], policy)
+            if shifted != variant:
+                d["effort"] = shifted
+                notes.append(f"review: degraded effort {variant} -> {shifted} "
+                             f"so the review does not mirror the implementer's settings")
+    return d, None
 
 
 def plan_deepseek(prof, st, policy, forced, notes):
@@ -3214,50 +3285,89 @@ def concurrency(st, policy):
 
 def route(prof, st, policy, exclude=()):
     r = policy["routing"]
-    notes = []
     default_order = list(r["default_order"])
 
     def prioritize(preferred):
         return [backend for backend in preferred if backend in default_order] + [
             backend for backend in default_order if backend not in preferred]
 
-    if prof.get("backend"):
-        order = [canonical_backend(prof["backend"])]
-    elif prof["type"] in r["review_types"]:
-        if any(backend in default_order for backend in ("ocgo", "deepseek")):
-            order = prioritize(("ocgo", "codex", "deepseek"))
-            notes.append("review: prefer a non-GPT family for an independent second opinion")
+    def attempt(p, notes):
+        """One pass over the backend planners for profile p."""
+        if p.get("backend"):
+            order = [canonical_backend(p["backend"])]
+        elif p["type"] in r["review_types"]:
+            if any(backend in default_order for backend in ("ocgo", "deepseek")):
+                order = prioritize(("ocgo", "codex", "deepseek"))
+                notes.append("review: prefer a non-GPT family for an independent second opinion")
+            else:
+                order = default_order
+        elif p["difficulty"] <= r["ocgo_first_max_difficulty"] and p["type"] in r["ocgo_first_types"]:
+            if "ocgo" in default_order:
+                order = prioritize(("ocgo", "codex", "deepseek"))
+                notes.append("low-difficulty mechanical work: OpenCode Go first to save Codex")
+            else:
+                order = default_order
         else:
             order = default_order
-    elif prof["difficulty"] <= r["ocgo_first_max_difficulty"] and prof["type"] in r["ocgo_first_types"]:
-        if "ocgo" in default_order:
-            order = prioritize(("ocgo", "codex", "deepseek"))
-            notes.append("low-difficulty mechanical work: OpenCode Go first to save Codex")
-        else:
-            order = default_order
-    else:
-        order = default_order
-    if prof.get("context_tokens", 0) > r["large_context_tokens"] and not prof.get("backend"):
-        context_backends = [backend for backend in ("ocgo", "deepseek") if backend in order]
-        if context_backends:
-            order = context_backends + [backend for backend in order if backend not in context_backends]
-            notes.append("context exceeds codex window: prefer 1M-context backends")
-    order = [b for b in order if b not in exclude]
-    skipped = {}
-    for b in order:
-        d, why = PLANNERS[b](prof, st, policy, bool(prof.get("backend")), notes)
-        if d:
-            if prof.get("model"):
-                d["model"] = prof["model"]
-                if b in ("ocgo", "deepseek"):
-                    d["opencode_model"] = f"{'opencode-go' if b == 'ocgo' else 'deepseek'}/{prof['model']}"
-            if prof.get("effort"):
-                d["effort"] = prof["effort"]
-            mode, why_c = claude_mode(st, policy)
-            return {"ok": True, **d, "fallbacks": [x for x in order if x != b],
-                    "claude_review": mode, "reasons": list(dict.fromkeys(notes + [why_c])), "skipped": skipped,
-                    "concurrency": concurrency(st, policy), "profile": prof}
-        skipped[b] = why
+        if p.get("context_tokens", 0) > r["large_context_tokens"] and not p.get("backend"):
+            context_backends = [backend for backend in ("ocgo", "deepseek") if backend in order]
+            if context_backends:
+                order = context_backends + [backend for backend in order if backend not in context_backends]
+                notes.append("context exceeds codex window: prefer 1M-context backends")
+        order = [b for b in order if b not in exclude]
+        skipped = {}
+        for b in order:
+            d, why = PLANNERS[b](p, st, policy, bool(p.get("backend")), notes)
+            if d:
+                if p.get("model"):
+                    d["model"] = p["model"]
+                    d.pop("degraded", None)  # a forced model is the caller's choice, not a router degradation
+                    if b in ("ocgo", "deepseek"):
+                        d["opencode_model"] = f"{'opencode-go' if b == 'ocgo' else 'deepseek'}/{p['model']}"
+                if p.get("effort"):
+                    d["effort"] = p["effort"]
+                return d, order, skipped
+            skipped[b] = why
+        return None, order, skipped
+
+    notes = []
+    plan_prof = prof
+    proxy = None
+    if prof["type"] in r["review_types"] and not prof.get("backend") and not prof.get("model"):
+        # Resolve who would implement this work, so the review can be checked
+        # against the implementer's family instead of a per-tier proxy. The
+        # planners see the family/model as private profile keys; the caller's
+        # profile is never mutated.
+        proxy_d, _, _ = attempt({**prof, "type": "impl"}, [])
+        if proxy_d:
+            proxy = {"backend": proxy_d["backend"], "model": proxy_d.get("model"),
+                     "family": compare_backend_family(proxy_d["backend"], proxy_d.get("model"), policy, st)}
+            plan_prof = {**prof, "_impl_family": proxy["family"], "_impl_model": proxy["model"]}
+    d, order, skipped = attempt(plan_prof, notes)
+    if d and proxy:
+        fam = compare_backend_family(d["backend"], d.get("model"), policy, st)
+        if fam == proxy["family"] and d.get("model") == proxy["model"] and d["backend"] == "ocgo":
+            # Same model as the implementer: one retry with that model
+            # excluded and the pool restricted to the implementer's family,
+            # which lands on a sibling model (see ocgo_pick's degraded path).
+            retry_notes = []
+            d2, order2, skipped2 = attempt({**plan_prof, "_exclude_model": proxy["model"],
+                                            "_same_family_only": proxy["family"]}, retry_notes)
+            if d2 and d2["backend"] == "ocgo" and d2.get("model") != proxy["model"]:
+                d, order, skipped, notes = d2, order2, skipped2, retry_notes
+                fam = compare_backend_family(d["backend"], d.get("model"), policy, st)
+        if fam == proxy["family"] and "degraded" not in d:
+            # A review that stays in the implementer's family is degraded by
+            # construction; mark it on the decision so no report can present
+            # it as a cross-family independent review.
+            d["degraded"] = "single-family"
+            notes.append(f"review: degraded single-family — the reviewer is in the implementer's "
+                         f"{proxy['family']} family, not a cross-family independent review")
+    if d:
+        mode, why_c = claude_mode(st, policy)
+        return {"ok": True, **d, "fallbacks": [x for x in order if x != d["backend"]],
+                "claude_review": mode, "reasons": list(dict.fromkeys(notes + [why_c])), "skipped": skipped,
+                "concurrency": concurrency(st, policy), "profile": prof}
     return {"ok": False, "reasons": list(dict.fromkeys(notes)), "skipped": skipped, "profile": prof}
 
 

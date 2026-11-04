@@ -170,6 +170,8 @@ def decision(task, scenario, routed, index):
         "failed_attempts": 0,
         "reasons": reasons,
     }
+    if ok and routed.get("degraded"):
+        row["degraded"] = routed["degraded"]
     return row
 
 

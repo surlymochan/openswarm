@@ -140,6 +140,59 @@ class RoutingScenarios(unittest.TestCase):
         self.assertNotEqual(fam[review["model"]], fam[impl["model"]])
         self.assertTrue(any("family spread" in r for r in review["reasons"]))
 
+    def test_22_single_family_review_degrades_to_sibling_model(self):
+        # The balanced tier offers two models of one family only, and that
+        # family is the implementer's. A review must degrade explicitly: the
+        # sibling model, a `degraded: single-family` flag and a shifted
+        # effort — never the implementer's own model dressed as independent.
+        st = scenario(codex_week=0.90)  # codex soft limit: work spills to ocgo
+        sibling = copy.deepcopy(next(m for m in st["ocgo"]["models"] if m["tier"] == "balanced"))
+        sibling.update({"id": "mid-coder-older", "name": "mid-coder-older", "release_date": "2026-07-01"})
+        st["ocgo"]["models"].append(sibling)
+        impl = xs.route(prof(d=3), st, OPT_IN_POLICY)
+        self.assertEqual(impl["model"], "mid-coder")
+        self.assertNotIn("degraded", impl)
+        review = xs.route(prof("review", 3), st, OPT_IN_POLICY)
+        self.assertEqual(review["backend"], "ocgo")
+        self.assertEqual(review["model"], "mid-coder-older")
+        self.assertEqual(review.get("degraded"), "single-family")
+        self.assertEqual(review["effort"], "high")  # medium, shifted one step
+        self.assertTrue(any("degraded single-family" in r for r in review["reasons"]))
+
+    def test_23_single_family_review_widens_the_chain_for_a_sibling(self):
+        # Balanced has a single model; a same-family sibling exists at fast.
+        # The review widens the fallback chain to that sibling and degrades,
+        # instead of taking the different family waiting at deep.
+        st = scenario(codex_week=0.90)
+        for m in st["ocgo"]["models"]:
+            if m["id"] == "cheap-flash":
+                m["family"] = "b"  # same family as the balanced mid-coder
+        review = xs.route(prof("review", 3), st, OPT_IN_POLICY)
+        self.assertEqual(review["model"], "cheap-flash")
+        self.assertEqual(review["tier"], "fast")
+        self.assertEqual(review.get("degraded"), "single-family")
+
+    def test_24_single_family_review_without_any_sibling_still_degrades(self):
+        # Only the implementer's own model has headroom anywhere: the review
+        # stays on it, but the decision is still flagged degraded.
+        st = scenario(codex_week=0.90)
+        for m in st["ocgo"]["models"]:
+            if m["id"] != "mid-coder":
+                m["usage"] = {"5h": 0.9, "7d": 0.9, "30d": 0.9}
+        review = xs.route(prof("review", 3), st, OPT_IN_POLICY)
+        self.assertEqual(review["model"], "mid-coder")
+        self.assertEqual(review.get("degraded"), "single-family")
+        self.assertEqual(review["effort"], "high")
+
+    def test_25_ocgo_single_family_tier_is_not_degraded_when_implementer_is_elsewhere(self):
+        # The ocgo tier offers one family, but implementation stayed on
+        # Codex: the review is genuinely cross-family and must not be
+        # flagged degraded.
+        st = scenario()  # fresh codex: impl routes to codex
+        review = xs.route(prof("review", 3), st, OPT_IN_POLICY)
+        self.assertEqual(review["backend"], "ocgo")
+        self.assertNotIn("degraded", review)
+
     def test_21_impl_does_not_spread(self):
         st = scenario(codex_week=0.90)
         newer = copy.deepcopy(next(m for m in st["ocgo"]["models"] if m["tier"] == "balanced"))

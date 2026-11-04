@@ -8,11 +8,11 @@
   ],
   "cores": 8,
   "cpu": "Intel(R) Xeon(R) Processor",
-  "date": "2026-11-03T17:30:14Z",
+  "date": "2026-11-03T23:41:30Z",
   "kernel": "6.12.94+",
   "omo_commit": "07776864a043acdda9f9976ac8f71659a25f1d86",
   "omo_dir": "<omo-dir>",
-  "openswarm_commit": "6d5c3c555c2b2275924dacf9dd35c5e3c770b58a",
+  "openswarm_commit": "840b8682b070a2a4b562fedb8a51deeb7643d3df",
   "os": "Linux-6.12.94+-x86_64-with-glibc2.41",
   "python": "3.13.5"
 }

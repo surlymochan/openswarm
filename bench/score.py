@@ -178,6 +178,7 @@ def score_block(tool, scenario, rows, by_task, by_model, families, budget, frac_
     n = len(rows)
     exact = over = under = unrouted = wasted = failed_sum = 0
     review_n = review_ok = 0
+    review_model_ok = review_degraded_n = review_degraded_flagged = review_degraded_model_ok = 0
     metered = ocgo_usd = 0.0
     ocgo_share = 0.0
     codex_tokens = 0
@@ -185,11 +186,9 @@ def score_block(tool, scenario, rows, by_task, by_model, families, budget, frac_
     refs = {}
     if scenario == "ALL":
         for sid in {r["scenario"] for r in rows}:
-            fam, model = reference_family([r for r in rows if r["scenario"] == sid], by_task.values(), families)
-            refs[sid] = fam
+            refs[sid] = reference_family([r for r in rows if r["scenario"] == sid], by_task.values(), families)
     else:
-        fam, model = reference_family(rows, by_task.values(), families)
-        refs[scenario] = fam
+        refs[scenario] = reference_family(rows, by_task.values(), families)
     for row in rows:
         task = by_task[row["task_id"]]
         kind = adequacy(row.get("tier"), task["min_tier"])
@@ -207,9 +206,20 @@ def score_block(tool, scenario, rows, by_task, by_model, families, budget, frac_
         if task["independent_review"]:
             review_n += 1
             fam = families.get(row.get("model") or "")
-            ref = refs.get(row["scenario"])
-            if fam and ref and fam != ref:
+            ref_fam, ref_model = refs.get(row["scenario"]) or (None, None)
+            if fam and ref_fam and fam != ref_fam:
                 review_ok += 1
+            if row.get("model") and ref_model and row["model"] != ref_model:
+                review_model_ok += 1
+            if fam and ref_fam and fam == ref_fam:
+                # Single-family outcome: a degraded review, never counted as
+                # family-independent. Track whether the router marked it and
+                # whether it still bought model-level separation.
+                review_degraded_n += 1
+                if row.get("degraded") == "single-family":
+                    review_degraded_flagged += 1
+                if row.get("model") and ref_model and row["model"] != ref_model:
+                    review_degraded_model_ok += 1
         model = by_model.get(row.get("model") or "")
         if not model:
             continue
@@ -242,6 +252,11 @@ def score_block(tool, scenario, rows, by_task, by_model, families, budget, frac_
         "review_n": review_n,
         "review_independent": review_ok,
         "review_independent_rate": rate(review_ok, review_n),
+        "review_model_independent": review_model_ok,
+        "review_model_independent_rate": rate(review_model_ok, review_n),
+        "review_degraded": review_degraded_n,
+        "review_degraded_flagged": review_degraded_flagged,
+        "review_degraded_model_independent": review_degraded_model_ok,
         "metered_usd": round(metered, 4),
         "ocgo_account_usd": round(ocgo_usd, 4),
         "ocgo_5h_share": round(ocgo_share, 4),
@@ -267,6 +282,8 @@ def write_csv(path, blocks):
         "exact_rate", "over_rate", "under_rate", "unrouted_rate",
         "wasted_first", "wasted_first_rate", "failed_attempts",
         "review_n", "review_independent", "review_independent_rate",
+        "review_model_independent", "review_model_independent_rate",
+        "review_degraded", "review_degraded_flagged", "review_degraded_model_independent",
         "metered_usd", "ocgo_account_usd", "ocgo_5h_share", "ocgo_5h_share_per_pass",
         "codex_tokens", "codex_5h_share", "codex_5h_share_per_pass",
         "metered_usd_per_pass", "ocgo_account_usd_per_pass",
@@ -564,16 +581,17 @@ def write_summary(path, blocks, env, latency_notes, breakdown, coverage):
     lines.append("")
     lines.append("## Objective metrics")
     lines.append("")
-    lines.append("| Tool | Wasted first | Unrouted | Review independence | Failed attempts | Metered USD | Go account USD | Go 5h share per pass | Go 5h share (sum) | Codex 5h share per pass | Codex 5h share (sum) | Codex tokens (sum) |")
-    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+    lines.append("| Tool | Wasted first | Unrouted | Review independence (family) | Review independence (model) | Failed attempts | Metered USD | Go account USD | Go 5h share per pass | Go 5h share (sum) | Codex 5h share per pass | Codex 5h share (sum) | Codex tokens (sum) |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     for block in blocks:
         o = block["overall"]
         lines.append(
-            "| {tool} | {wasted} | {unrouted} | {review} | {failed} | {metered:.4f} | {go:.4f} | {go_pass:.4f} | {go_sum:.4f} | {cx_pass:.4f} | {cx_sum:.4f} | {tokens} |".format(
+            "| {tool} | {wasted} | {unrouted} | {review} | {review_model} | {failed} | {metered:.4f} | {go:.4f} | {go_pass:.4f} | {go_sum:.4f} | {cx_pass:.4f} | {cx_sum:.4f} | {tokens} |".format(
                 tool=display_name(o["tool"]),
                 wasted=fmt_pct(o["wasted_first_rate"]),
                 unrouted=fmt_pct(o["unrouted_rate"]),
                 review=fmt_pct(o["review_independent_rate"]),
+                review_model=fmt_pct(o["review_model_independent_rate"]),
                 failed=o["failed_attempts"],
                 metered=o["metered_usd"],
                 go=o["ocgo_account_usd"],
@@ -624,7 +642,24 @@ def write_summary(path, blocks, env, latency_notes, breakdown, coverage):
     lines.append("")
     lines.append("## Review independence by scenario")
     lines.append("")
+    lines.append("Family level: the review ran in a different model family than the scenario's reference implementer.")
+    lines.append("")
     lines.extend(scenario_table(blocks, lambda s: fmt_pct(s["review_independent_rate"])))
+    lines.append("")
+    lines.append("## Review model-level independence by scenario")
+    lines.append("")
+    lines.append("Model level: the review ran on a different model than the reference implementer, even inside the same family. Reviews that stay in the reference family are degraded (single-family); openswarm flags the ones it knowingly degrades with `degraded: single-family` on the decision itself.")
+    lines.append("")
+    lines.extend(scenario_table(blocks, lambda s: fmt_pct(s["review_model_independent_rate"])))
+    lines.append("")
+    for block in blocks:
+        o = block["overall"]
+        if o["review_degraded"]:
+            lines.append(
+                f"- {display_name(o['tool'])}: {o['review_degraded']} of {o['review_n']} reviews stayed in the "
+                f"reference family (degraded); {o['review_degraded_model_independent']} of those still ran on a "
+                f"different model, and {o['review_degraded_flagged']} carry the router's `degraded: single-family` mark."
+            )
     lines.append("")
     lines.append("## Agreement with the difficulty→tier rubric")
     lines.append("")

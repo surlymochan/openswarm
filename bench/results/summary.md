@@ -10,13 +10,13 @@ The chart is `bench/results/chart.svg`. It plots the objective rates and the Cod
 
 ## Objective metrics
 
-| Tool | Wasted first | Unrouted | Review independence | Failed attempts | Metered USD | Go account USD | Go 5h share per pass | Go 5h share (sum) | Codex 5h share per pass | Codex 5h share (sum) | Codex tokens (sum) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| openswarm | 0.0% | 0.0% | 85.7% | 0 | 0.0000 | 31.0513 | 1.4378 | 10.0651 | 0.4763 | 3.3338 | 6667600 |
-| OmO | 23.4% | 19.8% | 71.4% | 254 | 1.5396 | 23.0340 | 1.0969 | 7.6780 | 0.8502 | 5.9512 | 11902500 |
-| Codex default | 28.6% | 28.6% | 0.0% | 160 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 1.7812 | 12.4685 | 24937000 |
-| strongest | 28.6% | 28.6% | 0.0% | 160 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 1.7812 | 12.4685 | 24937000 |
-| cheapest | 0.0% | 0.0% | 0.0% | 0 | 0.0000 | 4.0443 | 0.0481 | 0.3370 | 0.0000 | 0.0000 | 0 |
+| Tool | Wasted first | Unrouted | Review independence (family) | Review independence (model) | Failed attempts | Metered USD | Go account USD | Go 5h share per pass | Go 5h share (sum) | Codex 5h share per pass | Codex 5h share (sum) | Codex tokens (sum) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| openswarm | 0.0% | 0.0% | 85.7% | 95.2% | 0 | 0.0000 | 30.6145 | 1.4159 | 9.9117 | 0.4763 | 3.3338 | 6667600 |
+| OmO | 23.4% | 19.8% | 71.4% | 71.4% | 254 | 1.5396 | 23.0340 | 1.0969 | 7.6780 | 0.8502 | 5.9512 | 11902500 |
+| Codex default | 28.6% | 28.6% | 0.0% | 0.0% | 160 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 1.7812 | 12.4685 | 24937000 |
+| strongest | 28.6% | 28.6% | 0.0% | 0.0% | 160 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 1.7812 | 12.4685 | 24937000 |
+| cheapest | 0.0% | 0.0% | 0.0% | 0.0% | 0 | 0.0000 | 4.0443 | 0.0481 | 0.3370 | 0.0000 | 0.0000 | 0 |
 
 ## Unrouted decisions by OmO category
 
@@ -94,10 +94,12 @@ OpenCode Go 5h share:
 | codex_hard_97 | 2.4022 | 1.3370 | 0.0000 | 0.0000 | 0.0481 |
 | ocgo_hot | 1.4274 | 1.3370 | 0.0000 | 0.0000 | 0.0481 |
 | deepseek_floor | 1.4274 | 1.3370 | 0.0000 | 0.0000 | 0.0481 |
-| mixed_late_week | 1.6662 | 0.9930 | 0.0000 | 0.0000 | 0.0481 |
+| mixed_late_week | 1.5128 | 0.9930 | 0.0000 | 0.0000 | 0.0481 |
 | tight_friday | 0.0481 | 0.0000 | 0.0000 | 0.0000 | 0.0481 |
 
 ## Review independence by scenario
+
+Family level: the review ran in a different model family than the scenario's reference implementer.
 
 | Scenario | openswarm | OmO | Codex default | strongest | cheapest |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -108,6 +110,25 @@ OpenCode Go 5h share:
 | deepseek_floor | 100.0% | 100.0% | 0.0% | 0.0% | 0.0% |
 | mixed_late_week | 0.0% | 33.3% | 0.0% | 0.0% | 0.0% |
 | tight_friday | 100.0% | 0.0% | 0.0% | 0.0% | 0.0% |
+
+## Review model-level independence by scenario
+
+Model level: the review ran on a different model than the reference implementer, even inside the same family. Reviews that stay in the reference family are degraded (single-family); openswarm flags the ones it knowingly degrades with `degraded: single-family` on the decision itself.
+
+| Scenario | openswarm | OmO | Codex default | strongest | cheapest |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| fresh | 100.0% | 100.0% | 0.0% | 0.0% | 0.0% |
+| codex_soft_90 | 100.0% | 100.0% | 0.0% | 0.0% | 0.0% |
+| codex_hard_97 | 100.0% | 66.7% | 0.0% | 0.0% | 0.0% |
+| ocgo_hot | 100.0% | 100.0% | 0.0% | 0.0% | 0.0% |
+| deepseek_floor | 100.0% | 100.0% | 0.0% | 0.0% | 0.0% |
+| mixed_late_week | 66.7% | 33.3% | 0.0% | 0.0% | 0.0% |
+| tight_friday | 100.0% | 0.0% | 0.0% | 0.0% | 0.0% |
+
+- openswarm: 12 of 84 reviews stayed in the reference family (degraded); 8 of those still ran on a different model, and 6 carry the router's `degraded: single-family` mark.
+- Codex default: 60 of 84 reviews stayed in the reference family (degraded); 0 of those still ran on a different model, and 0 carry the router's `degraded: single-family` mark.
+- strongest: 60 of 84 reviews stayed in the reference family (degraded); 0 of those still ran on a different model, and 0 carry the router's `degraded: single-family` mark.
+- cheapest: 84 of 84 reviews stayed in the reference family (degraded); 0 of those still ran on a different model, and 0 carry the router's `degraded: single-family` mark.
 
 ## Agreement with the difficulty→tier rubric
 
@@ -124,12 +145,12 @@ An unrouted decision is counted in the under column here. The unrouted rate itse
 | codex_hard_97 | 100.0% / 0.0% / 0.0% | 52.5% / 20.0% / 27.5% | 0.0% / 0.0% / 100.0% | 0.0% / 0.0% / 100.0% | 40.0% / 0.0% / 60.0% |
 | ocgo_hot | 100.0% / 0.0% / 0.0% | 62.5% / 22.5% / 15.0% | 41.2% / 40.0% / 18.8% | 18.8% / 81.2% / 0.0% | 40.0% / 0.0% / 60.0% |
 | deepseek_floor | 100.0% / 0.0% / 0.0% | 62.5% / 22.5% / 15.0% | 41.2% / 40.0% / 18.8% | 18.8% / 81.2% / 0.0% | 40.0% / 0.0% / 60.0% |
-| mixed_late_week | 96.2% / 0.0% / 3.8% | 62.5% / 2.5% / 35.0% | 41.2% / 40.0% / 18.8% | 18.8% / 81.2% / 0.0% | 40.0% / 0.0% / 60.0% |
+| mixed_late_week | 88.8% / 0.0% / 11.2% | 62.5% / 2.5% / 35.0% | 41.2% / 40.0% / 18.8% | 18.8% / 81.2% / 0.0% | 40.0% / 0.0% / 60.0% |
 | tight_friday | 40.0% / 0.0% / 60.0% | 33.8% / 18.8% / 47.5% | 0.0% / 0.0% / 100.0% | 0.0% / 0.0% / 100.0% | 40.0% / 0.0% / 60.0% |
 
 Overall agreement (exact / over / under), same caveat:
 
-- openswarm: 90.9% / 0.0% / 9.1%
+- openswarm: 89.8% / 0.0% / 10.2%
 - OmO: 57.0% / 18.8% / 24.3%
 - Codex default: 29.5% / 28.6% / 42.0%
 - strongest: 13.4% / 58.0% / 28.6%
@@ -139,21 +160,21 @@ Overall agreement (exact / over / under), same caveat:
 
 Latency is the only non-deterministic section. Decision files do not include it.
 
-- openswarm in-process: n=1120 median=0.0119 ms p95=0.0306 ms
-- openswarm CLI cold start: n=25 median=395.921 ms p95=483.3239 ms
+- openswarm in-process: n=1120 median=0.0137 ms p95=0.0477 ms
+- openswarm CLI cold start: n=25 median=409.4904 ms p95=593.9731 ms
 - OmO in-process: n=1120 median=0.0292 ms p95=0.1027 ms
 - OmO: no standalone route CLI. model-core has no standalone route CLI. The figure is in-process time around resolveModelPipeline plus the exhaustion walk, after bun has loaded the module. It is not comparable to openswarm's process cold start.
 
 ## Environment
 
-- date: 2026-11-03T17:30:14Z
+- date: 2026-11-03T23:41:30Z
 - os: Linux-6.12.94+-x86_64-with-glibc2.41
 - kernel: 6.12.94+
 - cpu: Intel(R) Xeon(R) Processor
 - cores: 8
 - python: 3.13.5
 - bun: 1.4.2
-- openswarm_commit: 6d5c3c555c2b2275924dacf9dd35c5e3c770b58a
+- openswarm_commit: 840b8682b070a2a4b562fedb8a51deeb7643d3df
 - omo_dir: `<omo-dir>`
 - omo_commit: 07776864a043acdda9f9976ac8f71659a25f1d86
 - commands:

@@ -28,7 +28,7 @@ For each unit of work, write a self-contained prompt with goal, files or areas, 
 
 | field | values | guidance |
 |---|---|---|
-| `--type` | impl, refactor, debug, test, docs, mechanical, migration, format, rename, review, research | when enabled, review/audit prefers a non-GPT family for an independent opinion |
+| `--type` | impl, refactor, debug, test, docs, mechanical, migration, format, rename, review, research | when enabled, review/audit prefers a non-GPT family for an independent opinion; if only the implementer's family has headroom, the decision is marked `degraded: single-family` and routed to a sibling model of that family |
 | `--difficulty` | 1–5 | 1 rename or format · 2 small, well-specified · 3 normal feature · 4 cross-module or tricky · 5 hardest debugging or design-heavy |
 | `--context-tokens` | approx | >220k makes the router prefer 1M-context backends |
 | `--budget-minutes` | wall clock | **hard stop**; the executor's whole process tree is killed when it runs out. Default 40 |
