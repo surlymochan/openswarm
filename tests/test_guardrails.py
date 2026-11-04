@@ -185,7 +185,7 @@ class GuardrailsTests(unittest.TestCase):
         target = outside / "private-file"
         target.write_text("keep private path out of run result\n")
         block = xs.enforced_risk({"type": "tool_execution_start", "args": {
-            "command": f"rm -rf {target}"}}, {}, str(self.root))
+            "command": f'rm -rf "{target}"'}}, {}, str(self.root))
         self.assertEqual(block["path_class"], "outside")
         self.assertNotIn(str(target), json.dumps(block))
 
