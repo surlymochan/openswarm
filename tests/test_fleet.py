@@ -183,7 +183,16 @@ class FleetTests(unittest.TestCase):
                 "PATH": str(fake_bin) + os.pathsep + xs.os.environ.get("PATH", ""),
                 "OPENSWARM_TEST_SSH_ROOT": str(self.root),
             }), contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
-                xs.main()
+                try:
+                    xs.main()
+                except SystemExit as exc:
+                    try:
+                        cfg = list(xs.fleet_config())
+                    except Exception as cfg_exc:
+                        cfg = f"fleet_config raised {cfg_exc!r}"
+                    print("DIAG-LEDGER rc:", exc.code, "| errors:", errors.getvalue(),
+                          "| LEDGER:", xs.LEDGER, "| hosts:", cfg, file=sys.__stderr__)
+                    raise
             rows = [json.loads(line) for line in destination.read_text().splitlines()]
             first_pull = destination.read_bytes()
             sys.argv = ["openswarm", "fleet", "ledger", "pull"]
