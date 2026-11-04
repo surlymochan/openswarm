@@ -26,6 +26,10 @@ jobs:
         if: runner.os == 'Windows'
         run: pip install tzdata
       - name: Unit tests (stdlib only, no backends needed)
+        if: runner.os != 'Windows'
+        run: python tests/run_one_by_one.py
+      - name: Unit tests (Windows; SIGINT-shielded runner, see tests/run_windows_suite.py)
+        if: runner.os == 'Windows'
         run: python tests/run_one_by_one.py
       - name: CLI smoke test (offline state)
         shell: bash

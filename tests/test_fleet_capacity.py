@@ -22,7 +22,10 @@ class FleetCapacityTests(unittest.TestCase):
         self.env = dict(os.environ, OPENSWARM_FLEET_CAPACITY_DIR=self.temp.name)
 
     def call(self, authenticated_host, **payload):
-        p = subprocess.run([str(BIN), authenticated_host], input=json.dumps(payload), text=True,
+        argv = [str(BIN), authenticated_host]
+        if os.name == "nt":  # Windows cannot CreateProcess a shebang script (WinError 193)
+            argv = [sys.executable, *argv]
+        p = subprocess.run(argv, input=json.dumps(payload), text=True,
                            capture_output=True, env=self.env, timeout=15)
         return json.loads(p.stdout)
 

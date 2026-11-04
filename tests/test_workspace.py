@@ -9,7 +9,14 @@ xs = _load.load()
 
 
 def sh(*a, cwd):
+    if os.name == "nt" and a and os.path.isfile(a[0]):
+        a = (sys.executable, *a)  # shebang scripts cannot be CreateProcess'd on Windows
     subprocess.run(a, cwd=cwd, check=True, capture_output=True)
+
+
+def link_dir(target, link):
+    # A directory symlink needs target_is_directory on Windows; POSIX ignores it.
+    os.symlink(target, link, target_is_directory=(os.name == "nt"))
 
 
 def write(path, text):
@@ -51,7 +58,7 @@ class WorkspaceTest(unittest.TestCase):
         sh("git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "app", cwd=self.repo)
         os.makedirs(os.path.join(self.repo, "apps", "auth-api", "node_modules"))
         os.makedirs(os.path.join(self.repo, "node_modules", "@openbot"))
-        os.symlink("../../pkg", os.path.join(self.repo, "node_modules", "@openbot", "core"))
+        link_dir("../../pkg", os.path.join(self.repo, "node_modules", "@openbot", "core"))
         wt = os.path.join(self.tmp, "openbot-wt")
         sh("git", "worktree", "add", "--detach", "-q", wt, "HEAD", cwd=self.repo)
         script = os.path.join(HERE, "..", "bin", "link-openbot-deps")
@@ -171,7 +178,7 @@ class WorkspaceTest(unittest.TestCase):
         sibling = os.path.join(self.tmp, "sdkrepo", "sdk")
         os.makedirs(sibling)
         write(os.path.join(sibling, "index.js"), "sdk")
-        os.symlink("../../sdkrepo/sdk", os.path.join(self.repo, "pkg", "sdk-link"))
+        link_dir("../../sdkrepo/sdk", os.path.join(self.repo, "pkg", "sdk-link"))
         sh("git", "add", "pkg/sdk-link", cwd=self.repo)
         sh("git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "link", cwd=self.repo)
         ws = xs.prepare_workspace(self.repo, "r2", True)

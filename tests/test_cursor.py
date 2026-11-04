@@ -108,6 +108,7 @@ class CursorBackend(unittest.TestCase):
         opted["routing"]["default_order"] = ["cursor", "codex", "ocgo", "deepseek"]
         self.assertEqual(self.route({"type": "impl", "difficulty": 3}, opted)["backend"], "cursor")
 
+    @unittest.skipIf(os.name == "nt", "PATH discovery of an extensionless executable is POSIX semantics; Windows resolves via PATHEXT")
     def test_binary_discovery_order(self):
         self.assertEqual(xs.cursor_bin(), self.script)
         os.environ["OPENSWARM_CURSOR_BIN"] = os.path.join(self.tmp, "missing")

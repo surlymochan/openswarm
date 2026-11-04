@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Offline subset of gh api backed by a JSON file for issue-bus tests."""
 import base64
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows: fall back to msvcrt byte locking below
+    fcntl = None
+    import msvcrt
 import hashlib
 import json
 import os
@@ -24,7 +28,10 @@ def main():
         payload = json.loads(sys.stdin.read() or "{}")
     state_path = os.environ["OPENSWARM_FAKE_GH_STATE"]
     with open(state_path + ".lock", "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        if fcntl is not None:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        else:
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
         with open(state_path) as stream:
             state = json.load(stream)
         parsed = urllib.parse.urlsplit(endpoint)
