@@ -717,7 +717,7 @@ usage counts as zero; verification time is excluded from executor minutes.
 
 ## Status and limitations
 
-- Developed and used on macOS; Linux is covered by CI; Windows is untested.
+- Developed and used on macOS; Linux and Windows are covered by CI (Windows: the lane control plane needs AF_UNIX, so lane serving is POSIX-only for now; other commands run natively — CPython on Windows also needs `pip install tzdata` for IANA timezone names).
 - Model names, plan caps and the OpenCode Go price table in `policy.json` change often, so PRs are welcome.
 - The Claude quota comes from Claude Code's statusline hook or `openswarm ingest-claude`. Without either, reviews default to `light`.
 

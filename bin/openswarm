@@ -2594,7 +2594,7 @@ def cmd_retro(args, policy):
     now = NOW()
     cutoff = now - args.days * 86400
     zone_name = (policy.get("budget") or {}).get("timezone") or policy.get("timezone")
-    zone = ZoneInfo(zone_name) if zone_name else dt.datetime.now().astimezone().tzinfo
+    zone = _tzinfo(zone_name) if zone_name else dt.datetime.now().astimezone().tzinfo
     start = dt.datetime.fromtimestamp(cutoff, zone).isoformat(timespec="seconds")
     end = dt.datetime.fromtimestamp(now, zone).isoformat(timespec="seconds")
     today = dt.datetime.fromtimestamp(now, zone).date()
@@ -2663,11 +2663,18 @@ def cmd_retro(args, policy):
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
 
 
+def _tzinfo(name):
+    """Resolve an IANA zone name. UTC is spelled via timezone.utc: a bare
+    ZoneInfo("UTC") needs a system tz database (or the tzdata package), which
+    Windows hosts do not ship with CPython."""
+    if name in ("UTC", "Etc/UTC"):
+        return dt.timezone.utc
+    return ZoneInfo(name)
+
+
 def policy_day(policy, date=None):
     name = (policy.get("budget") or {}).get("timezone") or policy.get("timezone")
-    # UTC is spelled via timezone.utc: a bare ZoneInfo("UTC") needs a system tz
-    # database (or the tzdata package), which Windows hosts do not ship.
-    tz = dt.timezone.utc if name in ("UTC", "Etc/UTC") else (ZoneInfo(name) if name else None)
+    tz = _tzinfo(name) if name else None
     now = dt.datetime.fromtimestamp(NOW(), tz).astimezone(tz)
     day = dt.date.fromisoformat(date) if date else now.date()
     start = dt.datetime.combine(day, dt.time(), tz).astimezone(tz)
@@ -3791,7 +3798,8 @@ def descendants(pid):
 def kill_tree(pid, grace=3):
     """Terminate a process, its process group and every descendant (executors spawn shells in new groups)."""
     procs = [int(pid)] + descendants(pid)
-    for sig in (signal.SIGTERM, signal.SIGKILL):
+    # Windows has no SIGKILL constant; os.kill(SIGTERM) already hard-terminates there.
+    for sig in (signal.SIGTERM, getattr(signal, "SIGKILL", signal.SIGTERM)):
         for p in procs:
             for fn in (lambda q: os.killpg(q, sig), lambda q: os.kill(q, sig)):
                 try:
@@ -5818,7 +5826,7 @@ def gh_transport(endpoint, method="GET", payload=None, allow_not_found=False):
         command += ["--input", "-"]
         input_text = json.dumps(payload, ensure_ascii=False)
     try:
-        proc = subprocess.run(command, input=input_text, capture_output=True, text=True, timeout=60)
+        proc = subprocess.run(_spawnable(command), input=input_text, capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise BusError(bus_redact(f"gh api failed: {error}"))
     if proc.returncode:
@@ -6553,6 +6561,9 @@ def lane_last_log_error(name):
 
 
 def lane_validate_socket_path(name):
+    if not hasattr(socket, "AF_UNIX"):
+        raise RuntimeError("lane control requires AF_UNIX sockets, which this platform "
+                           "does not provide (Windows named-pipe transport is not implemented)")
     path = lane_socket_path(name)
     capacity = 104 if sys.platform == "darwin" else 108
     limit = capacity - 1  # sockaddr_un.sun_path needs room for the terminating NUL.
@@ -6647,6 +6658,8 @@ def lane_write_state(lane_name, **changes):
 
 
 def lane_call(name, request, timeout=8):
+    if not hasattr(socket, "AF_UNIX"):
+        return {"ok": False, "error": "lane control requires AF_UNIX sockets, unavailable on this platform"}
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
@@ -8353,8 +8366,12 @@ def generate_lane_service_definition(lane, service_manager):
         return json.dumps({"name": name, "plist": plist}, indent=2, ensure_ascii=False)
 
     if service_manager == "systemd-unit":
-        import pwd
-        user = pwd.getpwuid(os.getuid()).pw_name
+        try:
+            import pwd
+            user = pwd.getpwuid(os.getuid()).pw_name
+        except Exception:  # Windows has neither pwd nor os.getuid; the unit is text generation
+            import getpass
+            user = getpass.getuser()
         home = os.path.expanduser("~")
         path = os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
         local_bin = os.path.join(home, ".local", "bin")
