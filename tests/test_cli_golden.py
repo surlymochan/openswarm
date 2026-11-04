@@ -3,7 +3,10 @@ import contextlib
 import io
 import os
 from pathlib import Path
-import pwd
+try:
+    import pwd
+except ImportError:  # Windows has no pwd module (nor os.getuid).
+    pwd = None
 import subprocess
 import sys
 import unittest
@@ -35,6 +38,7 @@ class CliGoldenTests(unittest.TestCase):
                 actual = result.stdout.replace(b"optional arguments:", b"options:")
                 self.assertEqual(actual, (GOLDEN / filename).read_bytes())
 
+    @unittest.skipIf(os.name == "nt", "launchd/systemd service goldens are POSIX-only: they stub pwd.getpwuid and os.getuid, which do not exist on Windows")
     def test_lane_service_definitions_match_goldens(self):
         lane = {"name": "L1", "backend": "codex", "model": "gpt-6-luna", "effort": "low",
                 "repo": "/srv/project"}

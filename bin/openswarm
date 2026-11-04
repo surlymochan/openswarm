@@ -41,7 +41,11 @@ import contextlib
 import datetime as dt
 import glob
 import fnmatch
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows: no fcntl; _flock() below falls back to msvcrt.
+    fcntl = None
+    import msvcrt
 import hashlib
 import html
 import importlib.util
@@ -71,6 +75,40 @@ import random
 from zoneinfo import ZoneInfo
 
 HOME = os.path.expanduser("~")
+
+
+if fcntl is not None:
+    LOCK_EX = fcntl.LOCK_EX
+    LOCK_NB = fcntl.LOCK_NB
+else:  # pragma: no cover - exercised on Windows only
+    LOCK_EX = 0x1
+    LOCK_NB = 0x2
+
+
+def _flock(target, op):
+    """Exclusive advisory lock on an open file or fd.
+
+    POSIX uses flock(2) via fcntl. Windows has no flock; msvcrt.locking on byte 0 is
+    the closest equivalent (LK_LOCK retries for ~10s instead of blocking
+    forever -- acceptable for the short-lived coordination locks used here).
+    Non-blocking contention is normalised to BlockingIOError on both
+    platforms, matching the existing call-site contract.
+    """
+    if fcntl is not None:
+        fcntl.flock(target, op)
+        return
+    fd = target if isinstance(target, int) else target.fileno()  # noqa: F821 - msvcrt imported above
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+    except OSError:
+        pass
+    try:
+        msvcrt.locking(fd, msvcrt.LK_NBLCK if op & LOCK_NB else msvcrt.LK_LOCK, 1)
+    except OSError as exc:
+        if op & LOCK_NB:
+            raise BlockingIOError(str(exc)) from exc
+        raise
+
 
 
 def envvar(name, default=None):
@@ -1161,7 +1199,7 @@ def cmd_lessons_propose(args, policy):
     if not args.dry_run:
         os.makedirs(proposals_root, exist_ok=True)
         lock = open(seen_path + ".lock", "a", encoding="utf-8")
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        _flock(lock, LOCK_EX)
     try:
         if os.path.isfile(seen_path):
             try:
@@ -1421,7 +1459,7 @@ def cmd_lessons_escalate(args, policy):
     if not args.dry_run:
         os.makedirs(proposals_root, exist_ok=True)
         lock = open(seen_path + ".lock", "a", encoding="utf-8")
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        _flock(lock, LOCK_EX)
     try:
         if os.path.isfile(seen_path):
             try:
@@ -2780,7 +2818,7 @@ def admit_budget(policy, backend, minutes, rdir, **status):
     os.makedirs(DATA, exist_ok=True)
     requests = status.pop("budget_requests", [(backend, minutes)])
     with open(os.path.join(DATA, "budget.lock"), "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        _flock(lock, LOCK_EX)
         check_budget(policy, requests, exclude_id=status["id"])
         set_status(rdir, backend=backend, budget_minutes=minutes, budget_requests=requests, **status)
 
@@ -3512,7 +3550,7 @@ def reserve_provider_slot(rdir, backend, provider, policy, lane_name=None, keep_
                "backend": backend, "provider": provider}
     while True:
         with open(lock_path, "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            _flock(lock, LOCK_EX)
             active = {}
             for path in glob.glob(os.path.join(RUNS, "*", "status.json")):
                 if os.path.realpath(path) == os.path.realpath(status_path):
@@ -4617,7 +4655,7 @@ def run_workspace_prepare(repo, wd, phase):
         if attempt:
             time.sleep(0.2)
         with open(lock_path, "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            _flock(lock, LOCK_EX)
             try:
                 proc = subprocess.run(command, shell=True, cwd=wd, capture_output=True, text=True)
                 rc = proc.returncode
@@ -5587,7 +5625,7 @@ def update_peer_review_ledger(run_id, peer_review):
     os.makedirs(DATA, exist_ok=True)
     with open(lock_path, "a") as lock, open(path + ".lock", "a") as ledger_lock:
         for held in sorted((lock, ledger_lock), key=lambda item: item.name):
-            fcntl.flock(held, fcntl.LOCK_EX)
+            _flock(held, LOCK_EX)
         try:
             with open(path, encoding="utf-8") as stream:
                 lines = stream.readlines()
@@ -5673,7 +5711,7 @@ def spawn_auto_review(run_id, policy):
     for index in range(cap):
         fd = os.open(os.path.join(slots, f"{index}.lock"), os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _flock(fd, LOCK_EX | LOCK_NB)
         except BlockingIOError:
             os.close(fd)
             continue
@@ -8802,7 +8840,7 @@ def cmd_ledger_ingest(args):
     lock_path = path + ".lock"
     updated = linked_count = unlinked_count = completed = 0
     with open(lock_path, "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        _flock(lock, LOCK_EX)
         with open(path, encoding="utf-8") as stream:
             original_lines = stream.readlines()
         lines = []
@@ -8869,7 +8907,7 @@ def cmd_ledger_accept(args):
         reason = "manually accepted" if accepted else "manually rejected"
     lock_path = path + ".lock"
     with open(lock_path, "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        _flock(lock, LOCK_EX)
         with open(path, encoding="utf-8") as stream:
             lines = stream.readlines()
         matches = []
@@ -8902,7 +8940,7 @@ def cmd_ledger_backfill_pass(args):
     lock_path = path + ".lock"
     updated = skipped = 0
     with open(lock_path, "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        _flock(lock, LOCK_EX)
         with open(path, encoding="utf-8") as stream:
             lines = stream.readlines()
         for index, raw in enumerate(lines):
@@ -9306,7 +9344,7 @@ def execute_batch(spec, summary):
                         continue
                     lock_path = os.path.join(DATA, "fleet-provider-concurrency.lock")
                     with open(lock_path, "a") as lock:
-                        fcntl.flock(lock, fcntl.LOCK_EX)
+                        _flock(lock, LOCK_EX)
                         if not batch_provider_slot_available(spec, row):
                             continue
                         try:
@@ -10219,7 +10257,7 @@ def append_ledger(entry):
     os.makedirs(DATA, exist_ok=True)
     # Serialize completion writes with admissions so their ledger/reservation snapshot is coherent.
     with open(os.path.join(DATA, "budget.lock"), "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        _flock(lock, LOCK_EX)
         with open(LEDGER, "a") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -10628,7 +10666,7 @@ def update_compare_ledger(candidates, compare_id, winner_id):
     lock_path = os.path.join(DATA, "budget.lock")
     with open(lock_path, "a") as budget_lock, open(path + ".lock", "a") as ledger_lock:
         for held in sorted((budget_lock, ledger_lock), key=lambda item: item.name):
-            fcntl.flock(held, fcntl.LOCK_EX)
+            _flock(held, LOCK_EX)
         try:
             with open(path, encoding="utf-8") as stream:
                 lines = stream.readlines()
