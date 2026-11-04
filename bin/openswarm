@@ -1533,6 +1533,12 @@ def source_enabled(policy, name):
     return bool((policy.get("local_sources") or {}).get(name, False))
 
 
+def _symlink(src, dst):
+    # A directory target needs target_is_directory on Windows, or the link is
+    # created as a file link and neither git nor readers treat it as a directory.
+    os.symlink(src, dst, target_is_directory=(os.name == "nt" and os.path.isdir(src)))
+
+
 def _spawnable(cmd):
     """Windows cannot CreateProcess a script directly (WinError 193): when the
     target is a file with a python shebang, re-invoke it with this interpreter.
@@ -3963,9 +3969,12 @@ def rm_target_path_class(target, cwd, root):
     if "$" in target:
         return "outside"
     path = os.path.realpath(os.path.join(cwd, target))
-    if os.path.commonpath([tmpdir, path]) == tmpdir:
-        return "tmp"
-    return "inside" if os.path.commonpath([root, path]) == root else "outside"
+    try:
+        if os.path.commonpath([tmpdir, path]) == tmpdir:
+            return "tmp"
+        return "inside" if os.path.commonpath([root, path]) == root else "outside"
+    except ValueError:
+        return "outside"  # e.g. a different Windows drive than the worktree: outside by definition
 
 
 def rm_outside_worktree_class(command, worktree):
@@ -4003,7 +4012,10 @@ def is_scratch_tmp_file(target, cwd):
     if any(ch in target for ch in "*?[{~$"):
         return False
     path = os.path.normpath(os.path.join(cwd, target))
-    if os.path.dirname(path) not in SCRATCH_TMP_DIRS or os.path.basename(path) in ("", ".", ".."):
+    # Compare drive-insensitively: a rooted POSIX spelling ("/tmp/x") gains the cwd's
+    # drive when joined on Windows, while the canonical list holds it drive-less.
+    scratch_dirs = {os.path.splitdrive(d)[1] for d in SCRATCH_TMP_DIRS}
+    if os.path.splitdrive(os.path.dirname(path))[1] not in scratch_dirs or os.path.basename(path) in ("", ".", ".."):
         return False
     return not os.path.isdir(path)
 
@@ -4774,7 +4786,7 @@ def link_dependency_dirs(base, wt):
                 dst = os.path.join(dst_parent, d)
                 if os.path.isdir(dst_parent) and not os.path.lexists(dst):
                     try:
-                        os.symlink(os.path.realpath(src), dst)
+                        _symlink(os.path.realpath(src), dst)
                         linked.append(os.path.relpath(dst, wt))
                     except OSError:
                         pass
@@ -4804,7 +4816,7 @@ def _link_missing_entries(src, dst, wt, depth):
         s_path, d_path = os.path.join(src, name), os.path.join(dst, name)
         if not os.path.lexists(d_path):
             try:
-                os.symlink(os.path.realpath(s_path), d_path)
+                _symlink(os.path.realpath(s_path), d_path)
                 out.append(os.path.relpath(d_path, wt))
             except OSError:
                 pass

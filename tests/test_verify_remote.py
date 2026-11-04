@@ -1,3 +1,4 @@
+import os
 import argparse
 import contextlib
 import io
@@ -27,6 +28,7 @@ class VerifyRemoteTests(FakeFleetFixture, unittest.TestCase):
             xs.cmd_verify_remote(args)
         return exited.exception.code, json.loads(output.getvalue())
 
+    @unittest.skipIf(os.name == "nt", 'executor verify/prepare commands are POSIX shell strings run through the platform shell (cmd.exe on Windows)')
     def test_verify_locally_links_dependencies_and_preserves_checkouts(self):
         rid, original = self.start_source_run()
         (self.repo / "node_modules").mkdir()
@@ -49,6 +51,7 @@ class VerifyRemoteTests(FakeFleetFixture, unittest.TestCase):
         self.assertEqual(self.git(source, "rev-parse", "openswarm/" + rid), original["commit"])
         self.assertEqual(json.loads((self.root / "b1" / "data" / "runs" / rid / "result.json").read_text()), original)
 
+    @unittest.skipIf(os.name == "nt", 'executor verify/prepare commands are POSIX shell strings run through the platform shell (cmd.exe on Windows)')
     def test_verify_on_second_host_records_failure_without_printing_output(self):
         rid, original = self.start_source_run()
         self.hosts["b2"]["openswarm"] = str(Path(_load.ROOT) / "bin" / "openswarm")

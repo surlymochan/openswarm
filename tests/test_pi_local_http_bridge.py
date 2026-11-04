@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class PiLocalBridgeTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", 'the relay multiplexes a socket and a process pipe with select(); Windows select() supports sockets only')
     def test_client_cancellation_stops_waiting_ssh(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -65,6 +66,7 @@ class PiLocalBridgeTests(unittest.TestCase):
                 process.stdout.close()
                 process.stderr.close()
 
+    @unittest.skipIf(os.name == "nt", 'the relay multiplexes a socket and a process pipe with select(); Windows select() supports sockets only')
     def test_stream_auth_and_restart(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
