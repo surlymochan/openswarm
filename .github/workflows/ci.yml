@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-latest]
+        os: [ubuntu-24.04, macos-latest, windows-latest]
         python: ["3.9", "3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
@@ -25,6 +25,7 @@ jobs:
       - name: Unit tests (stdlib only, no backends needed)
         run: python -m unittest discover -s tests -v
       - name: CLI smoke test (offline state)
+        shell: bash
         env:
           OPENSWARM_STATE_FILE: examples/demo-state.json
         run: |
