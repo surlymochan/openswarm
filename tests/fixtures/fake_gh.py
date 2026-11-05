@@ -131,8 +131,19 @@ def route(state, parts, query, method, payload):
                            "created_at": datetime.now(timezone.utc).isoformat()}
                 issue["comments"].append(comment)
                 return comment
-        if tail[2:] == ["labels"] and method == "PUT":
-            issue["labels"] = [{"name": name} for name in payload.get("labels", [])]
+        if tail[2:] == ["labels"]:
+            if method == "POST":
+                for name in payload.get("labels", []):
+                    if all(row.get("name") != name for row in issue["labels"]):
+                        issue["labels"].append({"name": name})
+                return issue["labels"]
+            if method == "PUT":
+                issue["labels"] = [{"name": name} for name in payload.get("labels", [])]
+                return issue["labels"]
+        if len(tail) == 4 and tail[2] == "labels" and method == "DELETE":
+            if all(row.get("name") != tail[3] for row in issue["labels"]):
+                return None
+            issue["labels"] = [row for row in issue["labels"] if row.get("name") != tail[3]]
             return issue["labels"]
     if tail == ["pulls"] and method == "POST":
         number = len(bucket.get("pulls", [])) + 1

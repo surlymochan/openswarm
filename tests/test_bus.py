@@ -204,6 +204,62 @@ class BusTests(unittest.TestCase):
         self.assertIsNone(result["result"])
         self.assertIn("openswarm:cancelled", {label["name"] for label in self.issue()["labels"]})
 
+    def test_concurrent_label_writers_do_not_clobber_each_other(self):
+        created = xs.bus_create_issue("org/bus", self.cfg, "race", "label race", {
+            "run_id": "label-race", "repo": "org/target", "base": self.base,
+            "budget_minutes": 1, "report_schema": xs.RESULT_SCHEMA})
+        number = created["number"]
+        self.set_labels(number, ["claimed", "failed"], [])
+        names = xs.bus_label_names(self.cfg)
+        real_transport = xs.gh_transport
+        reads = []
+        both_read = threading.Event()
+
+        def gated(endpoint, method="GET", payload=None, allow_not_found=False):
+            # Hold any full-list replacement until both writers have taken
+            # their read snapshot: the exact interleave that used to erase a
+            # concurrently added label. Incremental writers never PUT, so
+            # for them the gate never engages.
+            if method == "PUT":
+                both_read.wait(timeout=10)
+            result = real_transport(endpoint, method, payload, allow_not_found)
+            if method == "GET" and endpoint == f"repos/org/bus/issues/{number}":
+                reads.append(1)
+                if len(reads) == 2:
+                    both_read.set()
+            return result
+
+        def write(add, remove):
+            xs.bus_set_issue_labels("org/bus", number, self.cfg, add=add, remove=remove)
+
+        with mock.patch.object(xs, "gh_transport", gated):
+            threads = [threading.Thread(target=write, args=([names["cancelled"]], [names["failed"]])),
+                       threading.Thread(target=write, args=([names["done"]], [names["queued"]]))]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=15)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        final = xs.issue_label_names(self.issue(number))
+        self.assertIn(names["cancelled"], final)
+        self.assertIn(names["done"], final)
+        self.assertNotIn(names["queued"], final)
+        self.assertNotIn(names["failed"], final)
+
+    def test_set_labels_tolerates_removing_absent_label(self):
+        created = xs.bus_create_issue("org/bus", self.cfg, "absent", "absent label removal", {
+            "run_id": "absent-label", "repo": "org/target", "base": self.base,
+            "budget_minutes": 1, "report_schema": xs.RESULT_SCHEMA})
+        number = created["number"]
+        names = xs.bus_label_names(self.cfg)
+        # The issue carries only openswarm:queued; removing a state label it
+        # does not have must not fail the whole update (the incremental
+        # DELETE answers 404 for a label the issue does not carry).
+        self.set_labels(number, ["claimed"], ["done"])
+        final = xs.issue_label_names(self.issue(number))
+        self.assertIn(names["claimed"], final)
+        self.assertNotIn(names["done"], final)
+
     def test_failed_executor_result_is_recorded(self):
         thread, outcome, issue = self.start_planner()
         self.add_comment(issue["number"], "/claim external-agent")
