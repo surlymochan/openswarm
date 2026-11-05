@@ -5929,11 +5929,28 @@ def issue_label_names(issue):
 
 
 def bus_set_issue_labels(repo, number, cfg, add=(), remove=()):
-    issue = gh_transport(f"repos/{repo}/issues/{number}")
-    labels = issue_label_names(issue)
-    labels.difference_update(remove)
-    labels.update(add)
-    return gh_transport(f"repos/{repo}/issues/{number}/labels", "PUT", {"labels": sorted(labels)})
+    # Incremental updates only: POST adds labels and DELETE removes one label
+    # at a time, both applied server-side to the live set. The previous
+    # GET -> PUT full-list replacement let two concurrent writers (planner
+    # vs worker/test) snapshot the same label set and clobber each other's
+    # changes with the later PUT; with no read-modify-write there is no
+    # snapshot to go stale. Removes run first so an add wins an overlap,
+    # matching the old snapshot order. DELETE answers 404 when the issue
+    # does not carry the label, which is a no-op here, not an error.
+    base = f"repos/{repo}/issues/{number}/labels"
+    result = None
+    for name in dict.fromkeys(remove):
+        deleted = gh_transport(f"{base}/{urllib.parse.quote(str(name), safe='')}", "DELETE",
+                               allow_not_found=True)
+        if deleted is not None:
+            result = deleted
+    additions = list(dict.fromkeys(add))
+    if additions:
+        result = gh_transport(base, "POST", {"labels": additions})
+    if result is None:
+        issue = gh_transport(f"repos/{repo}/issues/{number}")
+        return issue.get("labels") or []
+    return result
 
 
 def bus_comment(repo, number, body):
