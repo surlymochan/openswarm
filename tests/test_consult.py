@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import types
 import unittest
@@ -345,6 +346,46 @@ class ConsultTests(unittest.TestCase):
             with open(os.path.join(self.logs, backend + ".json"), encoding="utf-8") as stream:
                 argv = json.load(stream)["argv"]
             self.assertTrue(any("Existing API returns a stable response envelope." in value for value in argv))
+
+
+class WorktreeAdminLockTests(unittest.TestCase):
+    def test_concurrent_worktree_add_remove_on_one_repo(self):
+        # Regression for the #54 consult flake: raw git worktree add/remove
+        # pairs against one shared repository race in the .git/worktrees
+        # administration area (measured 8 failures in 600 pairs in consult's
+        # exact pattern). Consult serializes the administration calls
+        # through _WORKTREE_ADMIN_LOCK; hammer the helpers the same way and
+        # require zero failures.
+        tmp = tempfile.mkdtemp(prefix="openswarm-consult-wt-")
+        try:
+            repo = os.path.join(tmp, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init", "-q", repo], check=True)
+            subprocess.run(["git", "-C", repo, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                            "commit", "--allow-empty", "-qm", "initial"], check=True)
+            failures = []
+
+            def worker(rounds=12):
+                for _ in range(rounds):
+                    parent = tempfile.mkdtemp(prefix="consult-worktree-")
+                    worktree = os.path.join(parent, "worktree")
+                    added = consult._worktree_add(repo, worktree)
+                    if added.returncode:
+                        failures.append(added.stderr)
+                        shutil.rmtree(parent, ignore_errors=True)
+                        continue
+                    if consult._worktree_remove(repo, worktree).returncode:
+                        failures.append("worktree remove failed")
+                    shutil.rmtree(parent, ignore_errors=True)
+
+            threads = [threading.Thread(target=worker) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(failures, [])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
