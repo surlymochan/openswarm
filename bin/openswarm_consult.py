@@ -322,22 +322,16 @@ def _agy_execution_error(raw, stderr):
     return None
 
 
-def _spawnable(command):
-    """Windows cannot CreateProcess a script directly (WinError 193): when the
-    target is a file with a python shebang, re-invoke it with this interpreter."""
-    if os.name != "nt" or not command:
-        return command
-    head = str(command[0])
-    if head.lower().endswith((".exe", ".com", ".bat", ".cmd")):
-        return command
-    try:
-        with open(head, "rb") as fh:
-            first = fh.readline(256).decode("utf-8", "replace")
-    except OSError:
-        return command
-    if first.startswith("#!") and "python" in first:
-        return [sys.executable, *command]
-    return command
+def _load_spawnable():
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "_spawnable.py")
+    spec = importlib.util.spec_from_file_location("_spawnable", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.spawnable
+
+
+_spawnable = _load_spawnable()
 
 
 def _kill_process(process):
