@@ -352,6 +352,32 @@ def _kill_process(process):
         process.wait()
 
 
+# git's worktree administration area (.git/worktrees/*) is shared by every
+# consult thread working on the caller's repository: a `worktree remove`
+# deleting one entry while a sibling thread's `worktree add` enumerates
+# the area makes the add fail ("failed to read
+# .git/worktrees/<name>/commondir"), and removes race the same way.
+# Measured on git 2.43 with consult's exact pattern (same repo, leaf
+# always "worktree", distinct parents, 10 threads): 8 failures in 600
+# add/remove pairs. In consult, an add failure invalidates that answer
+# and a remove failure flips a valid answer to invalid, so either one
+# turns the run partial (exit 1) -- the load-sensitive flake in #54.
+# Serialize just the administration calls; executor turns stay parallel.
+_WORKTREE_ADMIN_LOCK = threading.Lock()
+
+
+def _worktree_add(repo, path):
+    with _WORKTREE_ADMIN_LOCK:
+        return subprocess.run(["git", "-C", repo, "worktree", "add", "--detach", path, "HEAD"],
+                              capture_output=True, text=True, timeout=30)
+
+
+def _worktree_remove(repo, path):
+    with _WORKTREE_ADMIN_LOCK:
+        return subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", path],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+
+
 def _ask_one(core, profile, prompt, run_dir, deadline, policy, reservation_id):
     row = {key: profile.get(key) for key in ("backend", "model", "family", "lane")}
     row.update({"valid": False, "answer": None, "raw": ""})
@@ -392,8 +418,7 @@ def _ask_one(core, profile, prompt, run_dir, deadline, policy, reservation_id):
                                     capture_output=True, timeout=30)
             if commit.returncode:
                 raise RuntimeError("could not initialize consult workspace")
-        prepared = subprocess.run(["git", "-C", worktree_repo, "worktree", "add", "--detach", worktree, "HEAD"],
-                                  capture_output=True, text=True, timeout=30)
+        prepared = _worktree_add(worktree_repo, worktree)
         if prepared.returncode:
             raise RuntimeError("could not create independent consult worktree")
         head = subprocess.run(["git", "-C", worktree, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=30)
@@ -496,8 +521,7 @@ def _ask_one(core, profile, prompt, run_dir, deadline, policy, reservation_id):
                 row["worktree_changes_detected"] = None
             else:
                 row["worktree_changes_detected"] = bool(status.stdout) or head.stdout.strip() != worktree_head
-            removed = subprocess.run(["git", "-C", worktree_repo, "worktree", "remove", "--force", worktree],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+            removed = _worktree_remove(worktree_repo, worktree)
             if removed.returncode:
                 row.update(valid=False, error="could not remove consult worktree; manual cleanup required")
             elif worktree_parent:
