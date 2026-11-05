@@ -62,5 +62,22 @@ class HermesTests(unittest.TestCase):
             self.assertEqual(methods.count('session/prompt'), 2)
 
 
+class HermesManifestTests(unittest.TestCase):
+    def test_hermes_manifest_matches_code_facts(self):
+        manifest = json.loads((ROOT / 'backends' / 'hermes.json').read_text())
+        self.assertEqual(manifest['id'], 'hermes')
+        self.assertIn('acp', manifest['invoke'])
+        self.assertIn('hermes.binary', manifest['binary_resolution'])
+        self.assertIn('minimax-cn', manifest['provider'])
+        self.assertIn('HERMES_HOME', manifest['dataBoundary'])
+
+    def test_every_executor_has_a_manifest(self):
+        # README: backends/*.json is "One manifest per executor".
+        for backend in xs.EXECUTORS:
+            path = ROOT / 'backends' / f'{backend}.json'
+            self.assertTrue(path.is_file(), f'missing manifest for executor {backend}')
+            self.assertEqual(json.loads(path.read_text())['id'], backend)
+
+
 if __name__ == '__main__':
     unittest.main()
