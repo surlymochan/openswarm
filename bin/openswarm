@@ -1914,12 +1914,13 @@ def probe_codex(policy):
 def codex_config_model():
     """Top-level default `model` in ~/.codex/config.toml (used by bare `codex exec`)."""
     try:
-        for line in open(f"{HOME}/.codex/config.toml"):
-            if line.lstrip().startswith("["):
-                break
-            m = re.match(r'\s*model\s*=\s*"([^"]+)"', line)
-            if m:
-                return m.group(1)
+        with open(f"{HOME}/.codex/config.toml") as fh:
+            for line in fh:
+                if line.lstrip().startswith("["):
+                    break
+                m = re.match(r'\s*model\s*=\s*"([^"]+)"', line)
+                if m:
+                    return m.group(1)
     except OSError:
         pass
     return None
@@ -4256,21 +4257,24 @@ def exec_codex(d, st, prompt, wd, rdir, timeout, evp):
                "--output-schema", schema, "-o", last, prompt]
     rc = run_proc(cmd, wd, os.environ.copy(), timeout, evp)
     usage, thread, errors = {}, None, []
-    for line in open(evp, errors="ignore"):
-        try:
-            ev = json.loads(line)
-        except Exception:
-            continue
-        if ev.get("type") == "thread.started":
-            thread = ev.get("thread_id")
-        elif ev.get("type") == "turn.completed":
-            usage = ev.get("usage") or usage
-        elif ev.get("type") in ("error", "turn.failed"):
-            errors.append(json.dumps(ev)[:500])
+    with open(evp, errors="ignore") as fh:
+        for line in fh:
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if ev.get("type") == "thread.started":
+                thread = ev.get("thread_id")
+            elif ev.get("type") == "turn.completed":
+                usage = ev.get("usage") or usage
+            elif ev.get("type") in ("error", "turn.failed"):
+                errors.append(json.dumps(ev)[:500])
     final = None
     if os.path.exists(last):
-        final = extract_json(open(last).read())
-    err_text = "\n".join(errors) + open(evp + ".err", errors="ignore").read()[-3000:]
+        with open(last) as fh:
+            final = extract_json(fh.read())
+    with open(evp + ".err", errors="ignore") as fh:
+        err_text = "\n".join(errors) + fh.read()[-3000:]
     return rc, final, {"usage": usage, "thread_id": thread}, err_text
 
 
@@ -4287,26 +4291,28 @@ def exec_opencode(d, st, prompt, wd, rdir, timeout, evp):
     cmd.append(prompt)
     rc = run_proc(cmd, wd, env, timeout, evp, abort_re=OPENCODE_ABORT_RE)
     texts, cost, tokens, session, errors = [], 0.0, {"input": 0, "output": 0, "reasoning": 0, "cache_read": 0}, None, []
-    for line in open(evp, errors="ignore"):
-        try:
-            ev = json.loads(line)
-        except Exception:
-            continue
-        session = ev.get("sessionID") or session
-        part = ev.get("part") or {}
-        if ev.get("type") == "text" and part.get("text"):
-            texts.append(part["text"])
-        elif ev.get("type") == "step_finish":
-            cost += part.get("cost") or 0
-            t = part.get("tokens") or {}
-            tokens["input"] += t.get("input", 0)
-            tokens["output"] += t.get("output", 0)
-            tokens["reasoning"] += t.get("reasoning", 0)
-            tokens["cache_read"] += (t.get("cache") or {}).get("read", 0)
-        elif ev.get("type") == "error":
-            errors.append(json.dumps(ev)[:500])
+    with open(evp, errors="ignore") as fh:
+        for line in fh:
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            session = ev.get("sessionID") or session
+            part = ev.get("part") or {}
+            if ev.get("type") == "text" and part.get("text"):
+                texts.append(part["text"])
+            elif ev.get("type") == "step_finish":
+                cost += part.get("cost") or 0
+                t = part.get("tokens") or {}
+                tokens["input"] += t.get("input", 0)
+                tokens["output"] += t.get("output", 0)
+                tokens["reasoning"] += t.get("reasoning", 0)
+                tokens["cache_read"] += (t.get("cache") or {}).get("read", 0)
+            elif ev.get("type") == "error":
+                errors.append(json.dumps(ev)[:500])
     final = extract_json(texts[-1]) if texts else None
-    err_text = "\n".join(errors) + open(evp + ".err", errors="ignore").read()[-3000:]
+    with open(evp + ".err", errors="ignore") as fh:
+        err_text = "\n".join(errors) + fh.read()[-3000:]
     if errors and rc == 0:
         rc = 1
     return rc, final, {"usage": tokens, "cost_usd": round(cost, 6), "session_id": session}, err_text
@@ -5011,9 +5017,16 @@ def cmd_run(args, policy):
     if args.run_id:  # detached child: task already stored
         rid = args.run_id
         rdir = f"{RUNS}/{rid}"
-        task = open(f"{rdir}/task.md").read()
+        with open(f"{rdir}/task.md") as fh:
+            task = fh.read()
     else:
-        task = args.prompt or (open(args.task_file).read() if args.task_file else sys.stdin.read())
+        if args.prompt:
+            task = args.prompt
+        elif args.task_file:
+            with open(args.task_file) as fh:
+                task = fh.read()
+        else:
+            task = sys.stdin.read()
         if not task.strip():
             sys.exit("empty task")
         rid = new_run_id()
@@ -5638,14 +5651,20 @@ def invoke_reviewer(reviewer, prompt, repo, rdir, policy):
                     safe_release = True
                 except subprocess.TimeoutExpired as error:
                     safe_release = True
-                    raw = (open(output_path, encoding="utf-8").read() if os.path.isfile(output_path)
-                           else output_text(error.stdout))
+                    if os.path.isfile(output_path):
+                        with open(output_path, encoding="utf-8") as fh:
+                            raw = fh.read()
+                    else:
+                        raw = output_text(error.stdout)
                     stderr = output_text(error.stderr)
                     raw_attempts.append(f"--- attempt {attempt} ---\n{raw}"
                                         + (f"\n[stderr]\n{stderr}" if stderr else ""))
                     raise RuntimeError(f"reviewer timed out after {timeout}s") from error
-                raw = (open(output_path, encoding="utf-8").read() if os.path.isfile(output_path)
-                       else output_text(completed.stdout))
+                if os.path.isfile(output_path):
+                    with open(output_path, encoding="utf-8") as fh:
+                        raw = fh.read()
+                else:
+                    raw = output_text(completed.stdout)
                 stderr = output_text(completed.stderr)
                 raw_attempts.append(f"--- attempt {attempt} ---\n{raw}"
                                     + (f"\n[stderr]\n{stderr}" if stderr else ""))
@@ -6814,7 +6833,11 @@ def lane_prepare_workspace(lane, rid, base_rev=None):
         if rc == 0:
             ex = ex if os.path.isabs(ex) else os.path.join(wt, ex)
             os.makedirs(os.path.dirname(ex), exist_ok=True)
-            have = open(ex).read().splitlines() if os.path.exists(ex) else []
+            if os.path.exists(ex):
+                with open(ex) as fh:
+                    have = fh.read().splitlines()
+            else:
+                have = []
             with open(ex, "a") as f:
                 for rel in linked:
                     if "/" + rel not in have:
@@ -8323,7 +8346,11 @@ def cmd_lane_status():
 def cmd_lane_assign(args):
     validate_card_type(load_policy(), getattr(args, "card_type", None))
     lane = lanes_by_name([args.name])[0]
-    task = args.prompt if args.prompt is not None else open(args.task_file).read()
+    if args.prompt is not None:
+        task = args.prompt
+    else:
+        with open(args.task_file) as fh:
+            task = fh.read()
     if not task.strip():
         print(json.dumps({"ok": False, "error": "empty task"}))
         sys.exit(1)
@@ -9854,17 +9881,18 @@ def cmd_watch(args, policy):
             if fh:
                 fh.close()
             for path in sorted(glob.glob(os.path.join(rdir, "events.*.jsonl"))):
-                for line in open(path, errors="ignore"):
-                    try:
-                        event = json.loads(line)
-                    except ValueError:
-                        continue
-                    if event.get("type") != "RATELIMIT":
-                        continue
-                    key = (path, json.dumps(event, sort_keys=True))
-                    if key not in seen_rate_limits:
-                        out("RATELIMIT", f"retry {event.get('retry')}/{event.get('max_retries')} after {event.get('wait_seconds')}s")
-                        seen_rate_limits.add(key)
+                with open(path, errors="ignore") as pf:
+                    for line in pf:
+                        try:
+                            event = json.loads(line)
+                        except ValueError:
+                            continue
+                        if event.get("type") != "RATELIMIT":
+                            continue
+                        key = (path, json.dumps(event, sort_keys=True))
+                        if key not in seen_rate_limits:
+                            out("RATELIMIT", f"retry {event.get('retry')}/{event.get('max_retries')} after {event.get('wait_seconds')}s")
+                            seen_rate_limits.add(key)
             r = jload(f"{rdir}/result.json", {}) or {}
             out("DONE", f"status={r.get('status')} backend={r.get('backend')}/{r.get('model')} "
                         f"commit={(r.get('commit') or '-')[:10]} files={len((r.get('result') or {}).get('files_changed') or [])} "
@@ -9910,16 +9938,17 @@ def run_digest(rid):
     cmds, last = 0, ""
     messages = WatchMessages()
     if st.get("events") and os.path.exists(st["events"]):
-        for line in open(st["events"], errors="ignore"):
-            try:
-                rows = messages.feed(json.loads(line))
-            except Exception:
-                continue
-            for kind, text in rows:
-                if kind in ("cmd", "tool"):
-                    cmds += 1
-                if kind == "msg":
-                    last = text
+        with open(st["events"], errors="ignore") as fh:
+            for line in fh:
+                try:
+                    rows = messages.feed(json.loads(line))
+                except Exception:
+                    continue
+                for kind, text in rows:
+                    if kind in ("cmd", "tool"):
+                        cmds += 1
+                    if kind == "msg":
+                        last = text
     end = st.get("finished") or now
     out = {"id": rid, "state": state, "status": st.get("status") or r.get("status"), "title": st.get("title"),
            "backend": st.get("backend"), "model": st.get("model"), "effort": st.get("effort"),
