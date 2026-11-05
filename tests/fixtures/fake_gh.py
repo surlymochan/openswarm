@@ -10,8 +10,29 @@ import hashlib
 import json
 import os
 import sys
+import time
 import urllib.parse
 from datetime import datetime, timezone
+
+
+# Windows: os.replace() onto the state file fails with PermissionError
+# (WinError 5) while any other handle has the destination open without
+# delete sharing -- e.g. a concurrent reader of the bus state. The lock
+# above serializes writers, not outside readers, so retry briefly instead
+# of crashing the whole gh call; the replace stays atomic.
+REPLACE_ATTEMPTS = 15
+REPLACE_BASE_DELAY = 0.04
+
+
+def replace_with_retry(src, dst):
+    for attempt in range(REPLACE_ATTEMPTS):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(min(REPLACE_BASE_DELAY * (attempt + 1), 0.2))
 
 
 def main():
@@ -44,7 +65,7 @@ def main():
         temp_path = state_path + ".tmp"
         with open(temp_path, "w") as stream:
             json.dump(state, stream)
-        os.replace(temp_path, state_path)
+        replace_with_retry(temp_path, state_path)
         print(json.dumps(answer))
     return 0
 
