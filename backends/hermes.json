@@ -1,0 +1,20 @@
+{
+  "id": "hermes",
+  "name": "Hermes agent (hermes acp)",
+  "role": "opt-in executor. Not selected unless --backend hermes is passed, or \"hermes\" is listed in routing.default_order",
+  "invoke": "hermes acp (long-lived ACP session over stdio; initialize, then session/prompt turns)",
+  "stdin": "stdio pipe carrying ACP JSON-RPC (Content-Length framed)",
+  "cwd": "<worktree>",
+  "binary_resolution": "policy hermes.binary, else ~/.local/hermes/bin/hermes; the file must exist and be executable, else the planner reports \"no working hermes binary\"",
+  "model": "--model / lane model, else policy hermes.model (null = hermes' own default); exported to the child as HERMES_MODEL",
+  "provider": "policy hermes.provider, default minimax-cn; exported to the child as HERMES_INFERENCE_PROVIDER",
+  "quota_source": "none (unknown). The planner gates only on a working binary; usage an ACP turn result reports is recorded on the run, not used for routing",
+  "steerSupport": "resident ACP: session/cancel ends the turn (stopReason cancelled) and the same session can be continued with a new prompt; one-shot runs have no live steer",
+  "streaming_events": "ACP session/update notifications (agent_message_chunk text, tool_call and tool_call_update)",
+  "costTier": "unknown",
+  "privacyRisk": "model_provider",
+  "dataBoundary": "worktree + the configured inference provider (default MiniMax via minimax-cn); hermes state stays local under HERMES_HOME (policy hermes.home, else ~/.local/hermes-home)",
+  "never": [
+    "logging or persisting the provider API key: it is read from Pi's auth store (~/.pi/agent/auth.json, minimax-cn entry) and injected into the child environment only, under policy hermes.key_env (default MINIMAX_CN_API_KEY)"
+  ]
+}
