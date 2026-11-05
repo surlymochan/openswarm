@@ -429,5 +429,70 @@ print(json.dumps({'type':'message_end','message':message}), flush=True)
         self.assertNotIn("github_pat_", str(error.exception))
 
 
+class FakeGhReplaceRetryTests(unittest.TestCase):
+    """fake_gh's state write must survive the transient Windows replace lock
+    (PermissionError / WinError 5 when a concurrent handle holds the state
+    file) instead of crashing the gh call -- the test_bus Windows flake."""
+
+    def load_fixture(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("fake_gh", FAKE_GH)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def run_fixture_main(self, module, state_path):
+        env = {"OPENSWARM_FAKE_GH_STATE": str(state_path)}
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(module.sys, "argv", ["fake_gh.py", "api", "user"]), \
+                contextlib.redirect_stdout(out):
+            rc = module.main()
+        return rc, out.getvalue()
+
+    def test_transient_replace_lock_is_retried(self):
+        module = self.load_fixture()
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "github.json"
+            state.write_text(json.dumps({"repos": {}}))
+            real_replace = os.replace
+            calls = {"n": 0}
+
+            def flaky_replace(src, dst):
+                calls["n"] += 1
+                if calls["n"] <= 2:
+                    error = PermissionError(13, "simulated WinError 5 lock")
+                    error.winerror = 5
+                    raise error
+                return real_replace(src, dst)
+
+            with mock.patch.object(os, "replace", flaky_replace):
+                rc, out = self.run_fixture_main(module, state)
+            self.assertEqual(rc, 0)
+            self.assertEqual(calls["n"], 3)
+            self.assertEqual(json.loads(out)["login"], "executor")
+            self.assertEqual(json.loads(state.read_text()), {"repos": {}})
+
+    def test_permanent_replace_lock_still_raises_after_bounded_attempts(self):
+        module = self.load_fixture()
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "github.json"
+            state.write_text(json.dumps({"repos": {}}))
+            calls = {"n": 0}
+
+            def locked_replace(src, dst):
+                calls["n"] += 1
+                error = PermissionError(13, "simulated WinError 5 lock")
+                error.winerror = 5
+                raise error
+
+            with mock.patch.object(module, "REPLACE_ATTEMPTS", 3), \
+                    mock.patch.object(module, "REPLACE_BASE_DELAY", 0), \
+                    mock.patch.object(os, "replace", locked_replace):
+                with self.assertRaises(PermissionError):
+                    self.run_fixture_main(module, state)
+            self.assertEqual(calls["n"], 3)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
