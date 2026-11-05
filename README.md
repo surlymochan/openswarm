@@ -223,6 +223,7 @@ Every subcommand, grouped by what it does. `openswarm <command> --help` lists al
 | `openswarm status` | Show plans, quota windows, models, breakers, and recommended concurrency. | `openswarm status --refresh` |
 | `openswarm probe` | Discover models, plans, and quotas into `$OPENSWARM_HOME/state.json`. | `openswarm probe --quiet` |
 | `openswarm runs` | Snapshot recent or active runs. | `openswarm runs --active --json` |
+| `openswarm resume` | Recover live runs, busy lanes and recent results after a planner restart. | `openswarm resume --since-hours 12 --json` |
 | `openswarm report` | One-screen check-in for scheduled updates: quotas, active runs, recently finished. | `openswarm report --since-minutes 60` |
 | `openswarm budget status` | Show today's executor budget usage. | `openswarm budget status --json` |
 | `openswarm ingest-claude` | Record Claude plan usage from the statusline hook or from flags. | `openswarm ingest-claude --five-hour 80 --seven-day 40` |

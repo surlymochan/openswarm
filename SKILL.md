@@ -285,6 +285,7 @@ Grouped by what the command does. `openswarm <command> --help` lists every flag.
 | `status` | Show plans, quota windows, models, breakers, and recommended concurrency. | `$XS status --refresh` |
 | `probe` | Discover models, plans, and quotas into `$OPENSWARM_HOME/state.json`. | `$XS probe --quiet` |
 | `runs` | Snapshot recent or active runs. | `$XS runs --active --json` |
+| `resume` | Recover live runs, busy lanes and recent results after a planner restart. | `$XS resume --since-hours 12 --json` |
 | `report` | One-screen check-in for scheduled updates: quotas, active runs, recently finished. | `$XS report --since-minutes 60` |
 | `budget status` | Show today's executor budget usage. | `$XS budget status --json` |
 | `ingest-claude` | Record Claude plan usage from the statusline hook or from flags. | `$XS ingest-claude --five-hour 80 --seven-day 40` |
@@ -386,6 +387,6 @@ inject it.
 
 ## Files
 
-- `bin/openswarm`: CLI (probe, status, route, run, lane, batch, bus, bus-worker, verify-remote, watch, runs, report, budget, stop, fleet, consult, review, compare, regress, routing, lessons, patterns, retro, ingest-claude, ledger)
+- `bin/openswarm`: CLI (probe, status, route, run, lane, batch, bus, bus-worker, verify-remote, watch, runs, resume, report, budget, stop, fleet, consult, review, compare, regress, routing, lessons, patterns, retro, ingest-claude, ledger)
 - `policy.json`: defaults · `backends/*.json`: harness manifests (x-agents style) · `templates/openswarm-workflow.js`: Workflow template · `tests/test_route.py`: routing scenarios
 - `$OPENSWARM_HOME/`: state, quota, ledger, breakers; `lanes.json`, `lanes/<name>/`; `fleet.json`, `batches/<id>/`, `remote-results/<id>.json`; `runs/<id>/` (task, events, result, patch), `worktrees/`
