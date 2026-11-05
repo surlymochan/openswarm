@@ -1539,23 +1539,16 @@ def _symlink(src, dst):
     os.symlink(src, dst, target_is_directory=(os.name == "nt" and os.path.isdir(src)))
 
 
-def _spawnable(cmd):
-    """Windows cannot CreateProcess a script directly (WinError 193): when the
-    target is a file with a python shebang, re-invoke it with this interpreter.
-    POSIX executes shebangs natively and never takes the fallback branch."""
-    if os.name != "nt" or not cmd:
-        return cmd
-    head = str(cmd[0])
-    if head.lower().endswith((".exe", ".com", ".bat", ".cmd")):
-        return cmd
-    try:
-        with open(head, "rb") as fh:
-            first = fh.readline(256).decode("utf-8", "replace")
-    except OSError:
-        return cmd
-    if first.startswith("#!") and "python" in first:
-        return [sys.executable, *cmd]
-    return cmd
+def _load_spawnable():
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "_spawnable.py")
+    spec = importlib.util.spec_from_file_location("_spawnable", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.spawnable
+
+
+_spawnable = _load_spawnable()
 
 
 def sh(cmd, timeout=60, env=None, cwd=None):
