@@ -48,7 +48,7 @@ class PolicyStaleness(unittest.TestCase):
         shipped = xs.jload(os.path.join(xs.SKILL_DIR, "policy.json"), {})
         r = xs.policy_staleness(shipped)
         self.assertIsNotNone(r)
-        self.assertEqual(r["last_updated"], "2026-10-06")
+        self.assertEqual(r["last_updated"], "2026-11-06")
 
 
 if __name__ == "__main__":
