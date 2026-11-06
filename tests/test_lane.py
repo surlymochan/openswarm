@@ -122,6 +122,15 @@ class LaneTests(unittest.TestCase):
         except (OSError, ValueError):
             return {}
 
+    def lane_turn_state(self, lane_name):
+        # Same source `lane status` reports as run_state: the lane's
+        # state.json turn_state. Read the file directly so the queued
+        # observation can be taken in the same poll as the run status.
+        try:
+            return json.loads((self.data / "lanes" / lane_name / "state.json").read_text())
+        except (OSError, ValueError):
+            return {}
+
     def test_assign_commits_and_writes_normal_result(self):
         self.set_config("pi")
         knowledge = self.root / "knowledge"
@@ -248,11 +257,19 @@ class LaneTests(unittest.TestCase):
         first = self.assign("LANE_TEST_WAIT_SHORT first provider task")
         self.wait_running(first)
         second = json.loads(self.cli("lane", "assign", "L2", "--prompt", "second provider task").stdout)["id"]
-        queued = self.wait_for(lambda: (state if (state := self.run_state(second)).get("queue_reason") else None),
-                               description="second provider turn to queue")
-        self.assertEqual(queued["queue_reason"], "provider concurrency limit")
-        lanes = {row["name"]: row for row in json.loads(self.cli("lane", "status").stdout)}
-        self.assertEqual(lanes["L2"]["run_state"], "queued")
+        # The first turn is short (LANE_TEST_WAIT_SHORT waits 1s), so the
+        # second turn may start running between two separate reads. Poll the
+        # run status and the lane turn state in the same wait_for iteration
+        # and only accept the pair while both still show queued; accepting
+        # "running" here would mask a cap that never queued the turn.
+        queued = self.wait_for(
+            lambda: ((state, turn_state)
+                     if (state := self.run_state(second)).get("queue_reason") == "provider concurrency limit"
+                     and (turn_state := self.lane_turn_state("L2").get("turn_state")) == "queued"
+                     else None),
+            description="second provider turn to queue")
+        self.assertEqual(queued[0]["queue_reason"], "provider concurrency limit")
+        self.assertEqual(queued[1], "queued")
         self.assertEqual(self.wait_run(first)["status"], "done")
         self.assertEqual(self.wait_run(second)["status"], "done")
 
