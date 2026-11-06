@@ -2635,7 +2635,6 @@ def cmd_retro(args, policy):
 
     entries = [entry for entry in ledger_entries_from(fleet_ledger_path())
                if cutoff <= (to_epoch(entry.get("ts")) or 0) <= now]
-    failures = retro_failure_counts(entries)
     rejected = retro_rejected(entries)
     compare_rows = retro_routing_rows(ledger_entries_from(fleet_ledger_path()), cutoff, now)
     proposal_snapshot_after = retro_snapshot_proposals(repo)
@@ -3097,7 +3096,7 @@ def plan_deepseek(prof, st, policy, forced, notes):
         return None, f"deepseek unavailable ({ds.get('error', 'no balance info')})"
     if ds["balance"] < policy["thresholds"]["deepseek_min_balance_cny"]:
         return None, f"deepseek balance {ds['balance']} below floor"
-    if f"deepseek/all" in breakers():
+    if "deepseek/all" in breakers():
         return None, "deepseek breaker open"
     tier = policy["difficulty_map"][str(prof["difficulty"])]["tier"]
     model = policy["deepseek"]["tiers"][tier]
@@ -4840,7 +4839,7 @@ def run_verify(cmd, wd, timeout):
     try:
         p = subprocess.run(cmd, shell=True, cwd=wd, capture_output=True, text=True, timeout=timeout)
         rc, out = p.returncode, p.stdout + p.stderr
-    except subprocess.TimeoutExpired as e:
+    except subprocess.TimeoutExpired:
         rc, out = 124, f"verify timed out after {timeout}s"
     return {"cmd": cmd, "rc": rc, "tail": out[-1500:], "failing": sorted(failing_tests(out))}
 
