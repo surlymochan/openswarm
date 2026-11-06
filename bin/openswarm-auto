@@ -2,7 +2,6 @@
 """Choose an available production lane from task type and difficulty."""
 import argparse
 import json
-import os
 from pathlib import Path
 import subprocess
 import sys

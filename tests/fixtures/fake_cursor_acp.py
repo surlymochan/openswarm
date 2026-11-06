@@ -5,7 +5,6 @@ import os
 import select
 import subprocess
 import sys
-import time
 
 # The prompt asks for a JSON report with this wording; a prompt without it gets no report.
 REPORT_MARKER = "your FINAL message must be ONLY a JSON object"

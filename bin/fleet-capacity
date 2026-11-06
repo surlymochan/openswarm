@@ -27,7 +27,6 @@ def _load_spawnable():
 _spawnable = _load_spawnable()
 
 
-import sys
 import time
 
 ALLOWED = {'codex', 'pi', 'cursor', 'agy', 'copilot'}

@@ -2,7 +2,6 @@ import argparse
 import contextlib
 import io
 import json
-import os
 import pathlib
 import subprocess
 import tempfile

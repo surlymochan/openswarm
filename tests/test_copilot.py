@@ -1,5 +1,4 @@
 """Exercise Copilot's JSONL adapter with a controlled local process."""
-import json
 import os
 import pathlib
 import sys
@@ -58,7 +57,7 @@ class CopilotTests(unittest.TestCase):
                     self.assertNotEqual(rc, 0)
 
     def test_missing_model_fails_closed(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory():
             with mock.patch.object(xs, "copilot_bin", return_value="/bin/true"):
                 policy = xs.load_policy()
                 policy["copilot"]["default_model"] = None
