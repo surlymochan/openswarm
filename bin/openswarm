@@ -3239,7 +3239,7 @@ def pi_bin():
     if env_bin:
         return env_bin if os.access(env_bin, os.X_OK) else None
     isolated = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pi-isolated")
-    if os.path.isfile(isolated) and os.access(isolated, os.X_OK):
+    if sys.platform != "darwin" and os.path.isfile(isolated) and os.access(isolated, os.X_OK):
         return isolated
     found = shutil.which("pi")
     if found and os.access(found, os.X_OK):
@@ -3259,16 +3259,16 @@ def probe_pi(policy):
 def plan_pi(prof, st, policy, forced, notes):
     known = st.get("pi") if isinstance(st.get("pi"), dict) else None
     cfg = policy.get("pi") or {}
-    binary = pi_bin() if cfg.get("require_isolation", True) else (
+    binary = pi_bin() if cfg.get("require_isolation", sys.platform != "darwin") else (
         known.get("binary") if known is not None and "binary" in known else pi_bin())
     if not binary:
         return None, "no working pi binary"
-    if cfg.get("require_isolation", True):
+    if cfg.get("require_isolation", sys.platform != "darwin"):
         expected = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pi-isolated")
         if os.path.realpath(binary) != os.path.realpath(expected):
             return None, "pi requires the isolated launcher"
     model = prof.get("model") or cfg.get("default_model")
-    if cfg.get("require_isolation", True):
+    if cfg.get("require_isolation", sys.platform != "darwin"):
         expected_model = envvar("PI_ISOLATED_MODEL") or "MiniMax-M3.1-Flash"
         if cfg.get("provider") != "minimax-cn" or model != expected_model:
             return None, "isolated Pi provider or model does not match the broker"
@@ -5344,7 +5344,7 @@ def review_available(policy):
         override_name = {"agy": "AGY_BIN", "pi": "PI_BIN", "cursor": "CURSOR_BIN"}.get(backend)
         explicit_override = envvar(override_name) if override_name else None
         binary = None
-        if backend == "pi" and (policy.get("pi") or {}).get("require_isolation", True):
+        if backend == "pi" and (policy.get("pi") or {}).get("require_isolation", sys.platform != "darwin"):
             binary = pi_bin()
         elif explicit_override:
             binary = {"agy": agy_bin, "pi": pi_bin, "cursor": cursor_bin}[backend]()
@@ -5473,7 +5473,7 @@ def review_command(reviewer, prompt, repo, scratch_dir, policy):
         if model:
             command += ["--model", model]
     elif backend == "pi":
-        if cfg.get("require_isolation", True):
+        if cfg.get("require_isolation", sys.platform != "darwin"):
             expected = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pi-isolated")
             if os.path.realpath(binary) != os.path.realpath(expected):
                 raise ValueError("read-only Pi review requires the isolated launcher")
@@ -6602,7 +6602,12 @@ def lane_state_path(name):
 
 
 def lane_socket_path(name):
-    return os.path.join(lane_root(name), "ctl.sock")
+    path = os.path.join(lane_root(name), "ctl.sock")
+    if sys.platform == "darwin" and len(os.fsencode(path)) > 103:
+        # Both the supervisor and clients must independently derive the same short path.
+        digest = hashlib.sha256(os.fsencode(os.path.abspath(path))).hexdigest()[:32]
+        return f"/tmp/openswarm-{os.getuid()}-{digest}.sock"
+    return path
 
 
 def lane_last_log_error(name):
@@ -6648,7 +6653,7 @@ def lane_config():
         names.add(name)
         if backend not in ("codex", "cursor", "agy", "pi", "hermes", "copilot"):
             raise ValueError(f"invalid lane config {where}: unsupported backend")
-        if backend == "pi" and (load_policy().get("pi") or {}).get("require_isolation", True):
+        if backend == "pi" and (load_policy().get("pi") or {}).get("require_isolation", sys.platform != "darwin"):
             expected = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pi-isolated")
             if lane.get("binary") and os.path.realpath(lane["binary"]) != os.path.realpath(expected):
                 raise ValueError(f"invalid lane config {where}: pi requires the isolated launcher")
@@ -6874,7 +6879,7 @@ class LaneChild:
             binary = envvar("PI_RPC_BIN") or lane.get("binary") or pi_bin()
             if not binary:
                 raise RuntimeError("pi binary not found; set lane binary or install Pi")
-            if (policy.get("pi") or {}).get("require_isolation", True):
+            if (policy.get("pi") or {}).get("require_isolation", sys.platform != "darwin"):
                 expected = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pi-isolated")
                 if os.path.realpath(binary) != os.path.realpath(expected):
                     raise RuntimeError("pi RPC requires the isolated launcher")

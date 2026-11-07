@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import pathlib
@@ -130,6 +131,21 @@ class LaneTests(unittest.TestCase):
             return json.loads((self.data / "lanes" / lane_name / "state.json").read_text())
         except (OSError, ValueError):
             return {}
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin socket path fallback")
+    def test_pi_lane_long_socket_path(self):
+        self.data = self.root / ("long-path-" * 12)
+        self.env["OPENSWARM_HOME"] = str(self.data)
+        self.set_config("pi")
+        original = self.data / "lanes" / self.lane_name / "ctl.sock"
+        self.assertGreater(len(os.fsencode(original)), 103)
+        digest = hashlib.sha256(os.fsencode(os.path.abspath(original))).hexdigest()[:32]
+        short = pathlib.Path(f"/tmp/openswarm-{os.getuid()}-{digest}.sock")
+        self.start_lane()
+        self.assertTrue(short.exists())
+        self.assertTrue(json.loads(self.cli("lane", "status").stdout))
+        self.cli("lane", "down", self.lane_name)
+        self.wait_for(lambda: not short.exists(), description="short socket cleanup")
 
     def test_assign_commits_and_writes_normal_result(self):
         self.set_config("pi")
