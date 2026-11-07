@@ -11,12 +11,14 @@ xs = _load.load()
 
 
 class PiDefaultSafetyTests(unittest.TestCase):
+    @mock.patch.object(xs.sys, 'platform', 'linux')
     def test_unisolated_binary_is_not_routed(self):
         with mock.patch.object(xs, 'pi_bin', return_value='/usr/bin/pi'):
             decision, reason = xs.plan_pi({'difficulty': 3}, {}, xs.load_policy(), True, [])
         self.assertIsNone(decision)
         self.assertIn('isolated launcher', reason)
 
+    @mock.patch.object(xs.sys, 'platform', 'linux')
     def test_review_can_use_pi_worktree(self):
         decision, reason = xs.plan_pi({'difficulty': 3, 'read_only': True}, {}, xs.load_policy(), True, [])
         self.assertIsNone(reason)

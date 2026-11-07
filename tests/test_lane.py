@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import pathlib
@@ -130,6 +131,42 @@ class LaneTests(unittest.TestCase):
             return json.loads((self.data / "lanes" / lane_name / "state.json").read_text())
         except (OSError, ValueError):
             return {}
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin socket path fallback")
+    def test_pi_lane_long_socket_path(self):
+        self.data = self.root / ("long-path-" * 12)
+        self.env["OPENSWARM_HOME"] = str(self.data)
+        self.set_config("pi")
+        original = self.data / "lanes" / self.lane_name / "ctl.sock"
+        self.assertGreater(len(os.fsencode(original)), 103)
+        digest = hashlib.sha256(os.fsencode(os.path.realpath(original))).hexdigest()[:32]
+        short = pathlib.Path(f"/tmp/openswarm-{os.getuid()}-{digest}.sock")
+        self.start_lane()
+        self.assertTrue(short.exists())
+        self.assertTrue(json.loads(self.cli("lane", "status").stdout))
+        self.cli("lane", "down", self.lane_name)
+        self.wait_for(lambda: not short.exists(), description="short socket cleanup")
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin socket path fallback")
+    def test_long_socket_path_symlink_rejects_second_supervisor(self):
+        self.data = self.root / ("long-path-" * 12)
+        self.env["OPENSWARM_HOME"] = str(self.data)
+        self.set_config("pi")
+        alias = self.root / ("alias-path-" * 11)
+        alias.symlink_to(self.data, target_is_directory=True)
+        original = self.data / "lanes" / self.lane_name / "ctl.sock"
+        alias_socket = alias / "lanes" / self.lane_name / "ctl.sock"
+        self.assertGreater(len(os.fsencode(alias_socket)), 103)
+        digest = hashlib.sha256(os.fsencode(os.path.realpath(original))).hexdigest()[:32]
+        short = pathlib.Path(f"/tmp/openswarm-{os.getuid()}-{digest}.sock")
+        self.start_lane()
+        self.assertTrue(short.exists())
+        alias_env = dict(self.env, OPENSWARM_HOME=str(alias))
+        second = subprocess.run([sys.executable, str(CLI), "lane", "serve", self.lane_name],
+                                env=alias_env, text=True, capture_output=True, timeout=15)
+        self.assertNotEqual(second.returncode, 0)
+        self.assertIn("lane supervisor is already listening", second.stderr)
+        self.assertTrue(json.loads(self.cli("lane", "status").stdout))
 
     def test_assign_commits_and_writes_normal_result(self):
         self.set_config("pi")
