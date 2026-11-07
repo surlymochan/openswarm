@@ -6605,7 +6605,7 @@ def lane_socket_path(name):
     path = os.path.join(lane_root(name), "ctl.sock")
     if sys.platform == "darwin" and len(os.fsencode(path)) > 103:
         # Both the supervisor and clients must independently derive the same short path.
-        digest = hashlib.sha256(os.fsencode(os.path.abspath(path))).hexdigest()[:32]
+        digest = hashlib.sha256(os.fsencode(os.path.realpath(path))).hexdigest()[:32]
         return f"/tmp/openswarm-{os.getuid()}-{digest}.sock"
     return path
 
