@@ -3,6 +3,7 @@
 Covers json event parsing, usage on result.json and the ledger, budget kill, routing opt-in.
 """
 import argparse, contextlib, io, json, os, shutil, stat, sys, tempfile, textwrap, unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _load  # noqa: E402
@@ -101,6 +102,24 @@ class PiBackend(unittest.TestCase):
             entry = json.loads(f.readlines()[-1])
         with open(os.path.join(xs.RUNS, entry["id"], "result.json")) as f:
             return entry, json.load(f)
+
+    def test_stop_queued_run_finalizes_without_killing_runner(self):
+        def stop_while_queued(rdir, *args, **kwargs):
+            xs.set_status(rdir, state="queued", queue_reason="provider concurrency limit")
+            xs.cmd_stop(argparse.Namespace(run_id=os.path.basename(rdir)), POLICY)
+            self.assertFalse(kwargs["keep_waiting"]())
+            return False
+
+        with mock.patch.object(xs, "reserve_provider_slot", side_effect=stop_while_queued), \
+             mock.patch.object(xs, "kill_tree") as kill:
+            self.dispatch()
+        entry, result = self.last_result()
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(result["error_class"], "stopped")
+        self.assertEqual(entry["status"], "stopped")
+        self.assertEqual(xs.jload(os.path.join(result["run_dir"], "status.json"), {})["state"], "finished")
+        self.assertFalse(os.path.exists(self.log))
+        kill.assert_not_called()
 
     def test_not_auto_selected_and_forced_model(self):
         for kind, diff in (("impl", 3), ("review", 3), ("mechanical", 1)):

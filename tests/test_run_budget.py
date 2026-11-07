@@ -91,6 +91,39 @@ class QueueBudgetTests(unittest.TestCase):
         self.assertEqual(len(attempts), 2)
         self.assertEqual(xs.jload(str(self.rdir / 'status.json'), {})['queued_seconds'], 360.0)
 
+    def test_lane_cancel_during_second_capacity_wait_counts_both_waits(self):
+        lane = {'name': 'L1', 'backend': 'pi', 'model': 'fake', 'fallback_models': ['other']}
+        spec = {'run_id': 'run', 'task': 'task', 'started': 100.0,
+                'queued_at': 100.0, 'budget_minutes': 1}
+        workspace = {'repo': self.tmp.name, 'root': self.tmp.name, 'path': self.tmp.name}
+        child = mock.Mock()
+        child.alive.return_value = True
+
+        def reserve(*args, **kwargs):
+            self.clock[0] += 180
+            if self.clock[0] > 300:
+                spec['abort_requested'] = True
+                return False
+            return True
+
+        turn = mock.Mock(return_value=(None, {}, 'exec_error', 1, 'events', 'model not available'))
+        finalize = mock.Mock(side_effect=lambda lane, spec, *args, **kwargs: dict(spec))
+        with mock.patch.object(xs, 'RUNS', self.tmp.name), \
+             mock.patch.object(xs, 'NOW', side_effect=lambda: self.clock[0]), \
+             mock.patch.object(xs, 'lane_prepare_workspace', return_value=workspace), \
+             mock.patch.object(xs, 'run_workspace_prepare', return_value=None), \
+             mock.patch.object(xs, 'add_lessons_to_prompt', side_effect=lambda prompt, *a: (prompt, [])), \
+             mock.patch.object(xs, 'add_patterns_to_prompt', side_effect=lambda prompt, *a: (prompt, [])), \
+             mock.patch.object(xs, 'reserve_provider_slot', side_effect=reserve), \
+             mock.patch.object(xs, 'lane_run_turn', turn), \
+             mock.patch.object(xs, 'trip_breaker'), \
+             mock.patch.object(xs, 'lane_finalize_run', finalize):
+            result = xs.lane_do_run(lane, spec, child, None, {})
+        self.assertEqual(result['queued_seconds'], 360.0)
+        self.assertEqual(xs.jload(str(self.rdir / 'status.json'), {})['queued_seconds'], 360.0)
+        self.assertEqual(finalize.call_args.args[5], 'stopped')
+        turn.assert_called_once()
+
 
 if __name__ == '__main__':
     unittest.main()

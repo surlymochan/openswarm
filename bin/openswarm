@@ -4205,6 +4205,10 @@ def _run_proc(cmd, cwd, env, timeout, out_path, abort_re=None):
                     return 133
             if done:
                 return p.returncode
+            if (jload(os.path.join(rdir, "status.json"), {}) or {}).get("stop_requested"):
+                kill_tree(p.pid)
+                p.wait()
+                return 130
             if NOW() >= end:
                 kill_tree(p.pid)
                 try:
@@ -8005,6 +8009,9 @@ def lane_do_run(lane, spec, child, server, current):
 
                 if not reserve_provider_slot(os.path.join(RUNS, rid), attempt_lane["backend"], provider,
                                              load_policy(), lane_name=lane["name"], keep_waiting=keep_waiting):
+                    queued_from = spec.get("queued_at", queue_start) if first_start else queue_start
+                    spec["queued_seconds"] = spec.get("queued_seconds", 0) + max(0, NOW() - queued_from)
+                    set_status(rdir, queued_seconds=round(spec["queued_seconds"], 3))
                     error_class = ("stopped" if spec.get("abort_requested") or spec.get("down_requested") else
                                    "exec_error" if not child.alive() else "budget_exceeded")
                     rc, final, usage, error_tail = (130 if error_class == "stopped" else 124 if error_class == "budget_exceeded" else 1), None, {}, None
@@ -10310,7 +10317,7 @@ def cmd_stop(args, policy):
     set_status(rdir, stop_requested=NOW())
     killed = []
     # Stop the executor first so the runner can still finalize (commit partial work, write result/ledger).
-    targets = ["executor_pid"] if pid_alive(st.get("executor_pid")) else ["runner_pid"]
+    targets = ["executor_pid"] if st.get("state") != "queued" else []
     for k in targets:
         pid = st.get(k)
         if pid and pid_alive(pid):
