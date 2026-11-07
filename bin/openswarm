@@ -10317,7 +10317,10 @@ def cmd_stop(args, policy):
     set_status(rdir, stop_requested=NOW())
     killed = []
     # Stop the executor first so the runner can still finalize (commit partial work, write result/ledger).
-    targets = ["executor_pid"] if st.get("state") != "queued" else []
+    # Queued runs have no executor yet: kill nothing so the runner can finalize the stopped result.
+    # Otherwise keep the old fallback: a dead/missing executor means the runner itself is the target.
+    targets = ([] if st.get("state") == "queued" else
+               ["executor_pid"] if pid_alive(st.get("executor_pid")) else ["runner_pid"])
     for k in targets:
         pid = st.get(k)
         if pid and pid_alive(pid):

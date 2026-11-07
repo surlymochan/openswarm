@@ -121,6 +121,27 @@ class PiBackend(unittest.TestCase):
         self.assertFalse(os.path.exists(self.log))
         kill.assert_not_called()
 
+    def test_stop_dead_executor_falls_back_to_runner(self):
+        # Regression pin for the queue-budget cmd_stop change: a queued run
+        # must not kill anything, but a running run whose executor is already
+        # dead must still kill the runner (the old fallback).
+        cases = (("queued", False), ("running", True))
+        for state, expect_kill in cases:
+            rdir = os.path.join(self.tmp, f"run-{state}")
+            os.makedirs(rdir)
+            xs.jsave(os.path.join(rdir, "status.json"),
+                     {"id": f"run-{state}", "state": state,
+                      "executor_pid": 999999, "runner_pid": 12345})
+            with mock.patch.object(xs, "RUNS", self.tmp), \
+                 mock.patch.object(xs, "pid_alive", side_effect=lambda pid: pid == 12345), \
+                 mock.patch.object(xs, "kill_tree") as kill:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    xs.cmd_stop(argparse.Namespace(run_id=f"run-{state}"), POLICY)
+            if expect_kill:
+                kill.assert_called_once_with(12345)
+            else:
+                kill.assert_not_called()
+
     def test_not_auto_selected_and_forced_model(self):
         for kind, diff in (("impl", 3), ("review", 3), ("mechanical", 1)):
             self.assertNotEqual(self.route({"type": kind, "difficulty": diff}).get("backend"), "pi")
