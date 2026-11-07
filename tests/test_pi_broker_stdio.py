@@ -1,6 +1,7 @@
 """Smoke tests for bin/pi-broker-stdio: stdin <-> broker-socket relay."""
 import os
 import pathlib
+import select
 import socket
 import subprocess
 import sys
@@ -26,7 +27,15 @@ def _socket_path(home):
 
 
 def _start_echo_server(path):
-    """Listen on path; accept one connection, echo everything back, close on half-close."""
+    """Listen on path; accept one connection and echo everything back.
+
+    Reads and writes through one select loop with an output buffer: a
+    naive recv-then-sendall loop deadlocks against the relay under test
+    once both directions hold more than a socket buffer (macOS unix
+    buffers are small) — each side blocks sending while the other
+    blocks sending, neither reading. On client half-close, flush the
+    pending echo before closing.
+    """
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(path))
     server.listen(1)
@@ -37,16 +46,37 @@ def _start_echo_server(path):
             conn, _ = server.accept()
         except socket.timeout:
             return
-        with conn:
-            conn.settimeout(15)
-            try:
-                while True:
-                    data = conn.recv(65536)
-                    if not data:
-                        return
-                    conn.sendall(data)
-            except socket.timeout:
-                return
+        conn.setblocking(False)
+        out = bytearray()
+        peer_closed = False
+        try:
+            while True:
+                readable, writable, _ = select.select(
+                    [conn] if not peer_closed else [],
+                    [conn] if out else [], [], 15)
+                if not readable and not writable:
+                    return
+                if readable:
+                    try:
+                        data = conn.recv(65536)
+                    except BlockingIOError:
+                        data = None
+                    if data == b'':
+                        peer_closed = True
+                    elif data:
+                        out += data
+                if writable and out:
+                    try:
+                        sent = conn.send(out)
+                    except BlockingIOError:
+                        sent = 0
+                    del out[:sent]
+                if peer_closed and not out:
+                    return
+        except OSError:
+            return
+        finally:
+            conn.close()
 
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()
