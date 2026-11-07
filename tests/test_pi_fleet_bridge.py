@@ -18,9 +18,18 @@ import unittest
 SCRIPT = pathlib.Path(__file__).resolve().parents[1] / 'bin' / 'pi-fleet-bridge'
 
 
+def _temp_home():
+    """Short temp HOME so paths stay short; on Windows there is no /tmp,
+    so fall back to the platform default temp dir (same shape as the
+    pi-broker-service smoke tests)."""
+    if os.name == 'nt':
+        return tempfile.TemporaryDirectory(prefix='os-')
+    return tempfile.TemporaryDirectory(prefix='os-', dir='/tmp')
+
+
 class PiFleetBridgeArgparseTests(unittest.TestCase):
     def _run(self, *args):
-        with tempfile.TemporaryDirectory(prefix='os-', dir='/tmp') as home:
+        with _temp_home() as home:
             env = dict(os.environ, HOME=home)
             return subprocess.run([sys.executable, str(SCRIPT), *args],
                                   stdout=subprocess.PIPE,
