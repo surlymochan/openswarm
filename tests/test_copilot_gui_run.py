@@ -80,7 +80,11 @@ class CopilotGuiRunWorkerTests(unittest.TestCase):
         """Write request.json + a listening control socket; return root."""
         root = pathlib.Path(home) / 'work'
         root.mkdir(parents=True)
-        workdir = pathlib.Path(home) / 'cwd'
+        # Resolve before writing request.json: os.getcwd() in the child
+        # resolves symlinks (macOS /tmp -> /private/tmp), so the
+        # requested cwd must already be resolved for the assertion to
+        # agree on every platform.
+        workdir = (pathlib.Path(home) / 'cwd').resolve()
         workdir.mkdir()
         (root / 'request.json').write_text(
             json.dumps({'cwd': str(workdir), 'args': args}))
