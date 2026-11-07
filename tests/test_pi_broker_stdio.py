@@ -12,6 +12,15 @@ SCRIPT = pathlib.Path(__file__).resolve().parents[1] / 'bin' / 'pi-broker-stdio'
 SOCKET_REL = pathlib.Path('Library') / 'Caches' / 'openswarm-pi-broker' / 'broker.sock'
 
 
+def _temp_home():
+    """Short temp HOME so the broker socket path stays under the AF_UNIX
+    limit (104 chars on macOS): the default macOS temp dir is too long
+    once Library/Caches/openswarm-pi-broker/broker.sock is appended."""
+    if os.name == 'nt':
+        return tempfile.TemporaryDirectory(prefix='os-')
+    return tempfile.TemporaryDirectory(prefix='os-', dir='/tmp')
+
+
 def _socket_path(home):
     return pathlib.Path(home) / SOCKET_REL
 
@@ -77,7 +86,7 @@ class PiBrokerStdioTests(unittest.TestCase):
                               env=env, timeout=15)
 
     def test_relay_round_trip(self):
-        with tempfile.TemporaryDirectory() as home:
+        with _temp_home() as home:
             path = _socket_path(home)
             path.parent.mkdir(parents=True)
             server, _thread = _start_echo_server(path)
@@ -91,7 +100,7 @@ class PiBrokerStdioTests(unittest.TestCase):
     def test_relay_large_payload(self):
         # 200 KB forces several 64 KB reads/writes through the relay loop.
         payload = (b'0123456789abcdef' * 12500)[:200000]
-        with tempfile.TemporaryDirectory() as home:
+        with _temp_home() as home:
             path = _socket_path(home)
             path.parent.mkdir(parents=True)
             server, _thread = _start_echo_server(path)
@@ -105,7 +114,7 @@ class PiBrokerStdioTests(unittest.TestCase):
     def test_broker_close_ends_relay(self):
         # Broker speaks first and closes while stdin is still open: the relay
         # must exit 0 on socket EOF instead of waiting on stdin forever.
-        with tempfile.TemporaryDirectory() as home:
+        with _temp_home() as home:
             path = _socket_path(home)
             path.parent.mkdir(parents=True)
             server, _thread = _start_greeting_server(path, b'goodbye\n')
@@ -124,7 +133,7 @@ class PiBrokerStdioTests(unittest.TestCase):
             self.assertEqual(proc.stdout.read(), b'goodbye\n')
 
     def test_missing_socket_exits_nonzero(self):
-        with tempfile.TemporaryDirectory() as home:
+        with _temp_home() as home:
             proc = self._run(home, b'hello\n')
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn(b'FileNotFoundError', proc.stderr)
