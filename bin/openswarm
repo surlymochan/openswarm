@@ -3621,8 +3621,7 @@ def reserve_provider_slot(rdir, backend, provider, policy, lane_name=None, keep_
             else:
                 admitted = False
             if admitted and keep_waiting and not keep_waiting():
-                # The coordinator call may have taken longer than the task's
-                # budget or overlapped cancellation. Do not start an executor.
+                # The coordinator call may have overlapped cancellation or expiry.
                 release_fleet_slot(rdir)
                 return False
             if admitted:
@@ -3720,11 +3719,15 @@ def run_executor_with_rate_limit(backend, decision, state, prompt, wd, rdir, bud
             call_decision["_resume_session"] = resume_session if backend in ("codex", "agy") else True
         before = quota_used(state, decision)
 
+        queue_start = NOW()
         if not reserve_provider_slot(
                 rdir, backend, provider, policy,
                 keep_waiting=lambda: not (jload(os.path.join(rdir, "status.json"), {}) or {}).get("stop_requested")
-                and NOW() < budget_deadline):
-            stopped = bool((jload(os.path.join(rdir, "status.json"), {}) or {}).get("stop_requested"))
+                and (first_attempt == 1 and not attempts or queue_start < budget_deadline)):
+            status = jload(os.path.join(rdir, "status.json"), {}) or {}
+            stopped = bool(status.get("stop_requested"))
+            queued_from = status.get("queued_at", queue_start) if first_attempt == 1 and not attempts else queue_start
+            set_status(rdir, queued_seconds=round(status.get("queued_seconds", 0) + max(0, NOW() - queued_from), 3))
             error_class = "stopped" if stopped else "budget_exceeded"
             attempts.append({"backend": backend, "model": decision.get("model"), "effort": decision.get("effort"),
                              "rc": 130 if stopped else 124, "seconds": 0, "error_class": error_class,
@@ -3732,10 +3735,22 @@ def run_executor_with_rate_limit(backend, decision, state, prompt, wd, rdir, bud
                              "quota_before": before})
             return attempts, None, error_class
 
+        admitted_at = NOW()
+        status = jload(os.path.join(rdir, "status.json"), {}) or {}
+        if first_attempt == 1 and not attempts and status.get("budget_minutes") is not None:
+            budget_deadline = admitted_at + float(status["budget_minutes"]) * 60
+        else:
+            budget_deadline += max(0, admitted_at - queue_start)
+        queued_seconds = status.get("queued_seconds", 0) + max(
+            0, admitted_at - (status.get("queued_at", queue_start) if first_attempt == 1 and not attempts else queue_start))
+        effective_start = (status.get("started", admitted_at) + max(0, admitted_at - queue_start)
+                           if status.get("execution_started") else admitted_at)
         set_status(rdir, state="running", backend=backend, model=decision.get("model"),
                    effort=decision.get("effort"), provider=provider,
                    concurrency_keys=concurrency_keys(backend, provider), attempt=attempt_number,
-                   deadline=budget_deadline, workspace=wd)
+                   deadline=budget_deadline, queued_seconds=round(queued_seconds, 3),
+                   started=effective_start,
+                   execution_started=status.get("execution_started") or admitted_at, workspace=wd)
         started = NOW()
         timeout = max(0, budget_deadline - NOW())
         rc, final, meta, err_text = EXECUTORS[backend](call_decision, state, current_prompt, wd,
@@ -5073,9 +5088,10 @@ def cmd_run(args, policy):
         print(json.dumps({"id": rid, "dry_run": True, "decision": decision,
                           **routing_fields}, indent=2, ensure_ascii=False))
         return
+    queued_at = (jload(f"{rdir}/status.json", {}) or {}).get("queued_at", NOW())
     try:
         admit_budget(policy, decision["backend"], budget_min, rdir, id=rid, state="queued", title=title,
-                     profile=prof, started=NOW(), runner_pid=os.getpid(), cwd=os.path.abspath(args.cwd))
+                     profile=prof, started=queued_at, queued_at=queued_at, runner_pid=os.getpid(), cwd=os.path.abspath(args.cwd))
     except BudgetExceeded as error:
         set_status(rdir, state="budget_rejected")
         budget_error(error)
@@ -5173,6 +5189,7 @@ def cmd_run(args, policy):
         tried.append(b)
         current_attempts, final, err_class = run_executor_with_rate_limit(
             b, decision, st, prompt, ws["path"], rdir, deadline, policy, first_attempt=len(attempts) + 1)
+        deadline = (jload(f"{rdir}/status.json", {}) or {}).get("deadline", deadline)
         attempts.extend(current_attempts)
         if err_class == "model_unavailable":  # same backend, next model in the tier
             trip_breaker(f"{b}/{decision['model']}", policy, attempts[-1].get("error_tail") or "model unavailable")
@@ -5282,6 +5299,7 @@ def cmd_run(args, policy):
         "title": title, "prepare": prepare, "workspace_note": note, "verify": verify, "verify_note": verify_note,
         "backend": decision["backend"], "model": decision["model"], "effort": decision.get("effort"),
         "usage": usage, "seconds": wall_seconds,
+        "queued_seconds": (jload(f"{rdir}/status.json", {}) or {}).get("queued_seconds", 0),
         "risk_blocks": (jload(f"{rdir}/status.json", {}) or {}).get("risk_blocks", []),
         "result": result, "workspace": {k: v for k, v in ws.items() if k in ("mode", "path", "repo", "base", "note")},
         **fin, "attempts": attempts, "claude_review": decision.get("claude_review"),
@@ -7235,8 +7253,10 @@ def lane_control_messages(server, lane, current, child, turn, pending):
                             f.write(task)
                         spec = {k: req.get(k) for k in ("title", "verify", "verify_baseline", "budget_minutes", "base",
                                                         "card_type", "rework_of", "paths", "regress_label", "read_only")}
+                        spec["budget_minutes"] = budget
                         provider = execution_provider(lane["backend"], policy=load_policy(), lane=lane)
                         spec.update({"run_id": rid, "task": task, "started": NOW(), "provider": provider})
+                        spec["queued_at"] = spec["started"]
                         spec["_event_file"] = os.path.join(rdir, f"events.1.{lane['backend']}.jsonl")
                         open(spec["_event_file"], "w").close()
                         current.update(spec)
@@ -7884,7 +7904,9 @@ def lane_finalize_run(lane, spec, ws, final, usage, error_class, rc, event_file,
            "verify_note": verify_note, "backend": lane["backend"], "model": model, "effort": lane.get("effort"),
            **({"resolved_model": model} if lane["backend"] in ("cursor", "copilot") else {}),
            "risk_blocks": spec.get("risk_blocks", []), "review_changes_discarded": bool(read_only and changed),
-           "usage": usage, "seconds": round(sum(attempt["seconds"] for attempt in attempts), 3), "result": final, "workspace":
+           "usage": usage, "seconds": round(sum(attempt["seconds"] for attempt in attempts), 3),
+           "queued_seconds": round(spec.get("queued_seconds", max(0, NOW() - spec.get("queued_at", NOW()))), 3),
+           "result": final, "workspace":
            {k: v for k, v in ws.items() if k in ("mode", "path", "repo", "base", "note", "lane")},
            **fin, "attempts": attempts, "run_dir": rdir}
     jsave(os.path.join(rdir, "result.json"), out)
@@ -7973,15 +7995,19 @@ def lane_do_run(lane, spec, child, server, current):
                 attempt_number += 1
                 provider = execution_provider(attempt_lane["backend"], lane=attempt_lane)
                 deadline = spec["started"] + max(0, float(spec["budget_minutes"] or 0)) * 60
+                queue_start = NOW()
+                first_start = not spec.get("execution_started")
 
                 def keep_waiting():
                     lane_control_messages(server, lane, spec, child, turn, pending)
-                    return not (spec.get("abort_requested") or spec.get("down_requested")) and NOW() < deadline and child.alive()
+                    return (not (spec.get("abort_requested") or spec.get("down_requested"))
+                            and (first_start or queue_start < deadline) and child.alive())
 
                 if not reserve_provider_slot(os.path.join(RUNS, rid), attempt_lane["backend"], provider,
                                              load_policy(), lane_name=lane["name"], keep_waiting=keep_waiting):
-                    error_class = "stopped" if spec.get("abort_requested") or spec.get("down_requested") else "budget_exceeded"
-                    rc, final, usage, error_tail = (130 if error_class == "stopped" else 124), None, {}, None
+                    error_class = ("stopped" if spec.get("abort_requested") or spec.get("down_requested") else
+                                   "exec_error" if not child.alive() else "budget_exceeded")
+                    rc, final, usage, error_tail = (130 if error_class == "stopped" else 124 if error_class == "budget_exceeded" else 1), None, {}, None
                     evp = spec.get("_event_file") or os.path.join(rdir, f"events.{attempt_number}.{lane['backend']}.jsonl")
                     attempts.append({"backend": attempt_lane["backend"], "model": model,
                                      "effort": attempt_lane.get("effort"), "rc": rc, "seconds": 0,
@@ -7989,6 +8015,15 @@ def lane_do_run(lane, spec, child, server, current):
                                      "events": evp, "error_tail": error_tail})
                     break
                 started = NOW()
+                queued_from = spec.get("queued_at", queue_start) if first_start else queue_start
+                spec["queued_seconds"] = spec.get("queued_seconds", 0) + max(0, started - queued_from)
+                if first_start:
+                    spec["started"] = spec["execution_started"] = started
+                else:
+                    spec["started"] += max(0, started - queue_start)
+                deadline = spec["started"] + max(0, float(spec["budget_minutes"] or 0)) * 60
+                set_status(rdir, started=spec["started"], execution_started=spec["execution_started"],
+                           queued_seconds=round(spec["queued_seconds"], 3), deadline=deadline)
                 spec.pop("_turn_completed", None)
                 spec.pop("_agy_finished_early", None)
                 final, usage, error_class, rc, evp, error_tail = lane_run_turn(
@@ -9923,7 +9958,7 @@ def cmd_watch(args, policy):
                 fh.close()
             out("EXITED", f"runner process gone in state={st.get('state')} (cmds={cmds}); check {rdir}/run.out")
             return
-        if st.get("deadline") and now > st["deadline"] + 90:
+        if st.get("queue_reason") != "provider concurrency limit" and st.get("deadline") and now > st["deadline"] + 90:
             out("BUDGET", f"past budget ({st.get('budget_minutes')}m) and still {st.get('state')}")
         if now - last_evt > args.stall_minutes * 60:
             out("STALL", f"no events for {(now - last_evt) / 60:.1f}m; last cmd: {short(last_cmd, 160)}")
@@ -10236,7 +10271,7 @@ def cmd_report(args, policy):
             warn.append("RUNNER DEAD")
         if r["idle_min"] and r["idle_min"] > 10:
             warn.append(f"idle {r['idle_min']}m")
-        if r["budget_min"] and r["elapsed_min"] > r["budget_min"]:
+        if r["state"] == "running" and r["budget_min"] and r["elapsed_min"] > r["budget_min"]:
             warn.append("over budget")
         print(f"  {r['id']} {r['backend']}/{r['model']}"
               f"{' lane=' + r['lane'] if r.get('lane') else ''} {r['elapsed_min']}m/{r['budget_min']}m cmds={r['cmds']} "
@@ -10249,7 +10284,7 @@ def cmd_report(args, policy):
         print(f"  {r['status']:<15} {r['backend']}/{r['model']}"
               f"{' lane=' + r['lane'] if r.get('lane') else ''} {r['elapsed_min']}m  {r['title']}"
               f"{'  commit ' + r['commit'][:10] if r.get('commit') else ''}")
-    needs = [r for r in active if r["state"] == "dead" or (r["budget_min"] and r["elapsed_min"] > r["budget_min"])]
+    needs = [r for r in active if r["state"] == "dead" or (r["state"] == "running" and r["budget_min"] and r["elapsed_min"] > r["budget_min"])]
     needs += [r for r in recent if r["status"] not in ("done",)]
     print(f"attention {len(needs)}" + ("" if not needs else ": " + ", ".join(f"{r['id']}({r['status'] or r['state']})" for r in needs)))
 
