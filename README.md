@@ -125,7 +125,7 @@ Routing decisions use live quota data, not guesses.
   - For a workspace that must install dependencies inside each worktree, set `workspace.prepare`; it runs before
     execution and again before verification when a lockfile changed, and replaces configured dependency links.
   - Nothing is pushed.
-- **Hard budgets.** `--budget-minutes` kills the executor's whole process tree. Watchers expire too, and you re-arm them on purpose.
+- **Hard budgets.** For local runs and lanes, `--budget-minutes` starts when execution first acquires capacity and kills the executor's whole process tree when exceeded. Capacity waits do not consume the budget; their total is recorded as `queued_seconds` in the result. There is no default queue time limit. GitHub Issue bus runs also have a separate planner timeout that starts before the issue is created. Watchers expire too, and you re-arm them on purpose.
 - **Host-side verification.** `--verify '<cmd>'` runs your test command on the committed worktree.
   - Its exit code overrides the executor's self-report.
   - `--verify-baseline` ignores failures that already exist on the base commit.
