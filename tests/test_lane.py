@@ -254,11 +254,14 @@ class LaneTests(unittest.TestCase):
         (self.data / "policy.local.json").write_text(json.dumps({"concurrency": {"fake-provider": 1}}))
         self.cli("lane", "up", "L1")
         self.cli("lane", "up", "L2")
-        first = self.assign("LANE_TEST_WAIT_SHORT first provider task")
+        first = self.assign("LANE_TEST_WAIT first provider task")
         self.wait_running(first)
         second = json.loads(self.cli("lane", "assign", "L2", "--prompt", "second provider task").stdout)["id"]
-        # The first turn is short (LANE_TEST_WAIT_SHORT waits 1s), so the
-        # second turn may start running between two separate reads. Poll the
+        # The first turn waits 20s (LANE_TEST_WAIT), so the queue window
+        # survives a slow second `lane assign` under load: with the old
+        # 1s LANE_TEST_WAIT_SHORT turn, a loaded suite could return from
+        # the second assign only after the first turn had finished, and
+        # the queued state was never observed at all (#68 §1). Poll the
         # run status and the lane turn state in the same wait_for iteration
         # and only accept the pair while both still show queued; accepting
         # "running" here would mask a cap that never queued the turn.
@@ -270,7 +273,7 @@ class LaneTests(unittest.TestCase):
             description="second provider turn to queue")
         self.assertEqual(queued[0]["queue_reason"], "provider concurrency limit")
         self.assertEqual(queued[1], "queued")
-        self.assertEqual(self.wait_run(first)["status"], "done")
+        self.assertEqual(self.wait_run(first, timeout=30)["status"], "done")
         self.assertEqual(self.wait_run(second)["status"], "done")
 
     def test_total_cap_queues_different_backends_until_slot_frees(self):
@@ -285,13 +288,18 @@ class LaneTests(unittest.TestCase):
         (self.data / "policy.local.json").write_text(json.dumps({"concurrency": {"total": 1}}))
         self.cli("lane", "up", "L1")
         self.cli("lane", "up", "L2")
-        first = self.assign("LANE_TEST_WAIT_SHORT first total-cap task")
+        first = self.assign("LANE_TEST_WAIT first total-cap task")
         self.wait_running(first)
         second = json.loads(self.cli("lane", "assign", "L2", "--prompt", "second backend task").stdout)["id"]
+        # Same 20s first turn as the provider-cap test above: the old 1s
+        # LANE_TEST_WAIT_SHORT turn could finish before a slow second
+        # assign returned under load, so the queued state was never
+        # observed (#68 §1). The assertion still requires observing the
+        # queued state; "running" is never accepted as a substitute.
         queued = self.wait_for(lambda: (state if (state := self.run_state(second)).get("queue_reason") else None),
                                description="second backend turn to queue on total cap")
         self.assertEqual(queued["queue_reason"], "provider concurrency limit")
-        self.assertEqual(self.wait_run(first)["status"], "done")
+        self.assertEqual(self.wait_run(first, timeout=30)["status"], "done")
         self.assertEqual(self.wait_run(second)["status"], "done")
 
     def test_codex_assign_commits_and_writes_normal_result(self):
