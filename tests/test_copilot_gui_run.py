@@ -107,7 +107,7 @@ class CopilotGuiRunWorkerTests(unittest.TestCase):
         # Validation runs before the control-socket connect, so no
         # listener is needed and the fake binary must never run.
         with _temp_dir() as home:
-            binary = _install_fake_copilot(home)
+            _install_fake_copilot(home)
             root = pathlib.Path(home) / 'work'
             root.mkdir(parents=True)
             (root / 'request.json').write_text(json.dumps(
@@ -118,7 +118,7 @@ class CopilotGuiRunWorkerTests(unittest.TestCase):
 
     def test_forbidden_flag_exits_2(self):
         with _temp_dir() as home:
-            binary = _install_fake_copilot(home)
+            _install_fake_copilot(home)
             root = pathlib.Path(home) / 'work'
             root.mkdir(parents=True)
             (root / 'request.json').write_text(json.dumps(
