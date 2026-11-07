@@ -50,9 +50,14 @@ class PiPlatformTests(unittest.TestCase):
                         self.assertIn('read,grep,find,ls', command)
 
     def test_lane_config_and_rpc_respect_platform_default(self):
+        # '/usr/bin/pi' is not an absolute path on Windows (ntpath), so
+        # lane_config() rejects it there; use a host-appropriate absolute
+        # path instead. The mocked sys.platform only drives the isolation
+        # decision, not path validation, so the host path rules apply.
+        binary = '/usr/bin/pi' if os.name != 'nt' else r'C:\usr\bin\pi.exe'
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, 'lanes.json')
-            lane = {'name': 'test', 'backend': 'pi', 'binary': '/usr/bin/pi',
+            lane = {'name': 'test', 'backend': 'pi', 'binary': binary,
                     'model': 'test', 'repo': tmp}
             with open(path, 'w') as stream:
                 json.dump({'lanes': [lane]}, stream)
@@ -75,6 +80,6 @@ class PiPlatformTests(unittest.TestCase):
                             xs.LaneChild(lane, tmp, policy)
                         popen.assert_not_called()
                     else:
-                        self.assertEqual(xs.lane_config()[0]['binary'], '/usr/bin/pi')
+                        self.assertEqual(xs.lane_config()[0]['binary'], binary)
                         xs.LaneChild(lane, tmp, policy)
-                        self.assertEqual(popen.call_args.args[0][0], '/usr/bin/pi')
+                        self.assertEqual(popen.call_args.args[0][0], binary)
